@@ -37,6 +37,36 @@ uint32_t ComputeObjectCount(uint64_t file_size, uint64_t object_unit_size) {
     return static_cast<uint32_t>(std::min<uint64_t>(count, std::numeric_limits<uint32_t>::max()));
 }
 
+zb::msg::Status RemoveDirectoryContents(const std::string& dir_path, uint64_t* removed_count) {
+    if (dir_path.empty()) {
+        return zb::msg::Status::InvalidArgument("directory path is empty");
+    }
+    std::error_code ec;
+    if (!fs::exists(dir_path, ec)) {
+        return zb::msg::Status::Ok();
+    }
+    if (ec || !fs::is_directory(dir_path, ec)) {
+        return zb::msg::Status::IoError("invalid directory: " + dir_path);
+    }
+    for (const auto& entry : fs::directory_iterator(dir_path, ec)) {
+        if (ec) {
+            return zb::msg::Status::IoError("failed to iterate directory " + dir_path + ": " + ec.message());
+        }
+        if (entry.path().filename() == ".disk_id") {
+            continue;
+        }
+        std::error_code remove_ec;
+        const uintmax_t count = fs::remove_all(entry.path(), remove_ec);
+        if (remove_ec) {
+            return zb::msg::Status::IoError("failed to remove " + entry.path().string() + ": " + remove_ec.message());
+        }
+        if (removed_count) {
+            *removed_count += static_cast<uint64_t>(count);
+        }
+    }
+    return zb::msg::Status::Ok();
+}
+
 } // namespace
 
 StorageServiceImpl::StorageServiceImpl(DiskManager* disk_manager,
@@ -300,6 +330,81 @@ zb::msg::Status StorageServiceImpl::DeleteObject(const zb::data_node::ObjectDele
     object_request.disk_id = request.disk_id;
     object_request.SetArchiveObjectId(request.object_id);
     return DeleteObject(object_request).status;
+}
+
+zb::msg::ResetNodeDataReply StorageServiceImpl::ResetNodeData(const zb::msg::ResetNodeDataRequest& request) {
+    zb::msg::ResetNodeDataReply reply;
+    if (request.confirm_token != "RESET_NODE_DATA") {
+        reply.status = zb::msg::Status::InvalidArgument("confirm_token must be RESET_NODE_DATA");
+        return reply;
+    }
+    if (!request.purge_objects && !request.purge_file_meta) {
+        reply.status = zb::msg::Status::InvalidArgument("nothing to reset");
+        return reply;
+    }
+
+    if (request.purge_objects) {
+        const zb::msg::DiskReportReply disk_reply = GetDiskReport();
+        if (!disk_reply.status.ok()) {
+            reply.status = disk_reply.status;
+            return reply;
+        }
+        for (const auto& disk : disk_reply.reports) {
+            if (disk.mount_point.empty()) {
+                continue;
+            }
+            const zb::msg::Status st = RemoveDirectoryContents(disk.mount_point, &reply.objects_removed);
+            if (!st.ok()) {
+                reply.status = st;
+                return reply;
+            }
+        }
+        if (disk_manager_) {
+            (void)disk_manager_->Refresh();
+        }
+    }
+
+    if (request.purge_file_meta) {
+        {
+            std::lock_guard<std::mutex> lock(file_meta_mu_);
+            std::string load_error;
+            if (!file_meta_loaded_ && InitFileMetaStorePath()) {
+                (void)LoadFileMetaStoreLocked(&load_error);
+            }
+            reply.file_meta_removed = static_cast<uint64_t>(file_meta_by_inode_.size());
+            file_meta_by_inode_.clear();
+            last_commit_txid_by_inode_.clear();
+            file_meta_loaded_ = true;
+            std::string persist_error;
+            if (!InitFileMetaStorePath() || !PersistFileMetaStoreLocked(&persist_error)) {
+                reply.status = zb::msg::Status::IoError(
+                    persist_error.empty() ? "failed to persist empty file meta store" : persist_error);
+                return reply;
+            }
+        }
+        std::string clear_error;
+        if (!archive_file_meta_store_.ClearAll(&clear_error)) {
+            reply.status = zb::msg::Status::IoError(clear_error.empty() ? "failed to clear archive file meta"
+                                                                        : clear_error);
+            return reply;
+        }
+    }
+    if (request.purge_objects || request.purge_file_meta) {
+        std::string clear_error;
+        if (!archive_meta_store_.ClearAll(&clear_error)) {
+            reply.status = zb::msg::Status::IoError(clear_error.empty() ? "failed to clear archive object meta"
+                                                                        : clear_error);
+            return reply;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(repl_repair_mu_);
+        repl_repair_queue_.clear();
+        repl_repair_generation_.clear();
+    }
+    reply.status = zb::msg::Status::Ok();
+    return reply;
 }
 
 zb::msg::DiskReportReply StorageServiceImpl::GetDiskReport() const {

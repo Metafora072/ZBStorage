@@ -55,6 +55,7 @@ public:
                                                    uint64_t min_age_ms,
                                                    uint64_t now_ms) const;
     std::vector<ArchiveFileMeta> SnapshotMetas() const;
+    bool ClearAll(std::string* error);
     bool FlushSnapshot(std::string* error);
 
 private:

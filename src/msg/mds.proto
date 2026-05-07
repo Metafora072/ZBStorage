@@ -437,6 +437,7 @@ message GenerateMasstreeTemplateRequest {
   string repeat_dir_prefix = 3;
   uint32 verify_inode_samples = 4;
   uint32 verify_dentry_samples = 5;
+  bool path_list_leaf_nodes_are_files = 6;
 }
 
 message GenerateMasstreeTemplateReply {

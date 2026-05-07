@@ -97,6 +97,7 @@ public:
     zb::msg::Status PutObject(const zb::data_node::ObjectWriteRequest& request);
     zb::data_node::ObjectReadResult GetObject(const zb::data_node::ObjectReadRequest& request);
     zb::msg::Status DeleteObject(const zb::data_node::ObjectDeleteRequest& request);
+    zb::msg::ResetNodeDataReply ResetNodeData(const zb::msg::ResetNodeDataRequest& request);
     zb::msg::DiskReportReply GetDiskReport() const;
     zb::msg::DeleteFileMetaReply DeleteFileMeta(const zb::msg::DeleteFileMetaRequest& request);
     zb::msg::ResolveFileReadReply ResolveFileRead(const zb::msg::ResolveFileReadRequest& request) const;
@@ -181,7 +182,6 @@ private:
     VirtualNodeConfig config_;
     std::unordered_set<std::string> disk_set_;
     mutable std::mutex object_mu_;
-    std::unordered_map<std::string, std::string> object_data_;
     std::unordered_map<std::string, std::string> object_home_disk_;
     std::unordered_map<std::string, uint64_t> object_sizes_;
     std::unordered_map<std::string, uint64_t> disk_used_bytes_;

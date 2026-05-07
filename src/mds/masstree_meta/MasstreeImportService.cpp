@@ -27,6 +27,7 @@ struct InternalImportRequest {
     std::string path_prefix;
     std::string path_list_file;
     std::string repeat_dir_prefix;
+    bool path_list_leaf_nodes_are_files{false};
     std::string template_id;
     std::string template_mode;
     uint64_t inode_start{0};
@@ -118,6 +119,7 @@ bool ValidateTemplateManifest(const InternalImportRequest& request,
         summary_request.path_list_file = request.path_list_file;
         summary_request.repeat_dir_prefix =
             request.repeat_dir_prefix.empty() ? manifest.repeat_dir_prefix : request.repeat_dir_prefix;
+        summary_request.path_list_leaf_nodes_are_files = request.path_list_leaf_nodes_are_files;
         MasstreeBulkMetaGenerator::PathListSummary summary;
         if (!generator.SummarizePathList(summary_request, &summary, error)) {
             return false;
@@ -214,6 +216,7 @@ bool EnsureTemplateManifest(const InternalImportRequest& request,
     template_request.source_mode = kMasstreeSourceModePathList;
     template_request.path_list_file = request.path_list_file;
     template_request.repeat_dir_prefix = request.repeat_dir_prefix;
+    template_request.path_list_leaf_nodes_are_files = request.path_list_leaf_nodes_are_files;
     template_request.inode_start = 1;
     template_request.file_count = request.file_count;
     template_request.max_files_per_leaf_dir = 2048U;
@@ -321,6 +324,7 @@ bool MasstreeImportService::GenerateTemplate(const TemplateGenerationRequest& re
     internal_request.template_id = request.template_id;
     internal_request.path_list_file = request.path_list_file;
     internal_request.repeat_dir_prefix = request.repeat_dir_prefix;
+    internal_request.path_list_leaf_nodes_are_files = request.path_list_leaf_nodes_are_files;
     internal_request.file_count = kMasstreeTemplateTargetFileCount;
     internal_request.verify_inode_samples = request.verify_inode_samples;
     internal_request.verify_dentry_samples = request.verify_dentry_samples;

@@ -13,6 +13,7 @@ SCHEDULER_ADDR="${SCHEDULER_ADDR:-127.0.0.1:9100}"
 TEMPLATE_ID="${1:-${MASSTREE_TEMPLATE_ID:-template-pathlist-100m-demo}}"
 PATH_LIST_FILE="${2:-${MASSTREE_PATH_LIST_FILE:-}}"
 REPEAT_DIR_PREFIX="${MASSTREE_REPEAT_DIR_PREFIX:-copy}"
+LEAF_NODES_ARE_FILES="${MASSTREE_PATH_LIST_LEAF_NODES_ARE_FILES:-false}"
 TEMPLATE_MODE="${MASSTREE_TEMPLATE_MODE:-page_fast}"
 SHOWCASE_LOG="${LOG_DIR}/demo_showcase_$(date '+%Y%m%d_%H%M%S').log"
 
@@ -51,6 +52,7 @@ if [[ -n "${PATH_LIST_FILE}" ]]; then
   CMD+=(
     --masstree_path_list_file="${PATH_LIST_FILE}"
     --masstree_repeat_dir_prefix="${REPEAT_DIR_PREFIX}"
+    --masstree_path_list_leaf_nodes_are_files="${LEAF_NODES_ARE_FILES}"
   )
 fi
 

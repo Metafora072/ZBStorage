@@ -35,6 +35,21 @@ bool ParseU32(const std::string& value, uint32_t* out) {
     }
 }
 
+bool ParseBool(const std::string& value, bool* out) {
+    if (!out) {
+        return false;
+    }
+    if (value == "1" || value == "true" || value == "TRUE" || value == "yes") {
+        *out = true;
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "FALSE" || value == "no") {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
 void PrintUsage() {
     std::cerr
         << "Usage:\n"
@@ -47,6 +62,7 @@ void PrintUsage() {
         << " [--source_mode=synthetic|path_list]"
         << " [--path_list_file=<path>]"
         << " [--repeat_dir_prefix=<prefix>]"
+        << " [--path_list_leaf_nodes_are_files=true|false]"
         << " [--file_count=<u64>]"
         << " [--max_files_per_leaf_dir=<u32>]"
         << " [--max_subdirs_per_dir=<u32>]\n";
@@ -72,6 +88,11 @@ int main(int argc, char** argv) {
             request.path_list_file = value;
         } else if (const std::string value = GetFlagValue(arg, "repeat_dir_prefix"); !value.empty()) {
             request.repeat_dir_prefix = value;
+        } else if (const std::string value = GetFlagValue(arg, "path_list_leaf_nodes_are_files"); !value.empty()) {
+            if (!ParseBool(value, &request.path_list_leaf_nodes_are_files)) {
+                std::cerr << "invalid --path_list_leaf_nodes_are_files\n";
+                return 1;
+            }
         } else if (const std::string value = GetFlagValue(arg, "inode_start"); !value.empty()) {
             if (!ParseU64(value, &request.inode_start)) {
                 std::cerr << "invalid --inode_start\n";

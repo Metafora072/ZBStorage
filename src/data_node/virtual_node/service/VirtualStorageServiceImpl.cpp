@@ -168,25 +168,12 @@ zb::msg::WriteObjectReply VirtualStorageServiceImpl::WriteObject(const zb::msg::
     {
         std::lock_guard<std::mutex> lock(object_mu_);
         const std::string key = BuildObjectKey(normalized_request.disk_id, object_id);
-        std::string& blob = object_data_[key];
-        if (normalized_request.offset > blob.size()) {
-            blob.resize(static_cast<size_t>(normalized_request.offset), '\0');
-        }
-        const size_t write_begin = static_cast<size_t>(normalized_request.offset);
-        const size_t write_end = write_begin + normalized_request.data.size();
-        if (blob.size() < write_end) {
-            blob.resize(write_end, '\0');
-        }
-        std::copy(normalized_request.data.begin(), normalized_request.data.end(), blob.begin() + write_begin);
-
         const uint64_t old_size = object_sizes_[key];
-        const uint64_t new_size = static_cast<uint64_t>(blob.size());
+        const uint64_t new_size = normalized_request.offset + static_cast<uint64_t>(normalized_request.data.size());
         if (new_size > old_size) {
             const uint64_t increase = new_size - old_size;
             const uint64_t used = disk_used_bytes_[normalized_request.disk_id];
             if (used + increase > config_.disk_capacity_bytes) {
-                // rollback write growth when capacity exceeded
-                blob.resize(static_cast<size_t>(old_size));
                 reply.status = zb::msg::Status::IoError("NO_SPACE");
                 reply.bytes = 0;
                 return reply;
@@ -194,7 +181,7 @@ zb::msg::WriteObjectReply VirtualStorageServiceImpl::WriteObject(const zb::msg::
             disk_used_bytes_[normalized_request.disk_id] = used + increase;
         }
         object_home_disk_[object_id] = normalized_request.disk_id;
-        object_sizes_[key] = static_cast<uint64_t>(blob.size());
+        object_sizes_[key] = new_size;
     }
     TrackObjectAccess(normalized_request.disk_id,
                       object_id,
@@ -244,8 +231,8 @@ zb::msg::ReadObjectReply VirtualStorageServiceImpl::ReadObject(const zb::msg::Re
     {
         std::lock_guard<std::mutex> lock(object_mu_);
         const std::string key = BuildObjectKey(effective_disk, object_id);
-        auto it = object_data_.find(key);
-        if (it == object_data_.end()) {
+        auto it = object_sizes_.find(key);
+        if (it == object_sizes_.end()) {
             if (!TryReadPreloadedObjectLocked(effective_disk,
                                               object_id,
                                               request.offset,
@@ -259,15 +246,15 @@ zb::msg::ReadObjectReply VirtualStorageServiceImpl::ReadObject(const zb::msg::Re
             reply.status = zb::msg::Status::Ok();
             return reply;
         }
-        const std::string& blob = it->second;
-        if (request.offset >= blob.size()) {
+        const uint64_t object_size = it->second;
+        if (request.offset >= object_size) {
             reply.bytes = 0;
             reply.data.clear();
         } else {
-            const uint64_t remain = static_cast<uint64_t>(blob.size()) - request.offset;
+            const uint64_t remain = object_size - request.offset;
             const uint64_t read_len = std::min<uint64_t>(remain, request.size);
             reply.bytes = read_len;
-            reply.data.assign(blob.data() + static_cast<size_t>(request.offset), static_cast<size_t>(read_len));
+            reply.data.assign(static_cast<size_t>(read_len), 'x');
         }
     }
     TrackObjectAccess(effective_disk, object_id, request.offset + reply.bytes, false, 0);
@@ -298,10 +285,9 @@ zb::msg::DeleteObjectReply VirtualStorageServiceImpl::DeleteObject(const zb::msg
     {
         std::lock_guard<std::mutex> lock(object_mu_);
         const std::string key = BuildObjectKey(effective_disk, object_id);
-        auto it = object_data_.find(key);
-        if (it != object_data_.end()) {
-            const uint64_t size = static_cast<uint64_t>(it->second.size());
-            object_data_.erase(it);
+        auto it = object_sizes_.find(key);
+        if (it != object_sizes_.end()) {
+            const uint64_t size = it->second;
             object_sizes_.erase(key);
             auto home_it = object_home_disk_.find(object_id);
             if (home_it != object_home_disk_.end() && home_it->second == effective_disk) {
@@ -347,6 +333,71 @@ zb::msg::Status VirtualStorageServiceImpl::DeleteObject(const zb::data_node::Obj
     object_request.disk_id = request.disk_id;
     object_request.SetArchiveObjectId(request.object_id);
     return DeleteObject(object_request).status;
+}
+
+zb::msg::ResetNodeDataReply VirtualStorageServiceImpl::ResetNodeData(const zb::msg::ResetNodeDataRequest& request) {
+    zb::msg::ResetNodeDataReply reply;
+    if (request.confirm_token != "RESET_NODE_DATA") {
+        reply.status = zb::msg::Status::InvalidArgument("confirm_token must be RESET_NODE_DATA");
+        return reply;
+    }
+    if (!request.purge_objects && !request.purge_file_meta) {
+        reply.status = zb::msg::Status::InvalidArgument("nothing to reset");
+        return reply;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(object_mu_);
+        if (request.purge_objects) {
+            reply.objects_removed = static_cast<uint64_t>(object_sizes_.size());
+            object_home_disk_.clear();
+            object_sizes_.clear();
+            for (auto& [_, used] : disk_used_bytes_) {
+                used = 0;
+            }
+        }
+        if (request.purge_file_meta) {
+            std::string load_error;
+            if (!file_meta_loaded_ && InitFileMetaStorePath()) {
+                (void)LoadFileMetaStoreLocked(&load_error);
+            }
+            reply.file_meta_removed = static_cast<uint64_t>(file_meta_by_inode_.size());
+            file_meta_by_inode_.clear();
+            preloaded_file_objects_.clear();
+            last_commit_txid_by_inode_.clear();
+            file_meta_loaded_ = true;
+            std::string persist_error;
+            if (!InitFileMetaStorePath() || !PersistFileMetaStoreLocked(&persist_error)) {
+                reply.status = zb::msg::Status::IoError(
+                    persist_error.empty() ? "failed to persist empty file meta store" : persist_error);
+                return reply;
+            }
+        }
+    }
+
+    if (request.purge_objects || request.purge_file_meta) {
+        std::string clear_error;
+        if (!archive_meta_store_.ClearAll(&clear_error)) {
+            reply.status = zb::msg::Status::IoError(clear_error.empty() ? "failed to clear archive object meta"
+                                                                        : clear_error);
+            return reply;
+        }
+    }
+    if (request.purge_file_meta) {
+        std::string clear_error;
+        if (!archive_file_meta_store_.ClearAll(&clear_error)) {
+            reply.status = zb::msg::Status::IoError(clear_error.empty() ? "failed to clear archive file meta"
+                                                                        : clear_error);
+            return reply;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(repl_repair_mu_);
+        repl_repair_queue_.clear();
+        repl_repair_generation_.clear();
+    }
+    reply.status = zb::msg::Status::Ok();
+    return reply;
 }
 
 zb::msg::DiskReportReply VirtualStorageServiceImpl::GetDiskReport() const {
@@ -541,12 +592,11 @@ zb::msg::DeleteFileMetaReply VirtualStorageServiceImpl::DeleteFileMeta(const zb:
                     effective_disk = home_it->second;
                 }
                 const std::string key = BuildObjectKey(effective_disk, object_id);
-                auto obj_it = object_data_.find(key);
-                if (obj_it == object_data_.end()) {
+                auto obj_it = object_sizes_.find(key);
+                if (obj_it == object_sizes_.end()) {
                     continue;
                 }
-                const uint64_t size = static_cast<uint64_t>(obj_it->second.size());
-                object_data_.erase(obj_it);
+                const uint64_t size = obj_it->second;
                 object_sizes_.erase(key);
                 auto home_erase_it = object_home_disk_.find(object_id);
                 if (home_erase_it != object_home_disk_.end() && home_erase_it->second == effective_disk) {
@@ -1007,7 +1057,7 @@ bool VirtualStorageServiceImpl::ResolveEffectiveDisk(const std::string& requeste
 
     if (!object_id.empty()) {
         const std::string suffix = "|" + object_id;
-        for (const auto& entry : object_data_) {
+        for (const auto& entry : object_sizes_) {
             const std::string& key = entry.first;
             if (key.size() <= suffix.size() || key.compare(key.size() - suffix.size(), suffix.size(), suffix) != 0) {
                 continue;
@@ -1349,13 +1399,7 @@ bool VirtualStorageServiceImpl::TryReadPreloadedObjectLocked(const std::string& 
         return true;
     }
     const uint64_t read_len = std::min<uint64_t>(size, object_size - offset);
-    const uint64_t seed = (preload_it != preloaded_file_objects_.end()) ? preload_it->second.seed : inode_id;
-    out->resize(static_cast<size_t>(read_len), 'x');
-    for (size_t i = 0; i < out->size(); ++i) {
-        const uint64_t v = seed + static_cast<uint64_t>(object_index) * 1315423911ULL +
-                           offset + static_cast<uint64_t>(i);
-        (*out)[i] = static_cast<char>('a' + (v % 26ULL));
-    }
+    out->assign(static_cast<size_t>(read_len), 'x');
     *bytes_read = read_len;
     return true;
 }

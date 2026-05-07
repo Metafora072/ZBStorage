@@ -128,6 +128,20 @@ void BrpcOpticalStorageService::DeleteObject(google::protobuf::RpcController* cn
     FillStatus(internal_reply.status, response->mutable_status());
 }
 
+void BrpcOpticalStorageService::ResetNodeData(google::protobuf::RpcController* cntl_base,
+                                              const zb::rpc::ResetNodeDataRequest* request,
+                                              zb::rpc::ResetNodeDataReply* response,
+                                              google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+    (void)cntl_base;
+    (void)request;
+    if (!response) {
+        return;
+    }
+    response->mutable_status()->set_code(zb::rpc::STATUS_INVALID_ARGUMENT);
+    response->mutable_status()->set_message("ResetNodeData is only supported for real and virtual nodes");
+}
+
 void BrpcOpticalStorageService::ReadArchivedFile(google::protobuf::RpcController* cntl_base,
                                                  const zb::rpc::ReadArchivedFileRequest* request,
                                                  zb::rpc::ReadArchivedFileReply* response,

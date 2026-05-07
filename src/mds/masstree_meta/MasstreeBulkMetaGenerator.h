@@ -15,6 +15,7 @@ public:
         std::string source_mode;
         std::string path_list_file;
         std::string repeat_dir_prefix;
+        bool path_list_leaf_nodes_are_files{false};
         uint64_t inode_start{0};
         uint64_t file_count{100000000ULL};
         uint32_t max_files_per_leaf_dir{2048};

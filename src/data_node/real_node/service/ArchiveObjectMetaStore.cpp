@@ -288,6 +288,19 @@ std::vector<ArchiveObjectMeta> ArchiveObjectMetaStore::SnapshotMetas() const {
     return out;
 }
 
+bool ArchiveObjectMetaStore::ClearAll(std::string* error) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!inited_) {
+        if (error) {
+            *error = "archive object meta store is not initialized";
+        }
+        return false;
+    }
+    metas_.clear();
+    updates_since_snapshot_ = snapshot_interval_ops_;
+    return WriteSnapshotLocked(error);
+}
+
 bool ArchiveObjectMetaStore::FlushSnapshot(std::string* error) {
     std::lock_guard<std::mutex> lock(mu_);
     return WriteSnapshotLocked(error);

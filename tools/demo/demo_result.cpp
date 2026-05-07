@@ -73,6 +73,11 @@ const std::unordered_map<std::string, std::string>& MetricDisplayNames() {
         {"inspected_node_id", "\u6821\u9a8c\u8282\u70b9ID"},
         {"inspected_disk_id", "\u6821\u9a8c\u78c1\u76d8ID"},
         {"inspected_tier", "\u6821\u9a8c\u5c42\u7ea7"},
+        {"object_unit_size_bytes", "\u5bf9\u8c61\u5355\u5143\u5927\u5c0f\u5b57\u8282"},
+        {"object_count", "\u5bf9\u8c61\u6570\u91cf"},
+        {"first_object_id", "\u9996\u4e2a\u5bf9\u8c61ID"},
+        {"last_object_id", "\u672b\u4e2a\u5bf9\u8c61ID"},
+        {"object_ids", "\u5bf9\u8c61ID\u5217\u8868"},
         {"backend_object_id", "\u540e\u7aef\u5bf9\u8c61ID"},
         {"backend_objects", "\u6d89\u53ca\u540e\u7aef\u5bf9\u8c61"},
         {"backend_mount_point", "\u540e\u7aef\u78c1\u76d8\u76ee\u5f55"},
@@ -139,6 +144,7 @@ const std::unordered_map<std::string, std::string>& MetricDisplayNames() {
         {"file_archive_state", "\u6587\u4ef6\u5f52\u6863\u72b6\u6001"},
         {"template_id", "\u6a21\u677fID"},
         {"template_mode", "\u6a21\u677f\u6a21\u5f0f"},
+        {"path_list_leaf_nodes_are_files", "\u53f6\u5b50\u8282\u70b9\u6309\u6587\u4ef6\u5904\u7406"},
         {"job_id", "\u4efb\u52a1ID"},
         {"job_status", "\u4efb\u52a1\u72b6\u6001"},
         {"manifest_path", "\u6e05\u5355\u8def\u5f84"},
@@ -186,7 +192,9 @@ const std::unordered_map<std::string, std::string>& CheckDisplayNames() {
         {"metadata.tier", "\u5143\u6570\u636e\u5c42\u7ea7\u6821\u9a8c"},
         {"backend.object_exists", "\u540e\u7aef\u5bf9\u8c61\u5b58\u5728\u6821\u9a8c"},
         {"backend.object_size", "\u540e\u7aef\u5bf9\u8c61\u5927\u5c0f\u6821\u9a8c"},
-        {"backend.object_hash", "\u540e\u7aef\u5bf9\u8c61\u54c8\u5e0c\u6821\u9a8c"}
+        {"backend.object_hash", "\u540e\u7aef\u5bf9\u8c61\u54c8\u5e0c\u6821\u9a8c"},
+        {"virtual.object_count", "\u865a\u62df\u5bf9\u8c61\u6570\u91cf\u6821\u9a8c"},
+        {"virtual.object_ids", "\u865a\u62df\u5bf9\u8c61\u5217\u8868\u6821\u9a8c"}
     };
     return kNames;
 }
@@ -250,6 +258,12 @@ std::string GroupForMetric(const std::string& key) {
         {"inspected_node_id", "\u5143\u6570\u636e\u6838\u9a8c"},
         {"inspected_disk_id", "\u5143\u6570\u636e\u6838\u9a8c"},
         {"inspected_tier", "\u5143\u6570\u636e\u6838\u9a8c"},
+
+        {"object_unit_size_bytes", "\u865a\u62df\u5bf9\u8c61\u5207\u5206\u8ba1\u5212"},
+        {"object_count", "\u865a\u62df\u5bf9\u8c61\u5207\u5206\u8ba1\u5212"},
+        {"first_object_id", "\u865a\u62df\u5bf9\u8c61\u5207\u5206\u8ba1\u5212"},
+        {"last_object_id", "\u865a\u62df\u5bf9\u8c61\u5207\u5206\u8ba1\u5212"},
+        {"object_ids", "\u865a\u62df\u5bf9\u8c61\u5207\u5206\u8ba1\u5212"},
 
         {"backend_object_id", "\u540e\u7aef\u6838\u9a8c"},
         {"backend_objects", "\u540e\u7aef\u6838\u9a8c"},
@@ -338,7 +352,7 @@ void ParseStdout(const std::string& stdout_text,
     }
     for (const std::string& raw_line : SplitLines(stdout_text)) {
         const std::string line = Trim(raw_line);
-        if (line.empty() || StartsWith(line, "====")) {
+        if (line.empty() || StartsWith(line, "====") || line == "{" || line == "}" || line == "attr={") {
             continue;
         }
         if (StartsWith(line, "check.") || StartsWith(line, "\u6821\u9a8c.")) {

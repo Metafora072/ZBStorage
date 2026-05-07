@@ -31,6 +31,7 @@
 #include "demo_result.h"
 #include "mds/masstree_meta/MasstreeDecimalUtils.h"
 #include "mds.pb.h"
+#include "real_node.pb.h"
 #include "scheduler.pb.h"
 
 namespace fs = std::filesystem;
@@ -42,7 +43,7 @@ DEFINE_string(real_dir, "real", "Top-level mounted directory for real-node files
 DEFINE_string(virtual_dir, "virtual", "Top-level mounted directory for virtual-node files");
 DEFINE_string(scenario,
               "interactive",
-              "Scenario: interactive|health|stats|posix|masstree|masstree_template|masstree_import|masstree_query|all");
+              "Scenario: interactive|health|stats|posix|masstree|masstree_template|masstree_import|masstree_query|reset_nodes|all");
 DEFINE_string(masstree_namespace_id, "demo-ns", "Masstree demo namespace id");
 DEFINE_string(masstree_generation_id, "", "Masstree demo generation id; auto-generated if empty");
 DEFINE_string(masstree_path_prefix, "", "Masstree demo path prefix; defaults to /masstree_demo/<namespace>");
@@ -57,6 +58,9 @@ DEFINE_string(masstree_path_list_file, "", "Masstree path_list source file");
 DEFINE_string(masstree_repeat_dir_prefix,
               "",
               "Masstree path_list wrapper directory prefix; empty keeps the server default");
+DEFINE_bool(masstree_path_list_leaf_nodes_are_files,
+            false,
+            "Treat path_list leaf nodes without an extension as files; false preserves legacy behavior");
 DEFINE_uint32(masstree_max_files_per_leaf_dir, 2048, "Masstree max files per leaf dir");
 DEFINE_uint32(masstree_max_subdirs_per_dir, 256, "Masstree max subdirs per dir");
 DEFINE_uint32(masstree_verify_inode_samples, 32, "Masstree import inode verify sample count");
@@ -112,6 +116,15 @@ DEFINE_bool(enable_log_file, true, "Write demo command output to a log file");
 DEFINE_bool(log_append, true, "Append demo execution logs instead of overwriting the file");
 DEFINE_int32(timeout_ms, 5000, "RPC timeout in ms");
 DEFINE_int32(max_retry, 0, "RPC max retry");
+DEFINE_bool(reset_nodes_force, false, "Allow reset_nodes scenario to clear real/virtual node data");
+DEFINE_string(reset_nodes_confirm,
+              "",
+              "Confirmation token for reset_nodes; must be RESET_NODE_DATA");
+DEFINE_string(reset_nodes_scope,
+              "real,virtual",
+              "Comma-separated reset scope: real,virtual");
+DEFINE_bool(reset_nodes_purge_objects, true, "Reset node object payload/state");
+DEFINE_bool(reset_nodes_purge_file_meta, true, "Reset node-side file metadata/archive tracking");
 
 namespace {
 
@@ -466,6 +479,10 @@ struct FileInspectionResult {
     std::string node_id;
     std::string disk_id;
     std::string actual_tier{"unknown"};
+    uint64_t object_unit_size_bytes{0};
+    uint32_t object_count{0};
+    std::string first_object_id;
+    std::string last_object_id;
     std::string backend_object_id;
     std::vector<std::string> backend_objects;
     std::string backend_mount_point;
@@ -1230,6 +1247,59 @@ private:
     zb::rpc::SchedulerService_Stub stub_{&channel_};
 };
 
+class NodeResetClient {
+public:
+    bool ResetNode(const std::string& endpoint,
+                   bool purge_objects,
+                   bool purge_file_meta,
+                   zb::rpc::ResetNodeDataReply* reply_out,
+                   std::string* error) const {
+        brpc::Channel channel;
+        brpc::ChannelOptions options;
+        options.protocol = "baidu_std";
+        options.timeout_ms = std::max<int32_t>(FLAGS_timeout_ms, 30000);
+        options.max_retry = FLAGS_max_retry;
+        if (channel.Init(endpoint.c_str(), &options) != 0) {
+            if (error) {
+                *error = "failed to connect node: " + endpoint;
+            }
+            return false;
+        }
+
+        zb::rpc::RealNodeService_Stub stub(&channel);
+        zb::rpc::ResetNodeDataRequest request;
+        request.set_confirm_token(FLAGS_reset_nodes_confirm);
+        request.set_purge_objects(purge_objects);
+        request.set_purge_file_meta(purge_file_meta);
+        zb::rpc::ResetNodeDataReply reply;
+        brpc::Controller cntl;
+        cntl.set_timeout_ms(std::max<int32_t>(FLAGS_timeout_ms, 30000));
+        stub.ResetNodeData(&cntl, &request, &reply, nullptr);
+        if (cntl.Failed()) {
+            if (error) {
+                *error = cntl.ErrorText();
+            }
+            if (reply_out) {
+                *reply_out = reply;
+            }
+            return false;
+        }
+        if (reply_out) {
+            *reply_out = reply;
+        }
+        if (reply.status().code() != zb::rpc::STATUS_OK) {
+            if (error) {
+                *error = reply.status().message();
+            }
+            return false;
+        }
+        if (error) {
+            error->clear();
+        }
+        return true;
+    }
+};
+
 class DemoApp {
 public:
     bool Init() {
@@ -1289,6 +1359,13 @@ public:
                                       "Masstree \u67e5\u8be2\u5b8c\u6210",
                                       "Masstree \u67e5\u8be2\u5931\u8d25",
                                       [&]() { return RunMasstreeQueryDemo(); });
+        }
+        if (scenario == "reset_nodes") {
+            return RunScenarioCommand("reset_nodes",
+                                      "Reset real/virtual node data",
+                                      "real/virtual node data reset completed",
+                                      "real/virtual node data reset failed",
+                                      [&]() { return RunResetNodesScenario(); });
         }
         if (scenario == "all") {
             return RunScenarioCommand("all",
@@ -1398,6 +1475,103 @@ private:
         return true;
     }
 
+    bool ResetScopeIncludes(const std::string& tier) const {
+        std::stringstream ss(ToLowerCopy(FLAGS_reset_nodes_scope));
+        std::string token;
+        while (std::getline(ss, token, ',')) {
+            token = TrimCopy(token);
+            if (token == "all" || token == tier) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool RunResetNodesScenario() {
+        PrintSection("Reset real/virtual node data");
+        if (!FLAGS_reset_nodes_force || FLAGS_reset_nodes_confirm != "RESET_NODE_DATA") {
+            std::cerr << "reset_nodes requires force=true and confirm=RESET_NODE_DATA\n";
+            std::cerr << "This clears data-node object state only; MDS namespace metadata is not removed.\n";
+            return false;
+        }
+        if (!FLAGS_reset_nodes_purge_objects && !FLAGS_reset_nodes_purge_file_meta) {
+            std::cerr << "nothing to reset: purge_objects and purge_file_meta are both false\n";
+            return false;
+        }
+        if (!RefreshClusterView()) {
+            return false;
+        }
+
+        const bool include_real = ResetScopeIncludes("real");
+        const bool include_virtual = ResetScopeIncludes("virtual");
+        if (!include_real && !include_virtual) {
+            std::cerr << "reset scope must include real, virtual, or all\n";
+            return false;
+        }
+
+        uint64_t target_count = 0;
+        uint64_t success_count = 0;
+        uint64_t total_objects_removed = 0;
+        uint64_t total_file_meta_removed = 0;
+        std::map<std::string, bool> seen_endpoints;
+        for (const auto& node : nodes_) {
+            const bool is_real = node.node_type() == zb::rpc::NODE_REAL;
+            const bool is_virtual = node.node_type() == zb::rpc::NODE_VIRTUAL_POOL;
+            if ((!is_real && !is_virtual) ||
+                (is_real && !include_real) ||
+                (is_virtual && !include_virtual)) {
+                continue;
+            }
+            if (node.address().empty()) {
+                std::cerr << "skip node with empty address: " << node.node_id() << '\n';
+                continue;
+            }
+            const std::string dedupe_key = node.node_type() == zb::rpc::NODE_VIRTUAL_POOL
+                                               ? ("virtual|" + node.address())
+                                               : ("real|" + node.address());
+            if (seen_endpoints[dedupe_key]) {
+                continue;
+            }
+            seen_endpoints[dedupe_key] = true;
+            ++target_count;
+
+            zb::rpc::ResetNodeDataReply reply;
+            std::string error;
+            const bool ok = reset_client_.ResetNode(node.address(),
+                                                    FLAGS_reset_nodes_purge_objects,
+                                                    FLAGS_reset_nodes_purge_file_meta,
+                                                    &reply,
+                                                    &error);
+            std::cout << "reset_node id=" << node.node_id()
+                      << " type=" << NodeTypeName(node.node_type())
+                      << " address=" << node.address()
+                      << " ok=" << (ok ? "true" : "false")
+                      << " status_code=" << static_cast<int>(reply.status().code())
+                      << " objects_removed=" << reply.objects_removed()
+                      << " file_meta_removed=" << reply.file_meta_removed();
+            if (!ok) {
+                std::cout << " error=" << error;
+            }
+            std::cout << '\n';
+            if (ok) {
+                ++success_count;
+                total_objects_removed += reply.objects_removed();
+                total_file_meta_removed += reply.file_meta_removed();
+            }
+        }
+
+        std::cout << "reset_target_nodes=" << target_count << '\n';
+        std::cout << "reset_success_nodes=" << success_count << '\n';
+        std::cout << "reset_total_objects_removed=" << total_objects_removed << '\n';
+        std::cout << "reset_total_file_meta_removed=" << total_file_meta_removed << '\n';
+        std::cout << "mds_namespace_cleared=false\n";
+        if (target_count == 0) {
+            std::cerr << "no real/virtual nodes matched reset scope\n";
+            return false;
+        }
+        return target_count == success_count;
+    }
+
     bool RunMasstreeSuite() {
         return (FLAGS_masstree_path_list_file.empty() || RunMasstreeTemplateGenerateDemo()) &&
                RunMasstreeImportDemo() && RunMasstreeQueryDemo();
@@ -1423,13 +1597,18 @@ private:
         actions_.push_back({"10",
                             "TC-P4A Masstree \u6a21\u677f\u751f\u6210",
                             "\u6839\u636e txt \u8def\u5f84\u6587\u4ef6\u751f\u6210 Masstree \u6a21\u677f",
-                            "10 template_id=<id> path_list_file=<path> [repeat_dir_prefix=<prefix>] [key=value ...]",
+                            "10 template_id=<id> path_list_file=<path> [repeat_dir_prefix=<prefix>] [leaf_nodes_are_files=true|false] [key=value ...]",
                             {"template", "template_generate", "p4a"}});
         actions_.push_back({"5",
                             "TC-P5 Masstree \u67e5\u8be2",
                             "\u6267\u884c\u968f\u673a\u5143\u6570\u636e\u67e5\u8be2\u5e76\u8f93\u51fa\u65f6\u5ef6\u7edf\u8ba1",
                             "5 [n=<count>] [query_mode=random_path_lookup|random_inode]",
                             {"query", "p5"}});
+        actions_.push_back({"20",
+                            "\u6e05\u7a7a\u771f\u5b9e/\u865a\u62df\u8282\u70b9\u6570\u636e",
+                            "\u901a\u8fc7 RPC \u6e05\u7a7a real/virtual node \u672c\u5730\u5bf9\u8c61\u548c\u8282\u70b9\u4fa7\u5143\u6570\u636e",
+                            "20 force=true confirm=RESET_NODE_DATA [scope=real,virtual]",
+                            {"reset", "reset_nodes"}});
         actions_.push_back({"q", "\u9000\u51fa", "\u9000\u51fa\u6f14\u793a\u63a7\u5236\u53f0", "q", {"\u9000\u51fa", "exit"}});
     }
 
@@ -1444,7 +1623,7 @@ private:
             return BuildInfoResult("\u672a\u77e5\u547d\u4ee4",
                                    false,
                                    "\u4e0d\u652f\u6301\u7684\u64cd\u4f5c: " + command.action,
-                                   "\u8bf7\u8f93\u5165 0\u30011\u30012\u30013\u30014\u30015\u300110 \u6216 q");
+                                   "\u8bf7\u8f93\u5165 0\u30011\u30012\u30013\u30014\u30015\u300110\u300120 \u6216 q");
         }
         if (action->id == "q") {
             if (should_exit) {
@@ -1509,6 +1688,13 @@ private:
                                          "Masstree \u67e5\u8be2\u5931\u8d25",
                                          [&]() { return RunMasstreeQueryDemo(); });
         }
+        if (action->id == "20") {
+            return ExecuteCapturedAction(*action,
+                                         command.raw,
+                                         "\u771f\u5b9e/\u865a\u62df\u8282\u70b9\u6570\u636e\u6e05\u7a7a\u5b8c\u6210",
+                                         "\u771f\u5b9e/\u865a\u62df\u8282\u70b9\u6570\u636e\u6e05\u7a7a\u5931\u8d25",
+                                         [&]() { return RunResetNodesScenario(); });
+        }
         return BuildInfoResult(action->title, false, "\u672a\u5904\u7406\u7684\u64cd\u4f5c\u5206\u53d1", action->usage);
     }
 
@@ -1520,7 +1706,7 @@ private:
             const zb::demo::ParsedCommand command = zb::demo::ParseCommandLine(input);
             if (!command.ok) {
                 zb::demo::RenderResult(
-                    BuildInfoResult("\u8f93\u5165\u9519\u8bef", false, command.error, "\u8bf7\u8f93\u5165 0\u30011\u30012\u30013\u30014\u30015\u300110 \u6216 q"));
+                    BuildInfoResult("\u8f93\u5165\u9519\u8bef", false, command.error, "\u8bf7\u8f93\u5165 0\u30011\u30012\u30013\u30014\u30015\u300110\u300120 \u6216 q"));
                 continue;
             }
             bool should_exit = false;
@@ -1629,12 +1815,13 @@ private:
         }
         out << "\nExamples:\n";
         out << "  1 tc_p1_expected_real_node_count=1 tc_p1_expected_virtual_node_count=99\n";
-        out << "  10 template_id=template-pathlist-100m path_list_file=examples/masstree_path_list_sample.txt repeat_dir_prefix=copy\n";
+        out << "  10 template_id=template-pathlist-100m path_list_file=examples/masstree_path_list_sample.txt repeat_dir_prefix=copy leaf_nodes_are_files=true\n";
         out << "  4 namespace=demo-ns generation=gen-report-001 template_mode=page_fast\n";
         out << "  4 namespace=demo-ns generation=gen-report-002 template_id=template-pathlist-100m template_mode=page_fast\n";
         out << "  5 n=1\n";
         out << "  5 n=1000 query_mode=random_path_lookup log_file=logs/p5_run.log\n";
         out << "  5 n=1000 query_mode=random_inode log_file=logs/p5_inode_run.log\n";
+        out << "  20 force=true confirm=RESET_NODE_DATA scope=real,virtual\n";
         return out.str();
     }
     bool ApplyCommandArgs(const zb::demo::ParsedCommand& command, std::string* error) {
@@ -1686,6 +1873,12 @@ private:
 	                FLAGS_masstree_path_list_file = value;
 	            } else if (key == "repeat_dir_prefix" || key == "masstree_repeat_dir_prefix") {
 	                FLAGS_masstree_repeat_dir_prefix = value;
+	            } else if (key == "leaf_nodes_are_files" || key == "masstree_path_list_leaf_nodes_are_files") {
+                bool parsed_bool = false;
+                if (!ParseBoolValue(key, value, &parsed_bool, error)) {
+                    return false;
+                }
+                FLAGS_masstree_path_list_leaf_nodes_are_files = parsed_bool;
 	            } else if (key == "max_files_per_leaf_dir" || key == "masstree_max_files_per_leaf_dir") {
                 if (!ParseUint32Value(key, value, &parsed_u32, error)) {
                     return false;
@@ -1751,6 +1944,28 @@ private:
                     return false;
                 }
                 FLAGS_posix_sync_on_close = parsed_bool;
+            } else if (key == "force" || key == "reset_nodes_force") {
+                bool parsed_bool = false;
+                if (!ParseBoolValue(key, value, &parsed_bool, error)) {
+                    return false;
+                }
+                FLAGS_reset_nodes_force = parsed_bool;
+            } else if (key == "confirm" || key == "reset_nodes_confirm") {
+                FLAGS_reset_nodes_confirm = value;
+            } else if (key == "scope" || key == "reset_nodes_scope") {
+                FLAGS_reset_nodes_scope = value;
+            } else if (key == "purge_objects" || key == "reset_nodes_purge_objects") {
+                bool parsed_bool = false;
+                if (!ParseBoolValue(key, value, &parsed_bool, error)) {
+                    return false;
+                }
+                FLAGS_reset_nodes_purge_objects = parsed_bool;
+            } else if (key == "purge_file_meta" || key == "reset_nodes_purge_file_meta") {
+                bool parsed_bool = false;
+                if (!ParseBoolValue(key, value, &parsed_bool, error)) {
+                    return false;
+                }
+                FLAGS_reset_nodes_purge_file_meta = parsed_bool;
             } else if (key == "tc_p1_expected_real_node_count") {
                 if (!ParseUint64Value(key, value, &parsed_u64, error)) {
                     return false;
@@ -1980,19 +2195,30 @@ private:
         std::cout << "inspected_node_id=" << last_result.inspection.node_id << std::endl;
         std::cout << "inspected_disk_id=" << last_result.inspection.disk_id << std::endl;
         std::cout << "inspected_tier=" << DisplayTierName(last_result.inspection.actual_tier) << std::endl;
-        std::cout << "backend_object_id=" << last_result.inspection.backend_object_id << std::endl;
-        std::cout << "backend_objects=" << JoinStrings(last_result.inspection.backend_objects, ", ") << std::endl;
-        std::cout << "backend_mount_point=" << last_result.inspection.backend_mount_point << std::endl;
-        std::cout << "backend_object_path=" << last_result.inspection.backend_object_path << std::endl;
-        std::cout << "backend_object_paths=" << JoinStrings(last_result.inspection.backend_object_paths, ", ")
-                  << std::endl;
-        PrintBoolMetric("backend_object_exists", last_result.inspection.backend_object_exists);
-        PrintByteMetric("backend_object_size_bytes", last_result.inspection.backend_object_size_bytes);
-        std::cout << "backend_object_hash=" << FormatHex64(last_result.inspection.backend_object_hash)
-                  << std::endl;
-        std::cout << "backend_dir_excerpt="
-                  << JoinStrings(last_result.inspection.backend_dir_excerpt, ", ")
-                  << std::endl;
+        if (last_result.inspection.actual_tier == "virtual") {
+            PrintByteMetric("object_unit_size_bytes", last_result.inspection.object_unit_size_bytes);
+            std::cout << "object_count=" << last_result.inspection.object_count << std::endl;
+            std::cout << "first_object_id=" << last_result.inspection.first_object_id << std::endl;
+            std::cout << "last_object_id=" << last_result.inspection.last_object_id << std::endl;
+            std::cout << "object_ids=" << JoinStrings(last_result.inspection.backend_objects, ", ") << std::endl;
+        } else {
+            std::cout << "backend_object_id=" << last_result.inspection.backend_object_id << std::endl;
+            std::cout << "backend_objects=" << JoinStrings(last_result.inspection.backend_objects, ", ") << std::endl;
+            std::cout << "backend_mount_point=" << last_result.inspection.backend_mount_point << std::endl;
+            std::cout << "backend_object_path=" << last_result.inspection.backend_object_path << std::endl;
+            std::cout << "backend_object_paths=" << JoinStrings(last_result.inspection.backend_object_paths, ", ")
+                      << std::endl;
+            PrintBoolMetric("backend_object_exists", last_result.inspection.backend_object_exists);
+            PrintByteMetric("backend_object_size_bytes", last_result.inspection.backend_object_size_bytes);
+            std::cout << "backend_object_hash=" << FormatHex64(last_result.inspection.backend_object_hash)
+                      << std::endl;
+            std::cout << "backend_dir_excerpt="
+                      << JoinStrings(last_result.inspection.backend_dir_excerpt, ", ")
+                      << std::endl;
+        }
+
+        const bool verify_content_hash =
+            options.verify_hash && last_result.inspection.actual_tier != "virtual";
 
         std::vector<CheckResult> checks;
         AddCheck(&checks,
@@ -2007,10 +2233,13 @@ private:
                      " expected=" + std::to_string(options.file_size_bytes));
         AddCheck(&checks,
                  "io.hash_match",
-                 !options.verify_hash || last_result.read_hash == last_result.write_hash,
-                 options.verify_hash ? ("write=" + FormatHex64(last_result.write_hash) +
-                                        " read=" + FormatHex64(last_result.read_hash))
-                                     : "hash verification disabled");
+                 !verify_content_hash || last_result.read_hash == last_result.write_hash,
+                 !options.verify_hash
+                     ? "hash verification disabled"
+                     : (last_result.inspection.actual_tier == "virtual"
+                            ? "virtual tier returns synthetic 'x' payload on read"
+                            : ("write=" + FormatHex64(last_result.write_hash) +
+                               " read=" + FormatHex64(last_result.read_hash))));
         AddCheck(&checks,
                  "metadata.size_bytes",
                  last_result.inspection.size_bytes == options.file_size_bytes,
@@ -2021,21 +2250,43 @@ private:
                  last_result.inspection.actual_tier == options.expected_tier,
                  "actual=" + DisplayTierName(last_result.inspection.actual_tier) +
                      " expected=" + DisplayTierName(options.expected_tier));
-        AddCheck(&checks,
-                 "backend.object_exists",
-                 last_result.inspection.backend_object_exists,
-                 last_result.inspection.backend_object_path);
-        AddCheck(&checks,
-                 "backend.object_size",
-                 last_result.inspection.backend_object_size_bytes == options.file_size_bytes,
-                 "actual=" + std::to_string(last_result.inspection.backend_object_size_bytes) +
-                     " expected=" + std::to_string(options.file_size_bytes));
-        AddCheck(&checks,
-                 "backend.object_hash",
-                 !options.verify_hash || last_result.inspection.backend_object_hash == last_result.write_hash,
-                 options.verify_hash ? ("backend=" + FormatHex64(last_result.inspection.backend_object_hash) +
-                                        " write=" + FormatHex64(last_result.write_hash))
-                                     : "backend hash verification disabled");
+        if (last_result.inspection.actual_tier == "virtual") {
+            const uint32_t expected_object_count =
+                options.file_size_bytes == 0 || last_result.inspection.object_unit_size_bytes == 0
+                    ? 0
+                    : static_cast<uint32_t>((options.file_size_bytes +
+                                             last_result.inspection.object_unit_size_bytes - 1) /
+                                            last_result.inspection.object_unit_size_bytes);
+            AddCheck(&checks,
+                     "virtual.object_count",
+                     last_result.inspection.object_count == expected_object_count,
+                     "actual=" + std::to_string(last_result.inspection.object_count) +
+                         " expected=" + std::to_string(expected_object_count));
+            AddCheck(&checks,
+                     "virtual.object_ids",
+                     static_cast<uint32_t>(last_result.inspection.backend_objects.size()) ==
+                         last_result.inspection.object_count &&
+                         !last_result.inspection.first_object_id.empty() &&
+                         !last_result.inspection.last_object_id.empty(),
+                     "first=" + last_result.inspection.first_object_id +
+                         " last=" + last_result.inspection.last_object_id);
+        } else {
+            AddCheck(&checks,
+                     "backend.object_exists",
+                     last_result.inspection.backend_object_exists,
+                     last_result.inspection.backend_object_path);
+            AddCheck(&checks,
+                     "backend.object_size",
+                     last_result.inspection.backend_object_size_bytes == options.file_size_bytes,
+                     "actual=" + std::to_string(last_result.inspection.backend_object_size_bytes) +
+                         " expected=" + std::to_string(options.file_size_bytes));
+            AddCheck(&checks,
+                     "backend.object_hash",
+                     !options.verify_hash || last_result.inspection.backend_object_hash == last_result.write_hash,
+                     options.verify_hash ? ("backend=" + FormatHex64(last_result.inspection.backend_object_hash) +
+                                            " write=" + FormatHex64(last_result.write_hash))
+                                         : "backend hash verification disabled");
+        }
 
         bool ok = true;
         for (const auto& check : checks) {
@@ -2093,9 +2344,11 @@ private:
         uint64_t read_hash = 14695981039346656037ULL;
         uint64_t bytes_read = 0;
         uint64_t read_elapsed_us = 0;
+        const bool verify_read_hash =
+            options.verify_hash && options.expected_tier != "virtual";
         if (!ReadPatternFile(mounted_path,
                              options.chunk_size_bytes,
-                             options.verify_hash,
+                             verify_read_hash,
                              &bytes_read,
                              &read_hash,
                              &read_elapsed_us)) {
@@ -2182,21 +2435,29 @@ private:
         uint64_t backend_object_hash = 0;
         std::vector<std::string> backend_dir_excerpt;
         std::vector<std::string> backend_objects;
-        if (!backend_mount_point.empty()) {
+        if (!backend_mount_point.empty() || actual_tier == "virtual") {
             const uint64_t object_count =
                 attr.size() == 0 ? 0 : ((attr.size() - 1U) / kDefaultObjectUnitSize) + 1U;
             backend_object_hash = 14695981039346656037ULL;
             backend_object_exists = object_count > 0;
             for (uint64_t index = 0; index < object_count; ++index) {
                 const std::string object_id = BuildStableObjectId(attr.inode_id(), static_cast<uint32_t>(index));
+                if (index == 0) {
+                    if (actual_tier != "virtual") {
+                        const std::string prefix = BuildObjectPrefix(object_id);
+                        const fs::path object_dir =
+                            fs::path(backend_mount_point) / prefix.substr(0, 2) / prefix.substr(2, 2);
+                        backend_object_path = (object_dir / object_id).string();
+                        backend_dir_excerpt = BuildDirectoryExcerpt(object_dir);
+                    }
+                }
+                backend_objects.push_back(object_id);
+                if (actual_tier == "virtual") {
+                    continue;
+                }
                 const std::string prefix = BuildObjectPrefix(object_id);
                 const fs::path object_dir = fs::path(backend_mount_point) / prefix.substr(0, 2) / prefix.substr(2, 2);
                 const fs::path object_path = object_dir / object_id;
-                if (index == 0) {
-                    backend_object_path = object_path.string();
-                    backend_dir_excerpt = BuildDirectoryExcerpt(object_dir);
-                }
-                backend_objects.push_back(object_id);
                 backend_object_paths.push_back(object_path.string());
                 std::error_code ec;
                 const bool exists = fs::exists(object_path, ec);
@@ -2216,6 +2477,10 @@ private:
             out->node_id = node_id;
             out->disk_id = disk_id;
             out->actual_tier = actual_tier;
+            out->object_unit_size_bytes = kDefaultObjectUnitSize;
+            out->object_count = static_cast<uint32_t>(backend_objects.size());
+            out->first_object_id = backend_objects.empty() ? std::string() : backend_objects.front();
+            out->last_object_id = backend_objects.empty() ? std::string() : backend_objects.back();
             out->backend_object_id = backend_objects.empty() ? std::string() : backend_objects.front();
             out->backend_objects = backend_objects;
             out->backend_mount_point = backend_mount_point;
@@ -2250,6 +2515,7 @@ private:
         if (!FLAGS_masstree_repeat_dir_prefix.empty()) {
             request.set_repeat_dir_prefix(FLAGS_masstree_repeat_dir_prefix);
         }
+        request.set_path_list_leaf_nodes_are_files(FLAGS_masstree_path_list_leaf_nodes_are_files);
         request.set_verify_inode_samples(FLAGS_masstree_verify_inode_samples);
         request.set_verify_dentry_samples(FLAGS_masstree_verify_dentry_samples);
 
@@ -2264,6 +2530,7 @@ private:
         if (!FLAGS_masstree_repeat_dir_prefix.empty()) {
             std::cout << "repeat_dir_prefix=" << FLAGS_masstree_repeat_dir_prefix << '\n';
         }
+        PrintBoolMetric("path_list_leaf_nodes_are_files", FLAGS_masstree_path_list_leaf_nodes_are_files);
         std::cout << "job_id=" << reply.job_id() << '\n';
 
         const auto poll_started_at = std::chrono::steady_clock::now();
@@ -3082,6 +3349,7 @@ private:
     }
     MdsClient mds_;
     SchedulerClient scheduler_;
+    NodeResetClient reset_client_;
     std::vector<zb::rpc::NodeView> nodes_;
     uint64_t cluster_generation_{0};
     std::map<std::string, zb::rpc::NodeType> node_type_by_id_;

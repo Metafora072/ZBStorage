@@ -13,6 +13,7 @@
 #include <memory>
 #include <random>
 #include <sstream>
+#include <unordered_set>
 #include <vector>
 
 #include "../masstree_meta/MasstreeManifest.h"
@@ -170,9 +171,14 @@ bool NormalizePathListRelativePath(const std::string& raw_path,
     return true;
 }
 
-bool PathListEntryIsDirectory(const std::string& normalized_path, bool explicit_dir) {
+bool PathListEntryIsDirectory(const std::string& normalized_path,
+                              bool explicit_dir,
+                              bool leaf_nodes_are_files) {
     if (normalized_path.empty() || explicit_dir) {
         return true;
+    }
+    if (leaf_nodes_are_files) {
+        return false;
     }
     return PathBaseName(normalized_path).find('.') == std::string::npos;
 }
@@ -182,6 +188,7 @@ bool TemplateManifestMatchesNamespaceManifest(const zb::mds::MasstreeNamespaceMa
     return candidate.source_mode == target.source_mode &&
            candidate.path_list_fingerprint == target.path_list_fingerprint &&
            candidate.repeat_dir_prefix == target.repeat_dir_prefix &&
+           candidate.path_list_leaf_nodes_are_files == target.path_list_leaf_nodes_are_files &&
            candidate.template_base_file_count == target.template_base_file_count &&
            candidate.template_repeat_count == target.template_repeat_count &&
            candidate.file_count == target.file_count &&
@@ -254,6 +261,7 @@ bool ResolveTemplateManifestForNamespace(const std::string& masstree_root,
 }
 
 bool BuildQueryPathSourceFromPathList(const std::string& path_list_file,
+                                      bool path_list_leaf_nodes_are_files,
                                       const std::string& output_path,
                                       uint64_t* path_count,
                                       std::string* error) {
@@ -275,7 +283,12 @@ bool BuildQueryPathSourceFromPathList(const std::string& path_list_file,
         return false;
     }
 
-    uint64_t count = 0;
+    struct PathEntry {
+        std::string normalized_path;
+        bool explicit_dir{false};
+    };
+
+    std::vector<PathEntry> entries;
     std::string line;
     while (std::getline(input, line)) {
         std::string normalized_path;
@@ -290,10 +303,40 @@ bool BuildQueryPathSourceFromPathList(const std::string& path_list_file,
             }
             return false;
         }
-        if (normalized_path.empty() || PathListEntryIsDirectory(normalized_path, explicit_dir)) {
+        if (normalized_path.empty()) {
             continue;
         }
-        output << normalized_path << '\n';
+        entries.push_back({std::move(normalized_path), explicit_dir});
+    }
+
+    std::unordered_set<std::string> parent_paths;
+    for (const auto& entry : entries) {
+        std::string current = entry.normalized_path;
+        while (true) {
+            const size_t slash = current.rfind('/');
+            if (slash == std::string::npos) {
+                break;
+            }
+            current.resize(slash);
+            if (current.empty()) {
+                break;
+            }
+            parent_paths.insert(current);
+        }
+    }
+
+    uint64_t count = 0;
+    for (const auto& entry : entries) {
+        const bool has_children = parent_paths.find(entry.normalized_path) != parent_paths.end();
+        const bool is_dir =
+            entry.explicit_dir || has_children ||
+            PathListEntryIsDirectory(entry.normalized_path,
+                                     false,
+                                     path_list_leaf_nodes_are_files);
+        if (is_dir) {
+            continue;
+        }
+        output << entry.normalized_path << '\n';
         ++count;
     }
 
@@ -530,7 +573,11 @@ bool EnsureTemplateQueryPathSource(zb::mds::MasstreeNamespaceManifest* template_
     std::filesystem::create_directories(query_path_source_path.parent_path());
     const std::filesystem::path tmp_path = query_path_source_path.string() + ".tmp";
     uint64_t path_count = 0;
-    if (!BuildQueryPathSourceFromPathList(path_list_file, tmp_path.string(), &path_count, error)) {
+    if (!BuildQueryPathSourceFromPathList(path_list_file,
+                                          template_manifest->path_list_leaf_nodes_are_files,
+                                          tmp_path.string(),
+                                          &path_count,
+                                          error)) {
         std::error_code remove_ec;
         std::filesystem::remove(tmp_path, remove_ec);
         return false;
@@ -2021,6 +2068,7 @@ void MdsServiceImpl::GenerateMasstreeTemplate(google::protobuf::RpcController* c
     generate_request.template_id = request->template_id();
     generate_request.path_list_file = request->path_list_file();
     generate_request.repeat_dir_prefix = request->repeat_dir_prefix();
+    generate_request.path_list_leaf_nodes_are_files = request->path_list_leaf_nodes_are_files();
     generate_request.verify_inode_samples = request->verify_inode_samples();
     generate_request.verify_dentry_samples = request->verify_dentry_samples();
 

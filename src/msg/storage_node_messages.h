@@ -99,6 +99,18 @@ struct DeleteObjectReply {
     Status status;
 };
 
+struct ResetNodeDataRequest {
+    std::string confirm_token;
+    bool purge_objects{true};
+    bool purge_file_meta{true};
+};
+
+struct ResetNodeDataReply {
+    Status status;
+    uint64_t objects_removed{0};
+    uint64_t file_meta_removed{0};
+};
+
 struct DiskReport {
     std::string id;
     std::string mount_point;

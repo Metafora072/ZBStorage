@@ -20,6 +20,7 @@ public:
         std::string template_id;
         std::string path_list_file;
         std::string repeat_dir_prefix;
+        bool path_list_leaf_nodes_are_files{false};
         uint32_t verify_inode_samples{16};
         uint32_t verify_dentry_samples{16};
     };

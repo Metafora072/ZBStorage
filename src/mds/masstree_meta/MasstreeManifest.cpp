@@ -101,6 +101,9 @@ bool MasstreeNamespaceManifest::LoadFromFile(const std::string& manifest_path,
             parsed.path_list_fingerprint = value;
         } else if (key == "repeat_dir_prefix") {
             parsed.repeat_dir_prefix = value;
+        } else if (key == "path_list_leaf_nodes_are_files") {
+            parsed.path_list_leaf_nodes_are_files =
+                (value == "1" || value == "true" || value == "TRUE" || value == "yes");
         } else if (key == "path_prefix") {
             parsed.path_prefix = value;
         } else if (key == "generation_id") {
@@ -463,6 +466,7 @@ bool MasstreeNamespaceManifest::SaveToFile(const std::string& manifest_path, std
     out << "path_list_file=" << path_list_file << "\n";
     out << "path_list_fingerprint=" << path_list_fingerprint << "\n";
     out << "repeat_dir_prefix=" << repeat_dir_prefix << "\n";
+    out << "path_list_leaf_nodes_are_files=" << (path_list_leaf_nodes_are_files ? 1 : 0) << "\n";
     out << "path_prefix=" << path_prefix << "\n";
     out << "generation_id=" << generation_id << "\n";
     out << "inode_records_path=" << inode_records_path << "\n";

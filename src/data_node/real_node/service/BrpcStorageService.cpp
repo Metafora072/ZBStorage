@@ -181,6 +181,32 @@ void BrpcStorageService::DeleteObject(google::protobuf::RpcController* cntl_base
     LogFailure("DeleteObject", st, "disk_id=" + request->disk_id() + " object_id=" + request->object_id());
 }
 
+void BrpcStorageService::ResetNodeData(google::protobuf::RpcController* cntl_base,
+                                       const zb::rpc::ResetNodeDataRequest* request,
+                                       zb::rpc::ResetNodeDataReply* response,
+                                       google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+    (void)cntl_base;
+    if (!service_ || !request || !response) {
+        zb::rpc::Status* status = response ? response->mutable_status() : nullptr;
+        if (status) {
+            status->set_code(zb::rpc::STATUS_INTERNAL_ERROR);
+            status->set_message("Service not initialized");
+        }
+        return;
+    }
+
+    zb::msg::ResetNodeDataRequest internal_req;
+    internal_req.confirm_token = request->confirm_token();
+    internal_req.purge_objects = request->purge_objects();
+    internal_req.purge_file_meta = request->purge_file_meta();
+    const zb::msg::ResetNodeDataReply internal_reply = service_->ResetNodeData(internal_req);
+    FillStatus(internal_reply.status, response->mutable_status());
+    response->set_objects_removed(internal_reply.objects_removed);
+    response->set_file_meta_removed(internal_reply.file_meta_removed);
+    LogFailure("ResetNodeData", internal_reply.status, "");
+}
+
 void BrpcStorageService::ReadArchivedFile(google::protobuf::RpcController* cntl_base,
                                           const zb::rpc::ReadArchivedFileRequest* request,
                                           zb::rpc::ReadArchivedFileReply* response,

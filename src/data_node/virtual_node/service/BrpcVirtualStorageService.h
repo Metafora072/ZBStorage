@@ -24,6 +24,11 @@ public:
                       zb::rpc::DeleteObjectReply* response,
                       google::protobuf::Closure* done) override;
 
+    void ResetNodeData(google::protobuf::RpcController* cntl_base,
+                       const zb::rpc::ResetNodeDataRequest* request,
+                       zb::rpc::ResetNodeDataReply* response,
+                       google::protobuf::Closure* done) override;
+
     void ReadArchivedFile(google::protobuf::RpcController* cntl_base,
                           const zb::rpc::ReadArchivedFileRequest* request,
                           zb::rpc::ReadArchivedFileReply* response,

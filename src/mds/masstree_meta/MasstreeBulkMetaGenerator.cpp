@@ -254,9 +254,12 @@ bool NormalizeRelativeTreePath(std::string raw,
     return true;
 }
 
-bool NodeIsDirectory(const PathListNode& node) {
+bool NodeIsDirectory(const PathListNode& node, bool leaf_nodes_are_files) {
     if (node.parent == kInvalidNodeIndex || node.explicit_dir || !node.children.empty()) {
         return true;
+    }
+    if (leaf_nodes_are_files) {
+        return false;
     }
     return node.explicit_entry && node.name.find('.') == std::string::npos;
 }
@@ -509,6 +512,7 @@ bool WriteVerifyManifest(const fs::path& path,
     out << "dir_count=" << manifest.dir_count << "\n";
     out << "template_repeat_count=" << manifest.template_repeat_count << "\n";
     out << "repeat_dir_prefix=" << manifest.repeat_dir_prefix << "\n";
+    out << "path_list_leaf_nodes_are_files=" << (manifest.path_list_leaf_nodes_are_files ? 1 : 0) << "\n";
     out << "path_list_fingerprint=" << manifest.path_list_fingerprint << "\n";
     out << "level1_dir_count=" << manifest.level1_dir_count << "\n";
     out << "leaf_dir_count=" << manifest.leaf_dir_count << "\n";
@@ -693,7 +697,7 @@ bool BuildPathListPlan(const MasstreeBulkMetaGenerator::Request& request,
     for (size_t i = 1; i < local_plan.nodes.size(); ++i) {
         fingerprint_order.push_back(i);
         const PathListNode& node = local_plan.nodes[i];
-        const bool is_dir = NodeIsDirectory(node);
+        const bool is_dir = NodeIsDirectory(node, request.path_list_leaf_nodes_are_files);
         const size_t depth = static_cast<size_t>(node.depth);
         if (is_dir) {
             ++local_plan.base_dir_count;
@@ -720,7 +724,8 @@ bool BuildPathListPlan(const MasstreeBulkMetaGenerator::Request& request,
     });
     std::string fingerprint_input;
     for (size_t node_index : fingerprint_order) {
-        fingerprint_input.push_back(NodeIsDirectory(local_plan.nodes[node_index]) ? 'D' : 'F');
+        fingerprint_input.push_back(
+            NodeIsDirectory(local_plan.nodes[node_index], request.path_list_leaf_nodes_are_files) ? 'D' : 'F');
         fingerprint_input.push_back(':');
         fingerprint_input.append(local_plan.nodes[node_index].relative_path);
         fingerprint_input.push_back('\n');
@@ -765,6 +770,7 @@ bool BuildPathListPlan(const MasstreeBulkMetaGenerator::Request& request,
 
 bool AssignPathListSubtreeInodes(const PathListPlan& plan,
                                  size_t node_index,
+                                 bool path_list_leaf_nodes_are_files,
                                  uint64_t parent_inode_id,
                                  uint64_t now_sec,
                                  uint64_t namespace_seed,
@@ -786,7 +792,7 @@ bool AssignPathListSubtreeInodes(const PathListPlan& plan,
     const PathListNode& node = plan.nodes[node_index];
     const uint64_t inode_id = (*next_inode)++;
     (*node_inode_ids)[node_index] = inode_id;
-    const bool is_dir = NodeIsDirectory(node);
+    const bool is_dir = NodeIsDirectory(node, path_list_leaf_nodes_are_files);
     if (is_dir) {
         const uint32_t nlink = static_cast<uint32_t>(2U + node.children.size());
         if (!WriteInodeRecord(inode_out,
@@ -799,6 +805,7 @@ bool AssignPathListSubtreeInodes(const PathListPlan& plan,
         for (size_t child_index : node.children) {
             if (!AssignPathListSubtreeInodes(plan,
                                              child_index,
+                                             path_list_leaf_nodes_are_files,
                                              inode_id,
                                              now_sec,
                                              namespace_seed,
@@ -832,6 +839,7 @@ bool AssignPathListSubtreeInodes(const PathListPlan& plan,
 
 bool EmitPathListDentryGroup(const PathListPlan& plan,
                              size_t parent_index,
+                             bool path_list_leaf_nodes_are_files,
                              uint64_t parent_inode_id,
                              const std::vector<uint64_t>& node_inode_ids,
                              std::ofstream* dentry_out,
@@ -851,7 +859,7 @@ bool EmitPathListDentryGroup(const PathListPlan& plan,
             return false;
         }
         const PathListNode& child = plan.nodes[child_index];
-        const bool child_is_dir = NodeIsDirectory(child);
+        const bool child_is_dir = NodeIsDirectory(child, path_list_leaf_nodes_are_files);
         if (!WriteDentryRecord(dentry_out,
                                parent_inode_id,
                                child.name,
@@ -862,11 +870,12 @@ bool EmitPathListDentryGroup(const PathListPlan& plan,
         }
     }
     for (size_t child_index : parent.children) {
-        if (!NodeIsDirectory(plan.nodes[child_index])) {
+        if (!NodeIsDirectory(plan.nodes[child_index], path_list_leaf_nodes_are_files)) {
             continue;
         }
         if (!EmitPathListDentryGroup(plan,
                                      child_index,
+                                     path_list_leaf_nodes_are_files,
                                      node_inode_ids[child_index],
                                      node_inode_ids,
                                      dentry_out,
@@ -1073,6 +1082,7 @@ bool MasstreeBulkMetaGenerator::Generate(const Request& request,
             for (size_t child_index : plan.nodes[0].children) {
                 if (!AssignPathListSubtreeInodes(plan,
                                                  child_index,
+                                                 request.path_list_leaf_nodes_are_files,
                                                  wrapper_inode,
                                                  now_sec,
                                                  namespace_seed,
@@ -1089,6 +1099,7 @@ bool MasstreeBulkMetaGenerator::Generate(const Request& request,
             }
             if (!EmitPathListDentryGroup(plan,
                                          0,
+                                         request.path_list_leaf_nodes_are_files,
                                          wrapper_inode,
                                          node_inode_ids,
                                          &dentry_out,
@@ -1250,6 +1261,7 @@ bool MasstreeBulkMetaGenerator::Generate(const Request& request,
     manifest.source_mode = source_mode;
     manifest.template_id = request.namespace_id;
     manifest.path_list_file = request.path_list_file;
+    manifest.path_list_leaf_nodes_are_files = request.path_list_leaf_nodes_are_files;
     manifest.path_list_fingerprint = path_list_fingerprint;
     manifest.repeat_dir_prefix = repeat_dir_prefix;
     manifest.manifest_path = manifest_path.string();

@@ -15,6 +15,7 @@ struct MasstreeNamespaceManifest {
     std::string path_list_file;
     std::string path_list_fingerprint;
     std::string repeat_dir_prefix;
+    bool path_list_leaf_nodes_are_files{false};
     std::string manifest_path;
     std::string inode_records_path;
     std::string dentry_records_path;

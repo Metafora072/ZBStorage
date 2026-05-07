@@ -11,13 +11,15 @@ MOUNT_POINT="${MOUNT_POINT:-${DEMO_ROOT}/mnt}"
 TEMPLATE_ID="${1:-${MASSTREE_TEMPLATE_ID:-}}"
 PATH_LIST_FILE="${2:-${MASSTREE_PATH_LIST_FILE:-}}"
 REPEAT_DIR_PREFIX="${3:-${MASSTREE_REPEAT_DIR_PREFIX:-copy}}"
+LEAF_NODES_ARE_FILES="${4:-${MASSTREE_PATH_LIST_LEAF_NODES_ARE_FILES:-false}}"
 VERIFY_INODE_SAMPLES="${MASSTREE_VERIFY_INODE_SAMPLES:-32}"
 VERIFY_DENTRY_SAMPLES="${MASSTREE_VERIFY_DENTRY_SAMPLES:-32}"
 
 if [[ -z "${TEMPLATE_ID}" || -z "${PATH_LIST_FILE}" ]]; then
-  echo "Usage: $0 <template_id> <path_list_file> [repeat_dir_prefix]"
+  echo "Usage: $0 <template_id> <path_list_file> [repeat_dir_prefix] [leaf_nodes_are_files]"
   echo "Environment:"
   echo "  BUILD_DIR, MDS_ADDR, SCHEDULER_ADDR, MOUNT_POINT"
+  echo "  MASSTREE_PATH_LIST_LEAF_NODES_ARE_FILES"
   echo "  MASSTREE_VERIFY_INODE_SAMPLES, MASSTREE_VERIFY_DENTRY_SAMPLES"
   exit 1
 fi
@@ -40,5 +42,6 @@ exec "${BUILD_DIR}/system_demo_tool" \
   --masstree_template_id="${TEMPLATE_ID}" \
   --masstree_path_list_file="${PATH_LIST_FILE}" \
   --masstree_repeat_dir_prefix="${REPEAT_DIR_PREFIX}" \
+  --masstree_path_list_leaf_nodes_are_files="${LEAF_NODES_ARE_FILES}" \
   --masstree_verify_inode_samples="${VERIFY_INODE_SAMPLES}" \
   --masstree_verify_dentry_samples="${VERIFY_DENTRY_SAMPLES}"

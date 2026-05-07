@@ -100,6 +100,7 @@ public:
     zb::msg::Status PutObject(const zb::data_node::ObjectWriteRequest& request);
     zb::data_node::ObjectReadResult GetObject(const zb::data_node::ObjectReadRequest& request);
     zb::msg::Status DeleteObject(const zb::data_node::ObjectDeleteRequest& request);
+    zb::msg::ResetNodeDataReply ResetNodeData(const zb::msg::ResetNodeDataRequest& request);
     zb::msg::DiskReportReply GetDiskReport() const;
     zb::msg::DeleteFileMetaReply DeleteFileMeta(const zb::msg::DeleteFileMetaRequest& request);
     zb::msg::ResolveFileReadReply ResolveFileRead(const zb::msg::ResolveFileReadRequest& request) const;

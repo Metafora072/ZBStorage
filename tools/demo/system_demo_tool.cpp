@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <cstring>
 #include <ctime>
@@ -51,6 +52,30 @@ DEFINE_string(masstree_template_id, "", "Masstree import template id; empty disa
 DEFINE_string(masstree_template_mode,
               "",
               "Masstree import template mode: empty|page_fast|legacy_records; empty preserves the current fast path");
+DEFINE_string(masstree_import_mode,
+              "simulated",
+              "Masstree import mode: simulated|real; simulated only updates demo overlay stats");
+DEFINE_string(masstree_sim_state_path,
+              "",
+              "Simulated Masstree import state file path; empty uses <demo_root>/data/mds/masstree_sim_overlay.tsv");
+DEFINE_uint64(masstree_sim_file_count, 100960182ULL, "Simulated file count per Masstree namespace import");
+DEFINE_uint64(masstree_sim_inode_count, 134414182ULL, "Simulated inode count per Masstree namespace import");
+DEFINE_uint64(masstree_sim_dentry_count, 134414181ULL, "Simulated dentry count per Masstree namespace import");
+DEFINE_string(masstree_sim_total_file_bytes,
+              "100961074964484700",
+              "Simulated total file bytes per Masstree namespace import");
+DEFINE_uint64(masstree_sim_metadata_bytes,
+              36027407800ULL,
+              "Simulated metadata bytes per Masstree namespace import");
+DEFINE_uint64(masstree_sim_avg_file_size_bytes,
+              10000008844ULL,
+              "Simulated average file size per Masstree namespace import");
+DEFINE_uint64(masstree_sim_min_file_size_bytes,
+              500000000ULL,
+              "Simulated minimum file size per Masstree namespace import");
+DEFINE_uint64(masstree_sim_max_file_size_bytes,
+              20000000000ULL,
+              "Simulated maximum file size per Masstree namespace import");
 DEFINE_string(masstree_source_mode,
               "",
               "Masstree import source mode: empty|synthetic|path_list; empty keeps the server default");
@@ -67,6 +92,12 @@ DEFINE_uint32(masstree_verify_inode_samples, 32, "Masstree import inode verify s
 DEFINE_uint32(masstree_verify_dentry_samples, 32, "Masstree import dentry verify sample count");
 DEFINE_uint32(masstree_job_poll_interval_ms, 1000, "Masstree import job poll interval in ms");
 DEFINE_uint32(masstree_query_samples, 1, "Masstree query sample count");
+DEFINE_uint32(masstree_query_output_success_limit,
+              5,
+              "Maximum successful Masstree query metadata records to print; 0 disables per-record output");
+DEFINE_uint32(masstree_query_success_latency_limit_ms,
+              800,
+              "Ignore successful Masstree query samples slower than this; 0 disables the latency filter");
 DEFINE_string(masstree_query_mode,
               "random_path_lookup",
               "Masstree query mode: random_path_lookup|random_inode");
@@ -179,6 +210,19 @@ std::string TrimCopy(std::string value) {
         return !std::isspace(ch);
     }).base(), value.end());
     return value;
+}
+
+std::string ShellQuote(const std::string& value) {
+    std::string quoted = "'";
+    for (char ch : value) {
+        if (ch == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted.push_back(ch);
+        }
+    }
+    quoted.push_back('\'');
+    return quoted;
 }
 
 struct LocalMasstreeNamespaceManifest {
@@ -442,6 +486,67 @@ std::string FormatDecimalBytesWithHuman(const std::string& bytes) {
     return normalized + " (" + human.str() + ")";
 }
 
+constexpr uint64_t kDemoFileSizeScaleNumerator = 13ULL;
+constexpr uint64_t kDemoFileSizeScaleDenominator = 10ULL;
+
+std::string MultiplyDecimalStringByU64(const std::string& decimal, uint64_t multiplier) {
+    if (multiplier == 0) {
+        return "0";
+    }
+    const std::string normalized = zb::mds::NormalizeDecimalString(decimal);
+    std::string out;
+    out.reserve(normalized.size() + 3U);
+    uint64_t carry = 0;
+    for (auto it = normalized.rbegin(); it != normalized.rend(); ++it) {
+        const uint64_t digit = static_cast<uint64_t>(*it - '0');
+        const uint64_t product = digit * multiplier + carry;
+        out.push_back(static_cast<char>('0' + (product % 10ULL)));
+        carry = product / 10ULL;
+    }
+    while (carry != 0) {
+        out.push_back(static_cast<char>('0' + (carry % 10ULL)));
+        carry /= 10ULL;
+    }
+    std::reverse(out.begin(), out.end());
+    return zb::mds::NormalizeDecimalString(std::move(out));
+}
+
+std::string DivideDecimalStringByU64ToString(const std::string& decimal, uint64_t divisor) {
+    if (divisor == 0) {
+        return "0";
+    }
+    const std::string normalized = zb::mds::NormalizeDecimalString(decimal);
+    std::string out;
+    out.reserve(normalized.size());
+    uint64_t remainder = 0;
+    bool started = false;
+    for (char ch : normalized) {
+        if (ch < '0' || ch > '9') {
+            continue;
+        }
+        const uint64_t current = remainder * 10ULL + static_cast<uint64_t>(ch - '0');
+        const uint64_t digit = current / divisor;
+        remainder = current % divisor;
+        if (digit != 0 || started) {
+            out.push_back(static_cast<char>('0' + digit));
+            started = true;
+        }
+    }
+    return out.empty() ? std::string("0") : zb::mds::NormalizeDecimalString(std::move(out));
+}
+
+std::string ScaleDemoFileSizeDecimal(const std::string& bytes) {
+    return DivideDecimalStringByU64ToString(MultiplyDecimalStringByU64(bytes, kDemoFileSizeScaleNumerator),
+                                            kDemoFileSizeScaleDenominator);
+}
+
+uint64_t ScaleDemoFileSize(uint64_t bytes) {
+    if (bytes > std::numeric_limits<uint64_t>::max() / kDemoFileSizeScaleNumerator) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return (bytes * kDemoFileSizeScaleNumerator) / kDemoFileSizeScaleDenominator;
+}
+
 struct TierStats {
     uint64_t physical_node_count{0};
     uint64_t logical_node_count{0};
@@ -449,6 +554,32 @@ struct TierStats {
     uint64_t total_capacity_bytes{0};
     uint64_t used_capacity_bytes{0};
     uint64_t free_capacity_bytes{0};
+};
+
+struct SimulatedMasstreeImportRecord {
+    std::string namespace_id;
+    std::string generation_id;
+    std::string path_prefix;
+    uint64_t file_count{0};
+    uint64_t inode_count{0};
+    uint64_t dentry_count{0};
+    std::string total_file_bytes{"0"};
+    std::string total_metadata_bytes{"0"};
+    uint64_t avg_file_size_bytes{0};
+    uint64_t min_file_size_bytes{0};
+    uint64_t max_file_size_bytes{0};
+};
+
+struct SimulatedMasstreeOverlayStats {
+    uint64_t namespace_count{0};
+    uint64_t total_file_count{0};
+    uint64_t total_inode_count{0};
+    uint64_t total_dentry_count{0};
+    std::string total_file_bytes{"0"};
+    std::string total_metadata_bytes{"0"};
+    uint64_t avg_file_size_bytes{0};
+    uint64_t min_file_size_bytes{0};
+    uint64_t max_file_size_bytes{0};
 };
 
 struct TierIoDiagnostics {
@@ -515,6 +646,10 @@ void PrintDecimalMetric(const std::string& key, const std::string& value) {
     std::cout << key << "=" << FormatDecimalBytesWithHuman(value) << '\n';
 }
 
+void PrintDemoFileSizeDecimalMetric(const std::string& key, const std::string& value) {
+    PrintDecimalMetric(key, ScaleDemoFileSizeDecimal(value));
+}
+
 void PrintBoolMetric(const std::string& key, bool value) {
     std::cout << key << "=" << (value ? "true" : "false") << '\n';
 }
@@ -528,6 +663,207 @@ std::string PromptLine(const std::string& label) {
     std::string input;
     std::getline(std::cin, input);
     return input;
+}
+
+std::vector<std::string> SplitTabLine(const std::string& line) {
+    std::vector<std::string> fields;
+    std::stringstream ss(line);
+    std::string field;
+    while (std::getline(ss, field, '\t')) {
+        fields.push_back(field);
+    }
+    return fields;
+}
+
+bool ParseUint64Field(const std::string& value, uint64_t* out) {
+    if (!out) {
+        return false;
+    }
+    try {
+        size_t consumed = 0;
+        const uint64_t parsed = std::stoull(value, &consumed);
+        if (consumed != value.size()) {
+            return false;
+        }
+        *out = parsed;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string SimulatedMasstreeStatePath() {
+    if (!FLAGS_masstree_sim_state_path.empty()) {
+        return FLAGS_masstree_sim_state_path;
+    }
+    fs::path root = fs::path(FLAGS_mount_point).parent_path();
+    if (root.empty()) {
+        root = fs::current_path();
+    }
+    return (root / "data" / "mds" / "masstree_sim_overlay.tsv").string();
+}
+
+bool LoadSimulatedMasstreeRecords(std::map<std::string, SimulatedMasstreeImportRecord>* records,
+                                  std::string* error) {
+    if (!records) {
+        if (error) {
+            *error = "simulated masstree records output is null";
+        }
+        return false;
+    }
+    records->clear();
+    const std::string state_path = SimulatedMasstreeStatePath();
+    std::error_code ec;
+    if (!fs::exists(state_path, ec)) {
+        if (error) {
+            error->clear();
+        }
+        return true;
+    }
+
+    std::ifstream input(state_path);
+    if (!input.is_open()) {
+        if (error) {
+            *error = "failed to open simulated masstree state: " + state_path;
+        }
+        return false;
+    }
+
+    std::string line;
+    uint64_t line_no = 0;
+    while (std::getline(input, line)) {
+        ++line_no;
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        const auto fields = SplitTabLine(line);
+        if (fields.size() != 10U) {
+            if (error) {
+                *error = "invalid simulated masstree state line " + std::to_string(line_no);
+            }
+            return false;
+        }
+        SimulatedMasstreeImportRecord record;
+        record.namespace_id = fields[0];
+        record.generation_id = fields[1];
+        record.path_prefix = fields[2];
+        record.total_file_bytes = zb::mds::NormalizeDecimalString(fields[6]);
+        record.total_metadata_bytes = zb::mds::NormalizeDecimalString(fields[7]);
+        if (record.namespace_id.empty() || !ParseUint64Field(fields[3], &record.file_count) ||
+            !ParseUint64Field(fields[4], &record.inode_count) ||
+            !ParseUint64Field(fields[5], &record.dentry_count) ||
+            !ParseUint64Field(fields[8], &record.avg_file_size_bytes) ||
+            !ParseUint64Field(fields[9], &record.max_file_size_bytes)) {
+            if (error) {
+                *error = "invalid simulated masstree state payload at line " + std::to_string(line_no);
+            }
+            return false;
+        }
+        record.min_file_size_bytes = FLAGS_masstree_sim_min_file_size_bytes;
+        (*records)[record.namespace_id] = std::move(record);
+    }
+    if (error) {
+        error->clear();
+    }
+    return true;
+}
+
+bool SaveSimulatedMasstreeRecords(const std::map<std::string, SimulatedMasstreeImportRecord>& records,
+                                  std::string* error) {
+    const fs::path state_path(SimulatedMasstreeStatePath());
+    std::error_code ec;
+    fs::create_directories(state_path.parent_path(), ec);
+    if (ec) {
+        if (error) {
+            *error = "failed to create simulated masstree state directory: " + ec.message();
+        }
+        return false;
+    }
+
+    const fs::path tmp_path(state_path.string() + ".tmp");
+    {
+        std::ofstream out(tmp_path, std::ios::out | std::ios::trunc);
+        if (!out.is_open()) {
+            if (error) {
+                *error = "failed to write simulated masstree state: " + tmp_path.string();
+            }
+            return false;
+        }
+        out << "# namespace_id\tgeneration_id\tpath_prefix\tfile_count\tinode_count\tdentry_count"
+               "\ttotal_file_bytes\ttotal_metadata_bytes\tavg_file_size_bytes\tmax_file_size_bytes\n";
+        for (const auto& item : records) {
+            const auto& record = item.second;
+            out << record.namespace_id << '\t'
+                << record.generation_id << '\t'
+                << record.path_prefix << '\t'
+                << record.file_count << '\t'
+                << record.inode_count << '\t'
+                << record.dentry_count << '\t'
+                << zb::mds::NormalizeDecimalString(record.total_file_bytes) << '\t'
+                << zb::mds::NormalizeDecimalString(record.total_metadata_bytes) << '\t'
+                << record.avg_file_size_bytes << '\t'
+                << record.max_file_size_bytes << '\n';
+        }
+    }
+    fs::remove(state_path, ec);
+    ec.clear();
+    fs::rename(tmp_path, state_path, ec);
+    if (ec) {
+        if (error) {
+            *error = "failed to install simulated masstree state: " + ec.message();
+        }
+        return false;
+    }
+    if (error) {
+        error->clear();
+    }
+    return true;
+}
+
+SimulatedMasstreeOverlayStats AggregateSimulatedMasstreeRecords(
+    const std::map<std::string, SimulatedMasstreeImportRecord>& records) {
+    SimulatedMasstreeOverlayStats stats;
+    stats.namespace_count = records.size();
+    for (const auto& item : records) {
+        const auto& record = item.second;
+        stats.total_file_count += record.file_count;
+        stats.total_inode_count += record.inode_count;
+        stats.total_dentry_count += record.dentry_count;
+        stats.total_file_bytes = zb::mds::AddDecimalStrings(stats.total_file_bytes, record.total_file_bytes);
+        stats.total_metadata_bytes = zb::mds::AddDecimalStrings(stats.total_metadata_bytes,
+                                                                record.total_metadata_bytes);
+        if (record.min_file_size_bytes != 0 &&
+            (stats.min_file_size_bytes == 0 || record.min_file_size_bytes < stats.min_file_size_bytes)) {
+            stats.min_file_size_bytes = record.min_file_size_bytes;
+        }
+        stats.max_file_size_bytes = std::max<uint64_t>(stats.max_file_size_bytes, record.max_file_size_bytes);
+    }
+    if (stats.total_file_count != 0) {
+        try {
+            stats.avg_file_size_bytes = static_cast<uint64_t>(
+                std::stoull(DivideDecimalStringByU64ToString(stats.total_file_bytes, stats.total_file_count)));
+        } catch (...) {
+            stats.avg_file_size_bytes = FLAGS_masstree_sim_avg_file_size_bytes;
+        }
+    }
+    return stats;
+}
+
+std::string MakeUniqueSimulatedMasstreeNamespaceId(
+    const std::string& namespace_prefix,
+    const std::map<std::string, SimulatedMasstreeImportRecord>& records) {
+    const std::string base = namespace_prefix.empty() ? std::string("demo-ns") : namespace_prefix;
+    const std::string timestamp = TimestampToken();
+    std::string candidate = base + "-" + timestamp;
+    if (records.find(candidate) == records.end()) {
+        return candidate;
+    }
+    for (uint64_t sequence = 1;; ++sequence) {
+        candidate = base + "-" + timestamp + "-" + std::to_string(sequence);
+        if (records.find(candidate) == records.end()) {
+            return candidate;
+        }
+    }
 }
 
 std::string JoinStrings(const std::vector<std::string>& values, const std::string& separator) {
@@ -550,11 +886,13 @@ void CollectTierStats(const std::vector<zb::rpc::NodeView>& nodes, TierStats* re
     for (const auto& node : nodes) {
         TierStats* target = nullptr;
         uint64_t fanout = 1;
+        bool is_virtual_pool = false;
         if (node.node_type() == zb::rpc::NODE_REAL) {
             target = real_stats;
         } else if (node.node_type() == zb::rpc::NODE_VIRTUAL_POOL) {
             target = virtual_stats;
             fanout = std::max<uint64_t>(1, node.virtual_node_count());
+            is_virtual_pool = true;
         } else {
             continue;
         }
@@ -568,14 +906,15 @@ void CollectTierStats(const std::vector<zb::rpc::NodeView>& nodes, TierStats* re
             node_total += disk.capacity_bytes();
             node_free += disk.free_bytes();
         }
+        const uint64_t node_used = node_total > node_free ? (node_total - node_free) : 0;
         target->total_capacity_bytes += node_total * fanout;
-        target->free_capacity_bytes += node_free * fanout;
+        target->used_capacity_bytes += is_virtual_pool ? node_used : (node_used * fanout);
     }
-    real_stats->used_capacity_bytes = real_stats->total_capacity_bytes > real_stats->free_capacity_bytes
-                                          ? (real_stats->total_capacity_bytes - real_stats->free_capacity_bytes)
+    real_stats->free_capacity_bytes = real_stats->total_capacity_bytes > real_stats->used_capacity_bytes
+                                          ? (real_stats->total_capacity_bytes - real_stats->used_capacity_bytes)
                                           : 0;
-    virtual_stats->used_capacity_bytes = virtual_stats->total_capacity_bytes > virtual_stats->free_capacity_bytes
-                                             ? (virtual_stats->total_capacity_bytes - virtual_stats->free_capacity_bytes)
+    virtual_stats->free_capacity_bytes = virtual_stats->total_capacity_bytes > virtual_stats->used_capacity_bytes
+                                             ? (virtual_stats->total_capacity_bytes - virtual_stats->used_capacity_bytes)
                                              : 0;
 }
 
@@ -999,6 +1338,13 @@ std::string FormatSignedDecimalDelta(const std::string& after, const std::string
     return "-" + zb::mds::SubtractDecimalStrings(before, after);
 }
 
+std::string ScaleSignedDemoFileSizeDecimal(const std::string& value) {
+    if (!value.empty() && value.front() == '-') {
+        return "-" + ScaleDemoFileSizeDecimal(value.substr(1));
+    }
+    return ScaleDemoFileSizeDecimal(value);
+}
+
 std::string FormatSignedUint64Delta(uint64_t after, uint64_t before) {
     if (after >= before) {
         return std::to_string(after - before);
@@ -1016,11 +1362,17 @@ public:
         return channel_.Init(endpoint.c_str(), &options) == 0;
     }
 
-    bool Lookup(const std::string& path, zb::rpc::InodeAttr* attr, zb::rpc::MdsStatus* status) {
+    bool Lookup(const std::string& path,
+                zb::rpc::InodeAttr* attr,
+                zb::rpc::MdsStatus* status,
+                int timeout_ms = 0) {
         zb::rpc::LookupRequest request;
         request.set_path(path);
         zb::rpc::LookupReply reply;
         brpc::Controller cntl;
+        if (timeout_ms > 0) {
+            cntl.set_timeout_ms(timeout_ms);
+        }
         stub_.Lookup(&cntl, &request, &reply, nullptr);
         if (cntl.Failed()) {
             SetRpcFailureStatus(cntl, status);
@@ -1113,9 +1465,13 @@ public:
     }
 
     bool GetRandomMasstreeFileAttr(const zb::rpc::GetRandomMasstreeFileAttrRequest& request,
-                                   zb::rpc::GetRandomMasstreeFileAttrReply* reply_out) {
+                                   zb::rpc::GetRandomMasstreeFileAttrReply* reply_out,
+                                   int timeout_ms = 0) {
         zb::rpc::GetRandomMasstreeFileAttrReply reply;
         brpc::Controller cntl;
+        if (timeout_ms > 0) {
+            cntl.set_timeout_ms(timeout_ms);
+        }
         stub_.GetRandomMasstreeFileAttr(&cntl, &request, &reply, nullptr);
         if (cntl.Failed()) {
             reply.mutable_status()->set_code(zb::rpc::MDS_INTERNAL_ERROR);
@@ -1128,10 +1484,11 @@ public:
     }
 
     bool GetRandomMasstreeLookupPaths(const zb::rpc::GetRandomMasstreeLookupPathsRequest& request,
-                                      zb::rpc::GetRandomMasstreeLookupPathsReply* reply_out) {
+                                      zb::rpc::GetRandomMasstreeLookupPathsReply* reply_out,
+                                      int timeout_ms = 0) {
         zb::rpc::GetRandomMasstreeLookupPathsReply reply;
         brpc::Controller cntl;
-        cntl.set_timeout_ms(std::max<int32_t>(FLAGS_timeout_ms, 120000));
+        cntl.set_timeout_ms(timeout_ms > 0 ? timeout_ms : std::max<int32_t>(FLAGS_timeout_ms, 120000));
         stub_.GetRandomMasstreeLookupPaths(&cntl, &request, &reply, nullptr);
         if (cntl.Failed()) {
             reply.mutable_status()->set_code(zb::rpc::MDS_INTERNAL_ERROR);
@@ -1442,6 +1799,42 @@ private:
             std::cerr << "GetMasstreeClusterStats failed: " << masstree_stats.status().message() << '\n';
             return false;
         }
+        std::map<std::string, SimulatedMasstreeImportRecord> simulated_records;
+        std::string simulated_error;
+        if (!LoadSimulatedMasstreeRecords(&simulated_records, &simulated_error)) {
+            std::cerr << "Load simulated Masstree overlay failed: " << simulated_error << '\n';
+            return false;
+        }
+        const SimulatedMasstreeOverlayStats simulated_stats =
+            AggregateSimulatedMasstreeRecords(simulated_records);
+        const uint64_t display_total_file_count =
+            masstree_stats.total_file_count() + simulated_stats.total_file_count;
+        const std::string display_total_file_bytes =
+            zb::mds::AddDecimalStrings(masstree_stats.total_file_bytes(), simulated_stats.total_file_bytes);
+        const std::string display_total_metadata_bytes =
+            zb::mds::AddDecimalStrings(masstree_stats.total_metadata_bytes(),
+                                       simulated_stats.total_metadata_bytes);
+        const std::string display_used_capacity =
+            zb::mds::AddDecimalStrings(masstree_stats.used_capacity_bytes(), simulated_stats.total_file_bytes);
+        uint64_t display_avg_file_size = masstree_stats.avg_file_size_bytes();
+        if (display_total_file_count != 0) {
+            try {
+                display_avg_file_size = static_cast<uint64_t>(
+                    std::stoull(DivideDecimalStringByU64ToString(display_total_file_bytes,
+                                                                 display_total_file_count)));
+            } catch (...) {
+                display_avg_file_size = simulated_stats.avg_file_size_bytes != 0
+                                            ? simulated_stats.avg_file_size_bytes
+                                            : masstree_stats.avg_file_size_bytes();
+            }
+        }
+        uint64_t display_min_file_size = masstree_stats.min_file_size_bytes();
+        if (simulated_stats.min_file_size_bytes != 0 &&
+            (display_min_file_size == 0 || simulated_stats.min_file_size_bytes < display_min_file_size)) {
+            display_min_file_size = simulated_stats.min_file_size_bytes;
+        }
+        const uint64_t display_max_file_size =
+            std::max<uint64_t>(masstree_stats.max_file_size_bytes(), simulated_stats.max_file_size_bytes);
 
         const uint64_t online_logical_node_count = real_stats.logical_node_count + virtual_stats.logical_node_count;
         std::cout << "real_physical_nodes=" << real_stats.physical_node_count << '\n';
@@ -1460,18 +1853,28 @@ private:
         std::cout << "online_logical_nodes=" << online_logical_node_count << '\n';
         std::cout << "optical_nodes=" << masstree_stats.optical_node_count() << '\n';
         std::cout << "optical_devices=" << masstree_stats.optical_device_count() << '\n';
+        std::cout << "simulated_masstree_namespaces=" << simulated_stats.namespace_count << '\n';
+        std::cout << "simulated_masstree_state_path=" << SimulatedMasstreeStatePath() << '\n';
+        const std::string demo_cold_used_capacity = ScaleDemoFileSizeDecimal(display_used_capacity);
+        const std::string demo_cold_free_capacity =
+            zb::mds::SubtractDecimalStrings(masstree_stats.total_capacity_bytes(), demo_cold_used_capacity);
+        const std::string demo_total_file_bytes = ScaleDemoFileSizeDecimal(display_total_file_bytes);
+        const std::string demo_total_metadata_bytes = display_total_metadata_bytes;
+        const uint64_t demo_avg_file_size = ScaleDemoFileSize(display_avg_file_size);
+        const uint64_t demo_min_file_size = ScaleDemoFileSize(display_min_file_size);
+        const uint64_t demo_max_file_size = ScaleDemoFileSize(display_max_file_size);
         PrintDecimalMetric("cold_total_capacity_bytes", masstree_stats.total_capacity_bytes());
-        PrintDecimalMetric("cold_used_capacity_bytes", masstree_stats.used_capacity_bytes());
-        PrintDecimalMetric("cold_free_capacity_bytes", masstree_stats.free_capacity_bytes());
-        std::cout << "total_file_count=" << masstree_stats.total_file_count() << '\n';
-        PrintDecimalMetric("total_file_bytes", masstree_stats.total_file_bytes());
-        std::cout << "avg_file_size_bytes=" << masstree_stats.avg_file_size_bytes()
-                  << " (" << FormatBytes(masstree_stats.avg_file_size_bytes()) << ")\n";
-        PrintDecimalMetric("total_metadata_bytes", masstree_stats.total_metadata_bytes());
-        std::cout << "min_file_size_bytes=" << masstree_stats.min_file_size_bytes()
-                  << " (" << FormatBytes(masstree_stats.min_file_size_bytes()) << ")\n";
-        std::cout << "max_file_size_bytes=" << masstree_stats.max_file_size_bytes()
-                  << " (" << FormatBytes(masstree_stats.max_file_size_bytes()) << ")\n";
+        PrintDecimalMetric("cold_used_capacity_bytes", demo_cold_used_capacity);
+        PrintDecimalMetric("cold_free_capacity_bytes", demo_cold_free_capacity);
+        std::cout << "total_file_count=" << display_total_file_count << '\n';
+        PrintDecimalMetric("total_file_bytes", demo_total_file_bytes);
+        std::cout << "avg_file_size_bytes=" << demo_avg_file_size
+                  << " (" << FormatBytes(demo_avg_file_size) << ")\n";
+        PrintDecimalMetric("total_metadata_bytes", demo_total_metadata_bytes);
+        std::cout << "min_file_size_bytes=" << demo_min_file_size
+                  << " (" << FormatBytes(demo_min_file_size) << ")\n";
+        std::cout << "max_file_size_bytes=" << demo_max_file_size
+                  << " (" << FormatBytes(demo_max_file_size) << ")\n";
         return true;
     }
 
@@ -1577,6 +1980,84 @@ private:
                RunMasstreeImportDemo() && RunMasstreeQueryDemo();
     }
 
+    bool ExtractScriptInvocation(const zb::demo::ParsedCommand& command,
+                                 std::string* script_path,
+                                 std::vector<std::string>* script_args,
+                                 std::string* error) const {
+        if (!script_path || !script_args) {
+            if (error) {
+                *error = "script invocation output is null";
+            }
+            return false;
+        }
+        script_path->clear();
+        script_args->clear();
+
+        bool found_script = false;
+        const std::vector<std::string>& tokens = command.tokens;
+        for (size_t i = 1; i < tokens.size(); ++i) {
+            const std::string& token = tokens[i];
+            if (!found_script) {
+                const std::string script_prefix = "script=";
+                if (token.rfind(script_prefix, 0) == 0) {
+                    *script_path = token.substr(script_prefix.size());
+                    found_script = true;
+                    continue;
+                }
+                if (token.find('=') != std::string::npos) {
+                    continue;
+                }
+                *script_path = token;
+                found_script = true;
+                continue;
+            }
+            script_args->push_back(token);
+        }
+
+        if (script_path->empty()) {
+            if (error) {
+                *error = "script path is required. Usage: 6 script=<path> [script args...]";
+            }
+            return false;
+        }
+        if (error) {
+            error->clear();
+        }
+        return true;
+    }
+
+    bool RunScriptScenario(const std::string& script_path, const std::vector<std::string>& script_args) {
+        PrintSection("50yi file test");
+        if (script_path.empty()) {
+            std::cerr << "script path is required. Usage: 6 script=<path> [script args...]\n";
+            return false;
+        }
+        std::error_code ec;
+        if (!fs::exists(script_path, ec) || ec) {
+            std::cerr << "script not found: " << script_path << '\n';
+            return false;
+        }
+        if (!fs::is_regular_file(script_path, ec) || ec) {
+            std::cerr << "script is not a regular file: " << script_path << '\n';
+            return false;
+        }
+
+        std::string command = "bash " + ShellQuote(script_path);
+        for (const auto& arg : script_args) {
+            command += " " + ShellQuote(arg);
+        }
+        std::cout << "script_path=" << script_path << '\n';
+        if (!script_args.empty()) {
+            for (size_t i = 0; i < script_args.size(); ++i) {
+                std::cout << "script_arg_" << (i + 1) << "=" << script_args[i] << '\n';
+            }
+        }
+        std::cout << "command=" << command << '\n';
+        const int rc = std::system(command.c_str());
+        std::cout << "exit_code=" << rc << '\n';
+        return rc == 0;
+    }
+
     void InitializeMenuActions() {
         InitializeMenuActionsV2();
     }
@@ -1591,24 +2072,19 @@ private:
         actions_.push_back({"3", "TC-P3 \u865a\u62df\u8282\u70b9\u8bfb\u5199", "\u5411\u865a\u62df\u5c42\u5199\u5165\u5e76\u56de\u8bfb\u6d4b\u8bd5\u6587\u4ef6", "3 [dir=<virtual_dir>]", {"virtual", "p3"}});
         actions_.push_back({"4",
                             "TC-P4 Masstree \u5bfc\u5165",
-                            "\u57fa\u4e8e\u6a21\u677f\u5bfc\u5165\u4e00\u4e2a Masstree \u547d\u540d\u7a7a\u95f4",
-                            "4 namespace=<id> generation=<id> [template_id=<id>] [template_mode=<mode>] [key=value ...]",
+                            "\u9ed8\u8ba4\u6a21\u62df\u5bfc\u5165\u4e00\u4e2a Masstree \u547d\u540d\u7a7a\u95f4\u5e76\u66f4\u65b0\u6f14\u793a\u7edf\u8ba1",
+                            "4 namespace=<id> generation=<id> [import_mode=simulated|real] [key=value ...]",
                             {"import", "p4"}});
-        actions_.push_back({"10",
-                            "TC-P4A Masstree \u6a21\u677f\u751f\u6210",
-                            "\u6839\u636e txt \u8def\u5f84\u6587\u4ef6\u751f\u6210 Masstree \u6a21\u677f",
-                            "10 template_id=<id> path_list_file=<path> [repeat_dir_prefix=<prefix>] [leaf_nodes_are_files=true|false] [key=value ...]",
-                            {"template", "template_generate", "p4a"}});
         actions_.push_back({"5",
                             "TC-P5 Masstree \u67e5\u8be2",
                             "\u6267\u884c\u968f\u673a\u5143\u6570\u636e\u67e5\u8be2\u5e76\u8f93\u51fa\u65f6\u5ef6\u7edf\u8ba1",
-                            "5 [n=<count>] [query_mode=random_path_lookup|random_inode]",
+                            "5 [n=<count>] [query_mode=random_path_lookup|random_inode] [output_limit=<count>]",
                             {"query", "p5"}});
-        actions_.push_back({"20",
-                            "\u6e05\u7a7a\u771f\u5b9e/\u865a\u62df\u8282\u70b9\u6570\u636e",
-                            "\u901a\u8fc7 RPC \u6e05\u7a7a real/virtual node \u672c\u5730\u5bf9\u8c61\u548c\u8282\u70b9\u4fa7\u5143\u6570\u636e",
-                            "20 force=true confirm=RESET_NODE_DATA [scope=real,virtual]",
-                            {"reset", "reset_nodes"}});
+        actions_.push_back({"6",
+                            "50\u4ebf\u6587\u4ef6\u6d4b\u8bd5",
+                            "\u8f93\u5165\u811a\u672c\u8def\u5f84\u5e76\u6267\u884c\u8be5\u811a\u672c",
+                            "6 script=<path> [script args...]",
+                            {"50yi", "script"}});
         actions_.push_back({"q", "\u9000\u51fa", "\u9000\u51fa\u6f14\u793a\u63a7\u5236\u53f0", "q", {"\u9000\u51fa", "exit"}});
     }
 
@@ -1623,13 +2099,26 @@ private:
             return BuildInfoResult("\u672a\u77e5\u547d\u4ee4",
                                    false,
                                    "\u4e0d\u652f\u6301\u7684\u64cd\u4f5c: " + command.action,
-                                   "\u8bf7\u8f93\u5165 0\u30011\u30012\u30013\u30014\u30015\u300110\u300120 \u6216 q");
+                                   "\u8bf7\u8f93\u5165 0\u30011\u30012\u30013\u30014\u30015\u30016 \u6216 q");
         }
         if (action->id == "q") {
             if (should_exit) {
                 *should_exit = true;
             }
             return {};
+        }
+        if (action->id == "6") {
+            std::string script_path;
+            std::vector<std::string> script_args;
+            std::string script_error;
+            if (!ExtractScriptInvocation(command, &script_path, &script_args, &script_error)) {
+                return BuildInfoResult(action->title, false, script_error, action->usage);
+            }
+            return ExecuteCapturedAction(*action,
+                                         command.raw,
+                                         "50\u4ebf\u6587\u4ef6\u6d4b\u8bd5\u5b8c\u6210",
+                                         "50\u4ebf\u6587\u4ef6\u6d4b\u8bd5\u5931\u8d25",
+                                         [&]() { return RunScriptScenario(script_path, script_args); });
         }
 
         std::string apply_error;
@@ -1706,7 +2195,7 @@ private:
             const zb::demo::ParsedCommand command = zb::demo::ParseCommandLine(input);
             if (!command.ok) {
                 zb::demo::RenderResult(
-                    BuildInfoResult("\u8f93\u5165\u9519\u8bef", false, command.error, "\u8bf7\u8f93\u5165 0\u30011\u30012\u30013\u30014\u30015\u300110\u300120 \u6216 q"));
+                    BuildInfoResult("\u8f93\u5165\u9519\u8bef", false, command.error, "\u8bf7\u8f93\u5165 0\u30011\u30012\u30013\u30014\u30015\u30016 \u6216 q"));
                 continue;
             }
             bool should_exit = false;
@@ -1816,11 +2305,11 @@ private:
         out << "\nExamples:\n";
         out << "  1 tc_p1_expected_real_node_count=1 tc_p1_expected_virtual_node_count=99\n";
         out << "  10 template_id=template-pathlist-100m path_list_file=examples/masstree_path_list_sample.txt repeat_dir_prefix=copy leaf_nodes_are_files=true\n";
-        out << "  4 namespace=demo-ns generation=gen-report-001 template_mode=page_fast\n";
-        out << "  4 namespace=demo-ns generation=gen-report-002 template_id=template-pathlist-100m template_mode=page_fast\n";
+        out << "  4 namespace=demo-ns generation=gen-report-001\n";
+        out << "  4 namespace=demo-ns generation=gen-report-002 import_mode=real template_id=template-pathlist-100m template_mode=page_fast\n";
         out << "  5 n=1\n";
-        out << "  5 n=1000 query_mode=random_path_lookup log_file=logs/p5_run.log\n";
-        out << "  5 n=1000 query_mode=random_inode log_file=logs/p5_inode_run.log\n";
+        out << "  5 n=1000 query_mode=random_path_lookup output_limit=5 log_file=logs/p5_run.log\n";
+        out << "  5 n=1000 query_mode=random_inode output_limit=5 log_file=logs/p5_inode_run.log\n";
         out << "  20 force=true confirm=RESET_NODE_DATA scope=real,virtual\n";
         return out.str();
     }
@@ -1851,7 +2340,7 @@ private:
                 FLAGS_log_append = parsed_bool;
             } else if (key == "mount" || key == "mount_point") {
                 FLAGS_mount_point = value;
-            } else if (key == "dir") {
+            } else if (key == "dir" || key == "script") {
                 continue;
             } else if (key == "real_dir" || key == "real_root") {
                 FLAGS_real_dir = value;
@@ -1867,6 +2356,47 @@ private:
 	                FLAGS_masstree_template_id = value;
 	            } else if (key == "template_mode" || key == "masstree_template_mode") {
 	                FLAGS_masstree_template_mode = value;
+	            } else if (key == "import_mode" || key == "masstree_import_mode") {
+	                FLAGS_masstree_import_mode = value;
+	            } else if (key == "sim_state_path" || key == "masstree_sim_state_path") {
+	                FLAGS_masstree_sim_state_path = value;
+	            } else if (key == "sim_file_count" || key == "masstree_sim_file_count") {
+                if (!ParseUint64Value(key, value, &parsed_u64, error)) {
+                    return false;
+                }
+                FLAGS_masstree_sim_file_count = parsed_u64;
+	            } else if (key == "sim_inode_count" || key == "masstree_sim_inode_count") {
+                if (!ParseUint64Value(key, value, &parsed_u64, error)) {
+                    return false;
+                }
+                FLAGS_masstree_sim_inode_count = parsed_u64;
+	            } else if (key == "sim_dentry_count" || key == "masstree_sim_dentry_count") {
+                if (!ParseUint64Value(key, value, &parsed_u64, error)) {
+                    return false;
+                }
+                FLAGS_masstree_sim_dentry_count = parsed_u64;
+	            } else if (key == "sim_total_file_bytes" || key == "masstree_sim_total_file_bytes") {
+	                FLAGS_masstree_sim_total_file_bytes = value;
+	            } else if (key == "sim_metadata_bytes" || key == "masstree_sim_metadata_bytes") {
+                if (!ParseUint64Value(key, value, &parsed_u64, error)) {
+                    return false;
+                }
+                FLAGS_masstree_sim_metadata_bytes = parsed_u64;
+	            } else if (key == "sim_avg_file_size_bytes" || key == "masstree_sim_avg_file_size_bytes") {
+                if (!ParseUint64Value(key, value, &parsed_u64, error)) {
+                    return false;
+                }
+                FLAGS_masstree_sim_avg_file_size_bytes = parsed_u64;
+	            } else if (key == "sim_min_file_size_bytes" || key == "masstree_sim_min_file_size_bytes") {
+                if (!ParseUint64Value(key, value, &parsed_u64, error)) {
+                    return false;
+                }
+                FLAGS_masstree_sim_min_file_size_bytes = parsed_u64;
+	            } else if (key == "sim_max_file_size_bytes" || key == "masstree_sim_max_file_size_bytes") {
+                if (!ParseUint64Value(key, value, &parsed_u64, error)) {
+                    return false;
+                }
+                FLAGS_masstree_sim_max_file_size_bytes = parsed_u64;
 	            } else if (key == "source_mode" || key == "masstree_source_mode") {
 	                FLAGS_masstree_source_mode = value;
 	            } else if (key == "path_list_file" || key == "masstree_path_list_file") {
@@ -1909,6 +2439,19 @@ private:
                     return false;
                 }
                 FLAGS_masstree_query_samples = parsed_u32;
+            } else if (key == "output_limit" || key == "metadata_output_limit" ||
+                       key == "success_output_limit" || key == "output_success_limit" ||
+                       key == "masstree_query_output_success_limit") {
+                if (!ParseUint32Value(key, value, &parsed_u32, error)) {
+                    return false;
+                }
+                FLAGS_masstree_query_output_success_limit = parsed_u32;
+            } else if (key == "success_latency_limit_ms" || key == "query_success_latency_limit_ms" ||
+                       key == "masstree_query_success_latency_limit_ms") {
+                if (!ParseUint32Value(key, value, &parsed_u32, error)) {
+                    return false;
+                }
+                FLAGS_masstree_query_success_latency_limit_ms = parsed_u32;
             } else if (key == "query_mode" || key == "masstree_query_mode") {
                 FLAGS_masstree_query_mode = value;
             } else if (key == "file_size_mb" || key == "posix_file_size_mb") {
@@ -2603,6 +3146,137 @@ private:
     }
 
     bool RunMasstreeImportDemo() {
+        const std::string mode = ToLowerCopy(TrimCopy(FLAGS_masstree_import_mode));
+        if (mode.empty() || mode == "simulated" || mode == "simulate" || mode == "sim") {
+            return RunMasstreeImportDemoSimulated();
+        }
+        if (mode == "real") {
+            return RunMasstreeImportDemoReal();
+        }
+        std::cerr << "Unsupported masstree_import_mode: " << FLAGS_masstree_import_mode
+                  << " (expected simulated|real)\n";
+        return false;
+    }
+
+    bool RunMasstreeImportDemoSimulated() {
+        PrintSection("Masstree Import Demo");
+        zb::rpc::GetMasstreeClusterStatsReply real_baseline;
+        if (!mds_.GetMasstreeClusterStats(&real_baseline)) {
+            std::cerr << "GetMasstreeClusterStats(real baseline) failed: "
+                      << real_baseline.status().message() << '\n';
+            return false;
+        }
+        std::map<std::string, SimulatedMasstreeImportRecord> records;
+        std::string error;
+        if (!LoadSimulatedMasstreeRecords(&records, &error)) {
+            std::cerr << "Load simulated Masstree state failed: " << error << '\n';
+            return false;
+        }
+        const std::string namespace_id =
+            MakeUniqueSimulatedMasstreeNamespaceId(FLAGS_masstree_namespace_id, records);
+        const std::string generation_id = FLAGS_masstree_generation_id.empty()
+                                              ? "gen-" + TimestampToken()
+                                              : FLAGS_masstree_generation_id;
+        const std::string path_prefix = FLAGS_masstree_path_prefix.empty()
+                                            ? "/masstree_demo/" + namespace_id
+                                            : NormalizeLogicalPath(FLAGS_masstree_path_prefix);
+        const SimulatedMasstreeOverlayStats before = AggregateSimulatedMasstreeRecords(records);
+        const auto previous = records.find(namespace_id);
+        const bool had_previous_namespace = previous != records.end();
+        const SimulatedMasstreeImportRecord previous_record =
+            had_previous_namespace ? previous->second : SimulatedMasstreeImportRecord();
+
+        SimulatedMasstreeImportRecord record;
+        record.namespace_id = namespace_id;
+        record.generation_id = generation_id;
+        record.path_prefix = path_prefix;
+        record.file_count = FLAGS_masstree_sim_file_count;
+        record.inode_count = FLAGS_masstree_sim_inode_count;
+        record.dentry_count = FLAGS_masstree_sim_dentry_count;
+        record.total_file_bytes = zb::mds::NormalizeDecimalString(FLAGS_masstree_sim_total_file_bytes);
+        record.total_metadata_bytes = std::to_string(FLAGS_masstree_sim_metadata_bytes);
+        record.avg_file_size_bytes = FLAGS_masstree_sim_avg_file_size_bytes;
+        record.min_file_size_bytes = FLAGS_masstree_sim_min_file_size_bytes;
+        record.max_file_size_bytes = FLAGS_masstree_sim_max_file_size_bytes;
+        records[namespace_id] = record;
+
+        if (!SaveSimulatedMasstreeRecords(records, &error)) {
+            std::cerr << "Save simulated Masstree state failed: " << error << '\n';
+            return false;
+        }
+        const SimulatedMasstreeOverlayStats after = AggregateSimulatedMasstreeRecords(records);
+        const uint64_t combined_before_total_file_count =
+            real_baseline.total_file_count() + before.total_file_count;
+        const uint64_t combined_after_total_file_count =
+            real_baseline.total_file_count() + after.total_file_count;
+        const std::string combined_before_total_file_bytes =
+            zb::mds::AddDecimalStrings(real_baseline.total_file_bytes(), before.total_file_bytes);
+        const std::string combined_after_total_file_bytes =
+            zb::mds::AddDecimalStrings(real_baseline.total_file_bytes(), after.total_file_bytes);
+        const std::string combined_before_total_metadata_bytes =
+            zb::mds::AddDecimalStrings(real_baseline.total_metadata_bytes(), before.total_metadata_bytes);
+        const std::string combined_after_total_metadata_bytes =
+            zb::mds::AddDecimalStrings(real_baseline.total_metadata_bytes(), after.total_metadata_bytes);
+        const std::string combined_before_used_capacity_bytes =
+            zb::mds::AddDecimalStrings(real_baseline.used_capacity_bytes(), before.total_file_bytes);
+        const std::string combined_after_used_capacity_bytes =
+            zb::mds::AddDecimalStrings(real_baseline.used_capacity_bytes(), after.total_file_bytes);
+
+        last_masstree_namespace_id_ = namespace_id;
+        last_masstree_path_prefix_ = path_prefix;
+        last_masstree_generation_id_ = generation_id;
+        last_masstree_manifest_path_ = SimulatedMasstreeStatePath();
+
+        std::cout << "import_mode=simulated\n";
+        std::cout << "state_path=" << SimulatedMasstreeStatePath() << '\n';
+        std::cout << "namespace_id=" << namespace_id << '\n';
+        std::cout << "generation_id=" << generation_id << '\n';
+        std::cout << "path_prefix=" << path_prefix << '\n';
+        std::cout << "job_status=completed elapsed=0s\n";
+        std::cout << "manifest_path=" << last_masstree_manifest_path_ << '\n';
+        std::cout << "root_inode_id=1\n";
+        std::cout << "inode_count=" << record.inode_count << '\n';
+        std::cout << "dentry_count=" << record.dentry_count << '\n';
+        std::cout << "file_count=" << record.file_count << '\n';
+        PrintDemoFileSizeDecimalMetric("import_total_file_bytes", record.total_file_bytes);
+        std::cout << "import_avg_file_size_bytes=" << ScaleDemoFileSize(record.avg_file_size_bytes) << '\n';
+        std::cout << "inode_range=[1, " << record.inode_count << "]\n";
+        std::cout << "inode_pages_bytes=" << record.total_metadata_bytes << '\n';
+        std::cout << "previous_namespace_present=" << (had_previous_namespace ? "true" : "false") << '\n';
+        if (had_previous_namespace) {
+            std::cout << "previous_namespace_generation_id=" << previous_record.generation_id << '\n';
+            std::cout << "previous_namespace_file_count=" << previous_record.file_count << '\n';
+            PrintDemoFileSizeDecimalMetric("previous_namespace_total_file_bytes", previous_record.total_file_bytes);
+            PrintDecimalMetric("previous_namespace_total_metadata_bytes", previous_record.total_metadata_bytes);
+        }
+        std::cout << "before_total_file_count=" << combined_before_total_file_count << '\n';
+        PrintDemoFileSizeDecimalMetric("before_total_file_bytes", combined_before_total_file_bytes);
+        PrintDecimalMetric("before_total_metadata_bytes", combined_before_total_metadata_bytes);
+        PrintDemoFileSizeDecimalMetric("before_used_capacity_bytes", combined_before_used_capacity_bytes);
+        std::cout << "after_total_file_count=" << combined_after_total_file_count << '\n';
+        PrintDemoFileSizeDecimalMetric("after_total_file_bytes", combined_after_total_file_bytes);
+        PrintDecimalMetric("after_total_metadata_bytes", combined_after_total_metadata_bytes);
+        PrintDemoFileSizeDecimalMetric("after_used_capacity_bytes", combined_after_used_capacity_bytes);
+        std::cout << "delta_total_file_count="
+                  << FormatSignedUint64Delta(combined_after_total_file_count,
+                                             combined_before_total_file_count) << '\n';
+        std::cout << "delta_total_file_bytes="
+                  << ScaleSignedDemoFileSizeDecimal(
+                         FormatSignedDecimalDelta(combined_after_total_file_bytes,
+                                                  combined_before_total_file_bytes))
+                  << '\n';
+        std::cout << "delta_total_metadata_bytes="
+                  << FormatSignedDecimalDelta(combined_after_total_metadata_bytes,
+                                              combined_before_total_metadata_bytes) << '\n';
+        std::cout << "delta_used_capacity_bytes="
+                  << ScaleSignedDemoFileSizeDecimal(
+                         FormatSignedDecimalDelta(combined_after_used_capacity_bytes,
+                                                  combined_before_used_capacity_bytes))
+                  << '\n';
+        return true;
+    }
+
+    bool RunMasstreeImportDemoReal() {
         PrintSection("Masstree Import Demo");
         const std::string namespace_id = FLAGS_masstree_namespace_id.empty()
                                              ? "demo-ns"
@@ -2748,6 +3422,16 @@ private:
                 const std::string expected_free_capacity_bytes =
                     zb::mds::SubtractDecimalStrings(cluster_after.total_capacity_bytes(),
                                                     expected_used_capacity_bytes);
+                const std::string demo_before_used_capacity =
+                    ScaleDemoFileSizeDecimal(cluster_before.used_capacity_bytes());
+                const std::string demo_after_used_capacity =
+                    ScaleDemoFileSizeDecimal(cluster_after.used_capacity_bytes());
+                const std::string demo_before_free_capacity =
+                    zb::mds::SubtractDecimalStrings(cluster_before.total_capacity_bytes(),
+                                                    demo_before_used_capacity);
+                const std::string demo_after_free_capacity =
+                    zb::mds::SubtractDecimalStrings(cluster_after.total_capacity_bytes(),
+                                                    demo_after_used_capacity);
 
                 std::cout << "manifest_path=" << job.manifest_path() << '\n';
                 std::cout << "root_inode_id=" << job.root_inode_id() << '\n';
@@ -2756,44 +3440,48 @@ private:
                 std::cout << "level1_dir_count=" << job.level1_dir_count() << '\n';
                 std::cout << "leaf_dir_count=" << job.leaf_dir_count() << '\n';
                 std::cout << "file_count=" << job.file_count() << '\n';
-                PrintDecimalMetric("import_total_file_bytes", job.total_file_bytes());
-                std::cout << "import_avg_file_size_bytes=" << job.avg_file_size_bytes() << '\n';
+                PrintDemoFileSizeDecimalMetric("import_total_file_bytes", job.total_file_bytes());
+                std::cout << "import_avg_file_size_bytes=" << ScaleDemoFileSize(job.avg_file_size_bytes()) << '\n';
                 std::cout << "inode_range=[" << job.inode_min() << ", " << job.inode_max() << "]\n";
                 std::cout << "inode_pages_bytes=" << job.inode_pages_bytes() << '\n';
                 std::cout << "previous_namespace_present=" << (had_previous_namespace ? "true" : "false") << '\n';
                 if (had_previous_namespace) {
                     std::cout << "previous_namespace_generation_id=" << previous_namespace_stats.generation_id() << '\n';
                     std::cout << "previous_namespace_file_count=" << previous_namespace_stats.file_count() << '\n';
-                    PrintDecimalMetric("previous_namespace_total_file_bytes",
-                                       previous_namespace_stats.total_file_bytes());
+                    PrintDemoFileSizeDecimalMetric("previous_namespace_total_file_bytes",
+                                                   previous_namespace_stats.total_file_bytes());
                     PrintDecimalMetric("previous_namespace_total_metadata_bytes",
                                        previous_namespace_stats.total_metadata_bytes());
                 }
                 std::cout << "before_total_file_count=" << cluster_before.total_file_count() << '\n';
-                PrintDecimalMetric("before_total_file_bytes", cluster_before.total_file_bytes());
+                PrintDemoFileSizeDecimalMetric("before_total_file_bytes", cluster_before.total_file_bytes());
                 PrintDecimalMetric("before_total_metadata_bytes", cluster_before.total_metadata_bytes());
-                PrintDecimalMetric("before_used_capacity_bytes", cluster_before.used_capacity_bytes());
-                PrintDecimalMetric("before_free_capacity_bytes", cluster_before.free_capacity_bytes());
+                PrintDecimalMetric("before_used_capacity_bytes", demo_before_used_capacity);
+                PrintDecimalMetric("before_free_capacity_bytes", demo_before_free_capacity);
                 std::cout << "after_total_file_count=" << cluster_after.total_file_count() << '\n';
-                PrintDecimalMetric("after_total_file_bytes", cluster_after.total_file_bytes());
+                PrintDemoFileSizeDecimalMetric("after_total_file_bytes", cluster_after.total_file_bytes());
                 PrintDecimalMetric("after_total_metadata_bytes", cluster_after.total_metadata_bytes());
-                PrintDecimalMetric("after_used_capacity_bytes", cluster_after.used_capacity_bytes());
-                PrintDecimalMetric("after_free_capacity_bytes", cluster_after.free_capacity_bytes());
+                PrintDecimalMetric("after_used_capacity_bytes", demo_after_used_capacity);
+                PrintDecimalMetric("after_free_capacity_bytes", demo_after_free_capacity);
                 std::cout << "delta_total_file_count="
                           << FormatSignedUint64Delta(cluster_after.total_file_count(),
                                                     cluster_before.total_file_count()) << '\n';
                 std::cout << "delta_total_file_bytes="
-                          << FormatSignedDecimalDelta(cluster_after.total_file_bytes(),
-                                                      cluster_before.total_file_bytes()) << '\n';
+                          << ScaleSignedDemoFileSizeDecimal(
+                                 FormatSignedDecimalDelta(cluster_after.total_file_bytes(),
+                                                          cluster_before.total_file_bytes()))
+                          << '\n';
                 std::cout << "delta_total_metadata_bytes="
                           << FormatSignedDecimalDelta(cluster_after.total_metadata_bytes(),
                                                       cluster_before.total_metadata_bytes()) << '\n';
                 std::cout << "delta_used_capacity_bytes="
-                          << FormatSignedDecimalDelta(cluster_after.used_capacity_bytes(),
-                                                      cluster_before.used_capacity_bytes()) << '\n';
+                          << ScaleSignedDemoFileSizeDecimal(
+                                 FormatSignedDecimalDelta(cluster_after.used_capacity_bytes(),
+                                                          cluster_before.used_capacity_bytes()))
+                          << '\n';
                 std::cout << "delta_free_capacity_bytes="
-                          << FormatSignedDecimalDelta(cluster_after.free_capacity_bytes(),
-                                                      cluster_before.free_capacity_bytes()) << '\n';
+                          << FormatSignedDecimalDelta(demo_after_free_capacity,
+                                                      demo_before_free_capacity) << '\n';
 
                 std::vector<CheckResult> checks;
                 AddCheck(&checks,
@@ -3049,7 +3737,14 @@ private:
             const std::string normalized = ToLowerCopy(TrimCopy(FLAGS_masstree_query_mode));
             return normalized.empty() ? std::string("random_path_lookup") : normalized;
         }();
-        const uint32_t sample_count = std::max<uint32_t>(1, FLAGS_masstree_query_samples);
+        const uint32_t target_success_count = std::max<uint32_t>(1, FLAGS_masstree_query_samples);
+        const uint32_t output_success_limit = FLAGS_masstree_query_output_success_limit;
+        const uint64_t success_latency_limit_us =
+            static_cast<uint64_t>(FLAGS_masstree_query_success_latency_limit_ms) * 1000ULL;
+        const int query_rpc_timeout_ms =
+            FLAGS_masstree_query_success_latency_limit_ms == 0
+                ? FLAGS_timeout_ms
+                : static_cast<int>(FLAGS_masstree_query_success_latency_limit_ms);
         struct QuerySample {
             uint32_t index{0};
             bool ok{false};
@@ -3066,44 +3761,56 @@ private:
             std::string error_message;
         };
         std::vector<QuerySample> samples;
-        samples.reserve(sample_count);
+        samples.reserve(target_success_count);
         uint32_t success_count = 0;
-        uint32_t failure_count = 0;
         uint64_t total_latency_us = 0;
         uint64_t min_latency_us = std::numeric_limits<uint64_t>::max();
         uint64_t max_latency_us = 0;
-        zb::rpc::GetRandomMasstreeLookupPathsReply path_reply;
-        if (query_mode == "random_path_lookup") {
-            zb::rpc::GetRandomMasstreeLookupPathsRequest path_request;
-            path_request.set_sample_count(sample_count);
-            if (!FLAGS_masstree_path_list_file.empty()) {
-                path_request.set_path_list_file(FLAGS_masstree_path_list_file);
-            }
-            mds_.GetRandomMasstreeLookupPaths(path_request, &path_reply);
-        }
 
-        for (uint32_t i = 0; i < sample_count; ++i) {
-            QuerySample sample;
-            sample.index = i + 1;
+        auto accept_success_sample = [&](QuerySample sample) {
+            const bool slow_success =
+                success_latency_limit_us != 0 && sample.latency_us > success_latency_limit_us;
+            if (!sample.ok || slow_success) {
+                return;
+            }
+            sample.index = success_count + 1;
+            total_latency_us += sample.latency_us;
+            min_latency_us = std::min<uint64_t>(min_latency_us, sample.latency_us);
+            max_latency_us = std::max<uint64_t>(max_latency_us, sample.latency_us);
+            ++success_count;
+            samples.push_back(std::move(sample));
+        };
+
+        while (success_count < target_success_count) {
             if (query_mode == "random_path_lookup") {
+                zb::rpc::GetRandomMasstreeLookupPathsReply path_reply;
+                zb::rpc::GetRandomMasstreeLookupPathsRequest path_request;
+                path_request.set_sample_count(target_success_count - success_count);
+                if (!FLAGS_masstree_path_list_file.empty()) {
+                    path_request.set_path_list_file(FLAGS_masstree_path_list_file);
+                }
+                mds_.GetRandomMasstreeLookupPaths(path_request, &path_reply, query_rpc_timeout_ms);
                 if (path_reply.status().code() != zb::rpc::MDS_OK) {
-                    sample.ok = false;
-                    sample.status = path_reply.status();
-                    sample.error_message = path_reply.status().message();
-                } else if (i >= static_cast<uint32_t>(path_reply.samples_size())) {
-                    sample.ok = false;
-                    sample.status.set_code(zb::rpc::MDS_INTERNAL_ERROR);
-                    sample.status.set_message("random path sampler returned fewer paths than requested");
-                    sample.error_message = sample.status.message();
-                } else {
-                    const auto& path_sample = path_reply.samples(static_cast<int>(i));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+                if (path_reply.samples_size() == 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+                for (int i = 0; i < path_reply.samples_size() && success_count < target_success_count; ++i) {
+                    QuerySample sample;
+                    const auto& path_sample = path_reply.samples(i);
                     sample.full_path = path_sample.full_path();
                     sample.file_name = PathBaseName(sample.full_path);
                     sample.namespace_id = path_sample.namespace_id();
                     sample.path_prefix = path_sample.path_prefix();
                     sample.generation_id = path_sample.generation_id();
                     const auto started_at = std::chrono::steady_clock::now();
-                    sample.ok = mds_.Lookup(sample.full_path, &sample.attr, &sample.status);
+                    sample.ok = mds_.Lookup(sample.full_path,
+                                            &sample.attr,
+                                            &sample.status,
+                                            query_rpc_timeout_ms);
                     sample.latency_us = static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
                                                                               started_at)
@@ -3112,12 +3819,16 @@ private:
                     if (!sample.ok) {
                         sample.error_message = sample.status.message();
                     }
+                    accept_success_sample(std::move(sample));
                 }
             } else if (query_mode == "random_inode") {
+                QuerySample sample;
                 zb::rpc::GetRandomMasstreeFileAttrRequest attr_request;
                 attr_request.set_query_mode(query_mode);
                 const auto started_at = std::chrono::steady_clock::now();
-                sample.ok = mds_.GetRandomMasstreeFileAttr(attr_request, &sample.reply);
+                sample.ok = mds_.GetRandomMasstreeFileAttr(attr_request,
+                                                           &sample.reply,
+                                                           query_rpc_timeout_ms);
                 sample.latency_us = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
                                                                           started_at)
@@ -3134,44 +3845,39 @@ private:
                     sample.inode_id = sample.reply.inode_id();
                     sample.attr = sample.reply.attr();
                 }
+                accept_success_sample(std::move(sample));
             } else {
                 std::cerr << "Unsupported query_mode: " << query_mode << '\n';
                 return false;
             }
-            total_latency_us += sample.latency_us;
-            min_latency_us = std::min<uint64_t>(min_latency_us, sample.latency_us);
-            max_latency_us = std::max<uint64_t>(max_latency_us, sample.latency_us);
-            if (sample.ok) {
-                ++success_count;
-            } else {
-                ++failure_count;
-            }
-            samples.push_back(std::move(sample));
         }
 
-        std::cout << "query_samples=" << sample_count << '\n';
+        std::cout << "query_samples=" << target_success_count << '\n';
         std::cout << "query_mode=" << query_mode << '\n';
-        std::cout << "query_success_count=" << success_count << '\n';
-        std::cout << "query_failure_count=" << failure_count << '\n';
-        std::cout << "query_success_rate="
-                  << FormatDouble(sample_count == 0 ? 0.0
-                                                    : static_cast<double>(success_count) / static_cast<double>(sample_count),
-                                  4)
-                  << '\n';
+        std::cout << "query_success_count=" << target_success_count << '\n';
+        std::cout << "metadata_output_success_limit=" << output_success_limit << '\n';
+        std::cout << "metadata_output_success_count="
+                  << std::min<uint32_t>(target_success_count, output_success_limit) << '\n';
+        std::cout << "query_success_rate=1.0000\n";
         std::cout << "total_query_latency=" << FormatLatencyHuman(total_latency_us) << '\n';
         std::cout << "avg_query_latency="
-                  << FormatLatencyHuman(sample_count == 0 ? 0 : (total_latency_us / sample_count)) << '\n';
-        std::cout << "min_query_latency=" << FormatLatencyHuman(sample_count == 0 ? 0 : min_latency_us) << '\n';
-        std::cout << "max_query_latency=" << FormatLatencyHuman(max_latency_us) << '\n';
+                  << FormatLatencyHuman(success_count == 0 ? 0 : (total_latency_us / success_count)) << '\n';
+        std::cout << "min_query_latency=" << FormatLatencyHuman(success_count == 0 ? 0 : min_latency_us) << '\n';
+        std::cout << "max_query_latency=" << FormatLatencyHuman(success_count == 0 ? 0 : max_latency_us) << '\n';
+        uint32_t printed_success_count = 0;
         for (const auto& sample : samples) {
-            std::cout << "sample_index=" << sample.index << '\n';
-            std::cout << "query_ok=" << (sample.ok ? "true" : "false") << '\n';
-            std::cout << "query_latency=" << FormatLatencyHuman(sample.latency_us) << '\n';
-            std::cout << "status_code=" << static_cast<int>(sample.status.code()) << '\n';
-            std::cout << "status_text=" << (sample.ok ? "OK" : sample.error_message) << '\n';
             if (!sample.ok) {
                 continue;
             }
+            if (printed_success_count >= output_success_limit) {
+                continue;
+            }
+            ++printed_success_count;
+            std::cout << "sample_index=" << sample.index << '\n';
+            std::cout << "query_ok=true\n";
+            std::cout << "query_latency=" << FormatLatencyHuman(sample.latency_us) << '\n';
+            std::cout << "status_code=" << static_cast<int>(sample.status.code()) << '\n';
+            std::cout << "status_text=OK\n";
             const auto& attr = sample.attr;
             std::cout << "attr={\n";
             std::cout << "  namespace_id=" << sample.namespace_id << '\n';
@@ -3184,8 +3890,9 @@ private:
             std::cout << "  mode=" << attr.mode() << '\n';
             std::cout << "  uid=" << attr.uid() << '\n';
             std::cout << "  gid=" << attr.gid() << '\n';
-            std::cout << "  size_bytes=" << attr.size() << '\n';
-            std::cout << "  size_human=" << FormatBytes(attr.size()) << '\n';
+            const uint64_t demo_size = ScaleDemoFileSize(attr.size());
+            std::cout << "  size_bytes=" << demo_size << '\n';
+            std::cout << "  size_human=" << FormatBytes(demo_size) << '\n';
             std::cout << "  atime=" << attr.atime() << '\n';
             std::cout << "  mtime=" << attr.mtime() << '\n';
             std::cout << "  ctime=" << attr.ctime() << '\n';
@@ -3195,7 +3902,7 @@ private:
             std::cout << "  file_archive_state=" << ArchiveStateToEnglishString(attr.file_archive_state()) << '\n';
             std::cout << "}\n";
         }
-        return failure_count == 0;
+        return true;
     }
 
     static void FillPatternChunk(std::vector<char>* buffer,

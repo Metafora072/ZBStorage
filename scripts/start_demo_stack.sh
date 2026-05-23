@@ -98,6 +98,46 @@ wait_port() {
   done
 }
 
+port_in_use() {
+  local host="$1"
+  local port="$2"
+  if command -v nc >/dev/null 2>&1; then
+    nc -z "${host}" "${port}" >/dev/null 2>&1
+    return $?
+  fi
+  (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1
+}
+
+describe_port_owner() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -lntp "sport = :${port}" 2>/dev/null || true
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -lntp 2>/dev/null | grep ":${port} " || true
+  fi
+}
+
+ensure_port_free() {
+  local name="$1"
+  local port="$2"
+  if port_in_use "127.0.0.1" "${port}"; then
+    log "[ERROR] ${name} port ${port} is already in use. Stop the old demo stack first."
+    describe_port_owner "${port}"
+    log "[HINT] run: bash scripts/start_demo_stack.sh stop"
+    log "[HINT] if pid files are stale/missing, check: ss -lntp | egrep '9000|9100|19080|29080'"
+    exit 1
+  fi
+}
+
+ensure_all_ports_free() {
+  ensure_port_free "scheduler" "${SCHEDULER_PORT}"
+  ensure_port_free "mds" "${MDS_PORT}"
+  ensure_port_free "real_node" "${REAL_PORT}"
+  ensure_port_free "virtual_node" "${VIRTUAL_PORT}"
+}
+
 write_pid() {
   local name="$1"
   local pid="$2"
@@ -212,9 +252,30 @@ start_component() {
   local port="$2"
   shift 2
   local log_file="${LOG_DIR}/${name}.log"
+  ensure_port_free "${name}" "${port}"
   "$@" >"${log_file}" 2>&1 &
-  write_pid "${name}" "$!"
-  if ! wait_port "127.0.0.1" "${port}" 20; then
+  local pid="$!"
+  write_pid "${name}" "${pid}"
+
+  local start_ts
+  start_ts="$(date +%s)"
+  while true; do
+    if ! is_pid_alive "${pid}"; then
+      log "[ERROR] ${name} exited before becoming ready. See log: ${log_file}"
+      tail -n 20 "${log_file}" || true
+      exit 1
+    fi
+    if port_in_use "127.0.0.1" "${port}"; then
+      log "[OK] ${name} started on :${port}"
+      return 0
+    fi
+    if (( "$(date +%s)" - start_ts >= 20 )); then
+      break
+    fi
+    sleep 1
+  done
+
+  if ! wait_port "127.0.0.1" "${port}" 1; then
     log "[ERROR] ${name} did not become ready on port ${port}"
     exit 1
   fi
@@ -228,6 +289,7 @@ start_all() {
   require_bin "${BUILD_DIR}/mds_server"
   require_bin "${BUILD_DIR}/zb_fuse_client"
 
+  ensure_all_ports_free
   render_configs
 
   start_component scheduler "${SCHEDULER_PORT}" \
@@ -246,6 +308,7 @@ start_all() {
   "${BUILD_DIR}/zb_fuse_client" \
     --mds="127.0.0.1:${MDS_PORT}" \
     --scheduler="127.0.0.1:${SCHEDULER_PORT}" \
+    --timeout_ms=30000 \
     --bootstrap_tier_dirs=true \
     --real_dir_name="${REAL_DIR_NAME}" \
     --virtual_dir_name="${VIRTUAL_DIR_NAME}" \

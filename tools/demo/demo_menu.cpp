@@ -17,7 +17,7 @@ void RenderMenu(const std::string& title, const std::vector<MenuActionSpec>& act
         std::cout << '\n';
     }
     std::cout << "\n\u8f93\u5165\u683c\u5f0f: <\u5e8f\u53f7> key=value key=value\n";
-    std::cout << "\u793a\u4f8b: 10 template_id=template-pathlist-100m path_list_file=examples/masstree_path_list_sample.txt\n";
+    std::cout << "\u793a\u4f8b: 6 script=scripts/import_50yi.sh\n";
 }
 
 const MenuActionSpec* FindAction(const std::vector<MenuActionSpec>& actions, const std::string& token) {

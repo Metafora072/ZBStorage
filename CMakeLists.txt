@@ -243,6 +243,15 @@ if(BRPC_DYNAMIC_LIB)
     target_link_libraries(system_demo_tool PRIVATE ${BRPC_DYNAMIC_LIB})
 endif()
 
+add_executable(random_read_6b_files
+    tools/random_read_6b_files.cpp
+)
+set_target_properties(random_read_6b_files PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+)
+
 add_executable(optical_archive_stress_test
     src/client/test/optical_archive_stress_test.cpp
 )
@@ -487,6 +496,49 @@ if(UNIX)
         masstree/index/masstree/string_slice.cc
     )
     target_compile_definitions(masstree_meta_import_tool PRIVATE ZBSTORAGE_ENABLE_MASSTREE_INDEX=1)
+endif()
+
+add_executable(masstree_random_bulk_import_tool
+    tools/masstree/masstree_random_bulk_import_tool.cpp
+    src/mds/masstree_meta/MasstreeBulkImporter.cpp
+    src/mds/masstree_meta/MasstreeBulkMetaGenerator.cpp
+    src/mds/masstree_meta/MasstreeIndexRuntime.cpp
+    src/mds/masstree_meta/MasstreeInodeRecordCodec.cpp
+    src/mds/masstree_meta/MasstreeManifest.cpp
+    src/mds/masstree_meta/MasstreeOpticalAllocator.cpp
+    src/mds/masstree_meta/MasstreePageLayout.cpp
+    src/mds/masstree_meta/MasstreePageReader.cpp
+    src/mds/storage/UnifiedInodeRecord.cpp
+)
+set_target_properties(masstree_random_bulk_import_tool PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+)
+target_include_directories(masstree_random_bulk_import_tool
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/masstree/index/masstree
+        ${CMAKE_CURRENT_BINARY_DIR}
+)
+target_link_libraries(masstree_random_bulk_import_tool
+    PRIVATE
+        zb_proto
+)
+if(UNIX)
+    target_sources(masstree_random_bulk_import_tool PRIVATE
+        masstree/index/masstree/clp.c
+        masstree/index/masstree/compiler.cc
+        masstree/index/masstree/kvthread.cc
+        masstree/index/masstree/masstree_wrapper.cc
+        masstree/index/masstree/memdebug.cc
+        masstree/index/masstree/misc.cc
+        masstree/index/masstree/str.cc
+        masstree/index/masstree/straccum.cc
+        masstree/index/masstree/string.cc
+        masstree/index/masstree/string_slice.cc
+    )
+    target_compile_definitions(masstree_random_bulk_import_tool PRIVATE ZBSTORAGE_ENABLE_MASSTREE_INDEX=1)
 endif()
 
 add_executable(masstree_meta_build_tool

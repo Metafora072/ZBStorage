@@ -18,6 +18,8 @@ cmake --build build --target scheduler_server mds_server real_node_server virtua
 bash scripts/start_demo_stack.sh start
 bash scripts/start_demo_stack.sh status
 bash scripts/start_demo_stack.sh stop
+bash scripts/run_system_demo.sh
+
 
 mkdir -p logs
 nohup bash scripts/import_masstree_demo.sh 1000 > logs/import_1000yi.log 2>&1 &
@@ -34,7 +36,7 @@ nohup bash scripts/generate_masstree_template.sh \
   "$MASSTREE_PATH_LIST_FILE" \
   copy \
   true > logs/generate_template.log 2>&1 &
-
+ 
 tail -f logs/generate_template.log
 
 用模板导入 1000 亿元数据

@@ -72,6 +72,7 @@ ParsedCommand ParseCommandLine(const std::string& line) {
         return parsed;
     }
 
+    parsed.tokens = tokens;
     parsed.action = tokens.front();
     for (size_t i = 1; i < tokens.size(); ++i) {
         const std::string& token = tokens[i];

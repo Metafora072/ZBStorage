@@ -118,14 +118,14 @@ test/dsf-user-service-test
 <type>: <summary>
 ```
 
-其中 type 与分支类型保持一致，summary 使用简短英文描述本次变更。示例如下。
+其中 type 与分支类型保持一致，summary 使用简短文本描述本次变更。示例如下。
 
 ```text
-feat: add project member management
-fix: correct task card collapse style
-ci: add github actions workflow
-docs: add github collaboration guide
-refactor: simplify project permission model
+feat: 添加项目成员管理
+fix: 修正任务卡片折叠样式
+ci: 添加 GitHub Actions 工作流
+docs: 添加 GitHub 协作指南
+refactor: 简化项目权限模型
 ```
 
 提交信息应避免使用 update、fix bug、change code、final 等含义模糊的描述。提交信息应能够让审查者在不打开代码的情况下，基本判断本次提交解决了什么问题。
@@ -204,6 +204,63 @@ git branch -D feature/pz-member-management
 完成清理后，下一项任务应重新从最新 `main` 创建新的工作分支，不应继续在已经合入的旧分支上开发。
 
 
+## 单元测试规范
+涉及核心逻辑、边界条件、问题修复和重构的变更，应同步补充或更新单元测试。单元测试应尽量保持快速、稳定、可重复执行，不应依赖个人机器路径、手工启动的服务、外部网络环境和大规模本地数据。若测试需要临时文件，应使用临时目录，并在测试结束后清理。
 
+测试文件推荐放在对应模块的 `test` 目录下，文件名使用 `<module>_<case>_test.cpp` 或 `<feature>_test.cpp` 形式。例如：
+
+```text
+src/client/test/pg_migration_sim_test.cpp
+src/mds/test/archive_manifest_test.cpp
+src/data_node/real_node/test/local_path_resolver_test.cpp
+```
+
+测试程序应以进程退出码表示结果：测试通过时返回 `0`，测试失败时返回非 `0`。测试中可以使用 `assert`、明确的条件判断和错误输出，但不应只打印日志而不返回失败状态。每个测试应覆盖清晰的行为目标，例如正常路径、非法参数、空输入、边界值、重复执行、资源清理和错误恢复。
+
+新增测试后，需要在 `CMakeLists.txt` 中创建测试可执行文件，并通过 `add_test` 注册到 CTest。示例如下：
+
+```cmake
+add_executable(archive_manifest_test
+    src/mds/test/archive_manifest_test.cpp
+    src/mds/archive_meta/ArchiveManifest.cpp
+)
+target_include_directories(archive_manifest_test
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(archive_manifest_test
+    PRIVATE
+        ${CMAKE_THREAD_LIBS_INIT}
+)
+if(BUILD_TESTING)
+    add_test(NAME archive_manifest_test COMMAND archive_manifest_test)
+endif()
+```
+
+其中 `add_executable` 负责让测试参与编译，`add_test` 负责让测试进入 CTest 测试集合。项目 CI 中的 `build-test` 门禁会使用 `-DBUILD_TESTING=ON` 配置 CMake，并执行如下命令：
+
+```bash
+ctest --test-dir build --output-on-failure --no-tests=error
+```
+
+因此，只要测试已经通过 `add_test` 注册，PR 触发 CI 时就会自动进入 `build-test` 门禁。若测试失败、超时或未能正常启动，`build-test` 会失败，PR 不允许合入 `main`。
+
+提交 PR 前，协作者应至少在本地执行新增测试。推荐命令如下：
+
+```bash
+cmake -S . -B build -G Ninja -DBUILD_TESTING=ON
+cmake --build build --target archive_manifest_test
+ctest --test-dir build -R archive_manifest_test --output-on-failure
+```
+
+如果测试依赖特殊参数，应在 `add_test` 中显式写出，避免只在本地手动执行时才传入参数。例如：
+
+```cmake
+if(BUILD_TESTING)
+    add_test(NAME pg_migration_sim_test COMMAND pg_migration_sim_test --sample_objects=1000)
+endif()
+```
+
+PR 描述中应写明本次新增或修改了哪些测试，以及本地执行结果。只新增业务代码但没有对应测试时，应在 PR 描述中说明原因，例如当前变更只涉及文档、纯配置、不可单独测试的脚本调整，或已有测试已经覆盖该行为。
 
 

@@ -87,19 +87,35 @@ jobs:
   build-test:
     name: build-test
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPRESS: "true"
+      CCACHE_COMPRESSLEVEL: "6"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 1G
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           submodules: recursive
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-ccache-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-${{ github.ref_name }}-
+            ${{ runner.os }}-ccache-
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            ccache \
             cmake \
             libfuse3-dev \
             libgflags-dev \
@@ -120,6 +136,8 @@ jobs:
             -DBUILD_TESTING=ON \
             -DBUILD_BRPC_TOOLS=OFF \
             -DBUILD_UNIT_TESTS=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DDOWNLOAD_GTEST=OFF \
             -DFAIL_ON_WARNINGS=OFF \
             -DWITH_ALL_TESTS=OFF \
@@ -130,7 +148,10 @@ jobs:
             -DWITH_TOOLS=OFF
 
       - name: Build
-        run: cmake --build build --parallel 2
+        run: cmake --build build --parallel "$(nproc)"
+
+      - name: Compiler cache stats
+        run: ccache --show-stats
 
       - name: Unit tests
         run: ctest --test-dir build --output-on-failure --no-tests=error

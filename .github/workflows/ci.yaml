@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+  push:
+    branches:
+      - main
+      - master
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install linters
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format shellcheck
+
+      - name: Collect changed files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git fetch --no-tags origin "${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+            base_ref="origin/${{ github.base_ref }}"
+          else
+            before="${{ github.event.before }}"
+            if [[ -z "${before}" || "${before}" =~ ^0+$ ]] || ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+              base_ref="$(git rev-list --max-parents=0 HEAD)"
+            else
+              base_ref="${before}"
+            fi
+          fi
+
+          git diff --name-only --diff-filter=ACMRT "${base_ref}" HEAD > changed-files.txt
+
+      - name: clang-format changed C/C++ files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(
+            grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$' changed-files.txt |
+            grep -Ev '^(third_party|build)/' || true
+          )
+
+          if (( ${#files[@]} == 0 )); then
+            echo "No changed C/C++ files to format-check."
+            exit 0
+          fi
+
+          clang-format --dry-run --Werror "${files[@]}"
+
+      - name: shellcheck changed shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(
+            grep -E '\.sh$' changed-files.txt |
+            grep -Ev '^(third_party|build)/' || true
+          )
+
+          if (( ${#files[@]} == 0 )); then
+            echo "No changed shell scripts to lint."
+            exit 0
+          fi
+
+          shellcheck "${files[@]}"
+
+  build-test:
+    name: build-test
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libfuse3-dev \
+            libgflags-dev \
+            libleveldb-dev \
+            libprotobuf-dev \
+            libprotoc-dev \
+            libsnappy-dev \
+            libssl-dev \
+            ninja-build \
+            pkg-config \
+            protobuf-compiler \
+            zlib1g-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=ON \
+            -DBUILD_BRPC_TOOLS=OFF \
+            -DBUILD_UNIT_TESTS=OFF \
+            -DDOWNLOAD_GTEST=OFF \
+            -DFAIL_ON_WARNINGS=OFF \
+            -DWITH_ALL_TESTS=OFF \
+            -DWITH_BENCHMARK_TOOLS=OFF \
+            -DWITH_CORE_TOOLS=OFF \
+            -DWITH_LIBURING=OFF \
+            -DWITH_TESTS=OFF \
+            -DWITH_TOOLS=OFF
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure --no-tests=error

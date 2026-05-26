@@ -4,6 +4,8 @@ project(ZBStorage C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(CTest)
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/cmake")
 
 option(BUILD_BRPC_TOOLS "Build brpc tools" OFF)
@@ -11,6 +13,11 @@ option(BUILD_UNIT_TESTS "Build brpc unit tests" OFF)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(third_party/brpc)
+
+set(ZBSTORAGE_BRPC_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/src
+    ${CMAKE_CURRENT_BINARY_DIR}/third_party/brpc
+)
 
 find_package(Protobuf REQUIRED)
 find_package(GFLAGS REQUIRED)
@@ -80,7 +87,7 @@ add_executable(real_node_server ${REAL_NODE_SOURCES})
 target_include_directories(real_node_server
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/src
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${GFLAGS_INCLUDE_PATH}
         ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -110,7 +117,7 @@ add_executable(virtual_node_server
 target_include_directories(virtual_node_server
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/src
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${GFLAGS_INCLUDE_PATH}
         ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -135,7 +142,7 @@ add_executable(optical_node_server
 target_include_directories(optical_node_server
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/src
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${GFLAGS_INCLUDE_PATH}
         ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -156,7 +163,7 @@ add_executable(real_node_client
 target_include_directories(real_node_client
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/src
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${GFLAGS_INCLUDE_PATH}
         ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -177,7 +184,7 @@ add_executable(real_node_multi_test
 target_include_directories(real_node_multi_test
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/src
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${GFLAGS_INCLUDE_PATH}
         ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -198,7 +205,7 @@ add_executable(virtual_node_test
 target_include_directories(virtual_node_test
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/src
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${GFLAGS_INCLUDE_PATH}
         ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -228,7 +235,7 @@ set_target_properties(system_demo_tool PROPERTIES
 target_include_directories(system_demo_tool
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/src
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${GFLAGS_INCLUDE_PATH}
         ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -258,7 +265,7 @@ add_executable(optical_archive_stress_test
 target_include_directories(optical_archive_stress_test
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/src
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${GFLAGS_INCLUDE_PATH}
         ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -279,7 +286,7 @@ add_executable(scheduler_control_test
 target_include_directories(scheduler_control_test
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/src
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${GFLAGS_INCLUDE_PATH}
         ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -621,7 +628,7 @@ add_executable(module_io_smoke_test
 target_include_directories(module_io_smoke_test
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/src
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${GFLAGS_INCLUDE_PATH}
         ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -642,7 +649,7 @@ add_executable(layout_commit_conflict_test
 target_include_directories(layout_commit_conflict_test
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/src
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${GFLAGS_INCLUDE_PATH}
         ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -671,6 +678,9 @@ target_link_libraries(pg_migration_sim_test
         ${GFLAGS_LIBRARY}
         ${CMAKE_THREAD_LIBS_INIT}
 )
+if(BUILD_TESTING)
+    add_test(NAME pg_migration_sim_test COMMAND pg_migration_sim_test --sample_objects=1000)
+endif()
 
 add_executable(mds_server
     src/mds/config/MdsConfig.cpp
@@ -718,7 +728,7 @@ target_include_directories(mds_server
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/masstree/index/masstree
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/src
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${GFLAGS_INCLUDE_PATH}
         ${ROCKSDB_ROOT}/include
         ${CMAKE_CURRENT_BINARY_DIR}
@@ -765,7 +775,7 @@ add_executable(scheduler_server
 target_include_directories(scheduler_server
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/src
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${GFLAGS_INCLUDE_PATH}
         ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -787,7 +797,7 @@ if(UNIX)
     target_include_directories(zb_fuse_client
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/src
+            ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
             ${GFLAGS_INCLUDE_PATH}
             ${FUSE3_INCLUDE_DIRS}
             ${CMAKE_CURRENT_BINARY_DIR}
@@ -807,4 +817,3 @@ if(UNIX)
         target_link_libraries(zb_fuse_client PRIVATE ${BRPC_DYNAMIC_LIB})
     endif()
 endif()
-

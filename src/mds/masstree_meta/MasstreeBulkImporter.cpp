@@ -603,6 +603,41 @@ bool BuildTargetOpticalRuns(const MasstreeOpticalProfile& profile,
     return true;
 }
 
+bool ResolveOpticalProfile(uint32_t layout_version,
+                           MasstreeOpticalProfile* profile,
+                           std::string* error) {
+    if (!profile) {
+        if (error) {
+            *error = "invalid optical profile output";
+        }
+        return false;
+    }
+    if (layout_version == MasstreeOpticalProfile::kLegacyMixedLayoutVersion) {
+        *profile = MasstreeOpticalProfile::LegacyMixed();
+        if (error) {
+            error->clear();
+        }
+        return true;
+    }
+    if (layout_version == MasstreeOpticalProfile::kUniform2TbLayoutVersion) {
+        *profile = MasstreeOpticalProfile::Fixed();
+        if (error) {
+            error->clear();
+        }
+        return true;
+    }
+    if (error) {
+        *error = "unsupported optical_layout_version: " + std::to_string(layout_version);
+    }
+    return false;
+}
+
+std::string OpticalLayoutName(const MasstreeOpticalProfile& profile) {
+    return profile.layout_version == MasstreeOpticalProfile::kLegacyMixedLayoutVersion
+               ? MasstreeOpticalProfile::kLegacyMixedLayoutName
+               : MasstreeOpticalProfile::kUniform2TbLayoutName;
+}
+
 bool BuildDentryPages(std::ifstream* dentry_in,
                       const MasstreeNamespaceManifest& manifest,
                       MasstreeIndexRuntime* runtime,
@@ -1490,7 +1525,10 @@ bool MasstreeBulkImporter::Import(const Request& request,
         return false;
     }
 
-    const MasstreeOpticalProfile optical_profile = MasstreeOpticalProfile::Fixed();
+    MasstreeOpticalProfile optical_profile;
+    if (!ResolveOpticalProfile(request.optical_layout_version, &optical_profile, error)) {
+        return false;
+    }
     MasstreeIndexRuntime local_runtime;
     MasstreeIndexRuntime* active_runtime = runtime ? runtime : &local_runtime;
     std::string init_error;
@@ -1699,7 +1737,7 @@ bool MasstreeBulkImporter::Import(const Request& request,
     manifest.end_cursor_disk_index = local_result.end_cursor.disk_index;
     manifest.end_cursor_image_index = local_result.end_cursor.image_index_in_disk;
     manifest.end_cursor_image_used_bytes = local_result.end_cursor.image_used_bytes;
-    manifest.layout_version = 3;
+    manifest.optical_layout_version = OpticalLayoutName(optical_profile);
     manifest.inode_page_count = local_result.inode_page_count;
     manifest.dentry_page_count = local_result.dentry_page_count;
 

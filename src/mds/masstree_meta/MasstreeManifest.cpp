@@ -91,6 +91,8 @@ bool MasstreeNamespaceManifest::LoadFromFile(const std::string& manifest_path,
                 return false;
             }
             parsed.layout_version = static_cast<uint32_t>(parsed_value);
+        } else if (key == "optical_layout_version") {
+            parsed.optical_layout_version = value;
         } else if (key == "source_mode") {
             parsed.source_mode = value;
         } else if (key == "template_id") {
@@ -460,6 +462,7 @@ bool MasstreeNamespaceManifest::SaveToFile(const std::string& manifest_path, std
 
     out << "masstree_namespace_manifest_v1\n";
     out << "layout_version=" << layout_version << "\n";
+    out << "optical_layout_version=" << optical_layout_version << "\n";
     out << "namespace_id=" << namespace_id << "\n";
     out << "source_mode=" << source_mode << "\n";
     out << "template_id=" << template_id << "\n";

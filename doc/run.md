@@ -9,6 +9,7 @@
   - `build/` 作为编译输出目录
   - `config/base.conf` 中的 `ROOT_PATH` 作为一键脚本和 demo 运行数据根目录
   - 如果 `ROOT_PATH` 为空，则回退到仓库下的 `.demo_run/`
+  - 也可以用环境变量 `DEMO_ROOT` 临时覆盖运行数据根目录
 - 主要脚本都在 [scripts](../scripts)。
 - 示例 `txt` 路径树文件见 [examples/masstree_path_list_sample.txt](../examples/masstree_path_list_sample.txt)。
 
@@ -25,6 +26,14 @@ ROOT_PATH=/data/zb_storage_demo
 - `pids/`
 - `data/`
 - `mnt/`
+
+如果 `config/base.conf` 中的 `ROOT_PATH` 指向当前用户不可写的目录，启动脚本会无法写入配置或日志。此时可以临时改用仓库内运行目录：
+
+```bash
+export DEMO_ROOT="$(pwd)/.demo_run"
+```
+
+后续 `start`、`status`、`stop`、demo 和导入脚本都应在同一个 shell 中使用这个 `DEMO_ROOT`。
 
 ## 2. 一键编译整个项目
 
@@ -74,6 +83,12 @@ BUILD_TYPE=Release JOBS=32 bash scripts/build_all.sh build
 bash scripts/start_demo_stack.sh start
 ```
 
+如果需要临时覆盖运行根目录：
+
+```bash
+DEMO_ROOT="$(pwd)/.demo_run" bash scripts/start_demo_stack.sh start
+```
+
 关闭全部模块：
 
 ```bash
@@ -99,6 +114,8 @@ bash scripts/start_demo_stack.sh status
 - `virtual_node_server`
 - `mds_server`
 - `zb_fuse_client`
+
+服务会在后台运行，进程号记录在 `<运行根目录>/pids/`，日志输出在 `<运行根目录>/logs/`。
 
 运行目录默认在 `ROOT_PATH` 下：
 
@@ -127,7 +144,7 @@ bash scripts/start_demo_stack.sh status
 命令：
 
 ```bash
-bash scripts/generate_masstree_template.sh <template_id> <path_list_file> [repeat_dir_prefix]
+bash scripts/generate_masstree_template.sh <template_id> <path_list_file> [repeat_dir_prefix] [leaf_nodes_are_files]
 ```
 
 示例：
@@ -150,6 +167,7 @@ MDS_ADDR=127.0.0.1:9000
 SCHEDULER_ADDR=127.0.0.1:9100
 MASSTREE_VERIFY_INODE_SAMPLES=32
 MASSTREE_VERIFY_DENTRY_SAMPLES=32
+MASSTREE_PATH_LIST_LEAF_NODES_ARE_FILES=false
 ```
 
 ## 5. 根据模板导入一个新的命名空间
@@ -174,7 +192,8 @@ bash scripts/import_masstree_demo.sh 1
 
 - 该脚本会连续导入多个 namespace
 - 每个 namespace 都使用同一个模板
-- namespace 名默认形如 `demo-ns-000001`
+- 如果未设置 `MASSTREE_TEMPLATE_ID`，`system_demo_tool` 会从 `<ROOT_PATH>/data/mds/masstree_meta/templates/` 自动选择一个约 1 亿文件规模的模板
+- namespace 名默认形如 `demo-ns-001001`，会扫描 `<ROOT_PATH>/data/mds/masstree_meta/namespaces/` 下已有的最大序号并从下一个序号开始
 
 常用环境变量：
 
@@ -240,7 +259,7 @@ MASSTREE_REPEAT_DIR_PREFIX=copy
 
 日志输出在：
 
-- `.demo_run/logs/import_masstree_<namespace_count>ns_<timestamp>.log`
+- `<运行根目录>/logs/import_masstree_<namespace_count>ns_<timestamp>.log`
 
 ## 7. 运行 demo 演示程序
 
@@ -301,46 +320,51 @@ bash scripts/run_demo_showcase.sh template-pathlist-100m examples/masstree_path_
 
 日志输出在：
 
-- `.demo_run/logs/demo_showcase_<timestamp>.log`
+- `<运行根目录>/logs/demo_showcase_<timestamp>.log`
 
 ## 9. demo 交互菜单功能说明
 
 进入交互式 demo 后，可用功能如下：
 
-- `1`：环境健康检查
-- `2`：全局统计检查
-- `3`：真实节点 POSIX 读写演示
-- `4`：虚拟节点 POSIX 读写演示
-- `5`：按模板导入一个 Masstree namespace
-- `10`：根据 `txt` 路径树生成 Masstree 模板
-- `6`：Masstree 随机查询
-- `7`：执行完整测试集
-- `8`：查看上一次结果
-- `9`：帮助
-- `0`：退出
+- `0`：环境健康检查
+- `1`：TC-P1 全局统计
+- `2`：TC-P2 真实节点读写
+- `3`：TC-P3 虚拟节点读写
+- `4`：TC-P4 Masstree 导入，基于已有模板执行真实导入
+- `5`：TC-P5 Masstree 查询
+- `6`：50 亿文件测试，输入脚本路径并执行该脚本
+- `q`：退出
 
 典型交互命令：
 
 ```text
-10 template_id=template-pathlist-100m path_list_file=examples/masstree_path_list_sample.txt repeat_dir_prefix=copy
-5 namespace=demo-ns generation=gen-001 template_id=template-pathlist-100m template_mode=page_fast
-6 n=10
-6 n=1000 query_mode=random_path_lookup
-6 n=1000 query_mode=random_inode
-7
+0
+1 tc_p1_expected_real_node_count=1 tc_p1_expected_virtual_node_count=99
+2 file_size_mb=1 chunk_size_kb=64 keep_file=false
+3 file_size_mb=1 chunk_size_kb=64 keep_file=false
+4 template_id=template-01-tijian template_mode=page_fast
+5 n=10 query_mode=random_inode output_limit=5
+6 script=scripts/random_read_6b_files.sh /path/to/6b/root -n 100 --continue-on-error
+q
 ```
 
 其中：
 
-- `6 n=10` 等价于 `6 n=10 query_mode=random_path_lookup`
+- `5 n=10` 等价于 `5 n=10 query_mode=random_path_lookup`
 - `random_path_lookup` 是默认模式，适合测真实路径逐层查找时延
 - `random_inode` 直接走随机 inode 查询，不走客户端路径拼接
+- `4` 如果不显式传 `namespace`，会扫描已有 `demo-ns-xxxxxx` 命名空间并使用下一个序号
+- `4` 如果不显式传 `template_id`，会从 `<ROOT_PATH>/data/mds/masstree_meta/templates/` 自动选择约 1 亿文件规模的模板
+- `6` 只负责调用外部脚本；脚本本身需要的参数和数据集目录由对应脚本决定
 
 ## 10. 推荐完整流程
 
 ### 10.1 手工分步执行
 
 ```bash
+# 可选：当 config/base.conf 中的 ROOT_PATH 不适用于当前机器时使用
+export DEMO_ROOT="$(pwd)/.demo_run"
+
 # 1. 编译
 bash scripts/build_all.sh build
 
@@ -372,4 +396,62 @@ bash scripts/run_import_1000yi_once.sh 1000
 
 ```bash
 bash scripts/run_demo_showcase.sh template-pathlist-100m examples/masstree_path_list_sample.txt
+```
+
+### 10.4 单机部署常用命令
+
+如果只需要编译并启动本机 demo stack：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target scheduler_server mds_server real_node_server virtual_node_server zb_fuse_client system_demo_tool -j$(nproc)
+
+export DEMO_ROOT="$(pwd)/.demo_run"
+bash scripts/start_demo_stack.sh start
+bash scripts/start_demo_stack.sh status
+bash scripts/run_system_demo.sh
+```
+
+关闭：
+
+```bash
+bash scripts/start_demo_stack.sh stop
+```
+
+后台导入 namespace：
+
+```bash
+mkdir -p logs
+nohup bash scripts/import_masstree_demo.sh 1000 > logs/import_1000yi.log 2>&1 &
+tail -f logs/import_1000yi.log
+```
+
+生成 Masstree 模板：
+
+```bash
+export MASSTREE_TEMPLATE_ID=template-100m
+export MASSTREE_PATH_LIST_FILE=examples/masstree_path_list_sample.txt
+export MASSTREE_PATH_LIST_LEAF_NODES_ARE_FILES=true
+
+mkdir -p logs
+nohup bash scripts/generate_masstree_template.sh \
+  "$MASSTREE_TEMPLATE_ID" \
+  "$MASSTREE_PATH_LIST_FILE" \
+  copy \
+  true > logs/generate_template.log 2>&1 &
+ 
+tail -f logs/generate_template.log
+```
+
+用模板导入 1000 亿规模元数据：
+
+```bash
+export MASSTREE_TEMPLATE_ID=template-100m
+export MASSTREE_TEMPLATE_MODE=page_fast
+export NAMESPACE_PREFIX=demo-ns
+
+mkdir -p logs
+nohup bash scripts/import_masstree_demo.sh 1000 > logs/import_1000yi.log 2>&1 &
+
+tail -f logs/import_1000yi.log
 ```

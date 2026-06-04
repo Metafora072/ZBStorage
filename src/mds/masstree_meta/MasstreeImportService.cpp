@@ -401,6 +401,14 @@ bool MasstreeImportService::ImportTemplateNamespace(const TemplateImportRequest&
     if (!stats_store.LoadClusterStats(&cluster_before, error)) {
         return false;
     }
+    if (cluster_before.optical_layout_version != MasstreeOpticalProfile::kLegacyMixedLayoutVersion &&
+        cluster_before.optical_layout_version != MasstreeOpticalProfile::kUniform2TbLayoutVersion) {
+        if (error) {
+            *error = "unsupported optical_layout_version: " +
+                     std::to_string(cluster_before.optical_layout_version);
+        }
+        return false;
+    }
 
     std::string staging_dir;
     std::string working_manifest_path;
@@ -467,6 +475,7 @@ bool MasstreeImportService::ImportTemplateNamespace(const TemplateImportRequest&
     import_request.verify_inode_samples = normalized.verify_inode_samples;
     import_request.verify_dentry_samples = normalized.verify_dentry_samples;
     import_request.start_cursor = cluster_before.cursor;
+    import_request.optical_layout_version = cluster_before.optical_layout_version;
 
     MasstreeBulkImporter::Result import_result;
     if (!importer.Import(import_request, nullptr, &import_result, error)) {
@@ -496,6 +505,7 @@ bool MasstreeImportService::ImportTemplateNamespace(const TemplateImportRequest&
     }
 
     MasstreeNamespaceStatsRecord namespace_stats;
+    namespace_stats.optical_layout_version = cluster_before.optical_layout_version;
     namespace_stats.namespace_id = normalized.namespace_id;
     namespace_stats.generation_id = normalized.generation_id;
     namespace_stats.file_count = import_result.file_count;

@@ -30,6 +30,7 @@ public:
         uint32_t verify_inode_samples{16};
         uint32_t verify_dentry_samples{16};
         MasstreeOpticalClusterCursor start_cursor;
+        uint32_t optical_layout_version{MasstreeOpticalProfile::kUniform2TbLayoutVersion};
     };
 
     struct Result {

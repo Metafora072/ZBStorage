@@ -9,6 +9,7 @@
 namespace zb::mds {
 
 struct MasstreeClusterStatsRecord {
+    uint32_t optical_layout_version{MasstreeOpticalProfile::kLegacyMixedLayoutVersion};
     uint64_t disk_node_count{0};
     uint64_t optical_node_count{0};
     uint64_t disk_device_count{0};
@@ -22,10 +23,17 @@ struct MasstreeClusterStatsRecord {
     uint64_t avg_file_size_bytes{0};
     uint64_t min_file_size_bytes{0};
     uint64_t max_file_size_bytes{0};
+    uint64_t total_disc_count{0};
+    uint64_t used_disc_count{0};
+    uint64_t unused_disc_count{0};
+    uint64_t sealed_legacy_disc_count{0};
+    uint64_t uniform_v2_used_disc_count{0};
+    std::string allocated_file_bytes{"0"};
     MasstreeOpticalClusterCursor cursor;
 };
 
 struct MasstreeNamespaceStatsRecord {
+    uint32_t optical_layout_version{MasstreeOpticalProfile::kLegacyMixedLayoutVersion};
     std::string namespace_id;
     std::string generation_id;
     uint64_t file_count{0};

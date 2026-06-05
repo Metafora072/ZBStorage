@@ -7,6 +7,7 @@ namespace zb::mds {
 
 struct MasstreeNamespaceManifest {
     uint32_t layout_version{1};
+    std::string optical_layout_version;
     std::string namespace_id;
     std::string path_prefix;
     std::string generation_id;

@@ -24,6 +24,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "demo_menu.h"
@@ -31,9 +32,11 @@
 #include "demo_params.h"
 #include "demo_result.h"
 #include "mds/masstree_meta/MasstreeDecimalUtils.h"
+#include "mds/masstree_meta/MasstreeOpticalProfile.h"
 #include "mds.pb.h"
 #include "real_node.pb.h"
 #include "scheduler.pb.h"
+#include "storagenode/optical_disc_catalog.h"
 
 namespace fs = std::filesystem;
 
@@ -45,37 +48,13 @@ DEFINE_string(virtual_dir, "virtual", "Top-level mounted directory for virtual-n
 DEFINE_string(scenario,
               "interactive",
               "Scenario: interactive|health|stats|posix|masstree|masstree_template|masstree_import|masstree_query|reset_nodes|all");
-DEFINE_string(masstree_namespace_id, "demo-ns", "Masstree demo namespace id");
+DEFINE_string(masstree_namespace_id, "", "Masstree demo namespace id; empty uses the next demo-ns-000001 style id");
 DEFINE_string(masstree_generation_id, "", "Masstree demo generation id; auto-generated if empty");
 DEFINE_string(masstree_path_prefix, "", "Masstree demo path prefix; defaults to /masstree_demo/<namespace>");
-DEFINE_string(masstree_template_id, "", "Masstree import template id; empty disables template reuse");
+DEFINE_string(masstree_template_id, "", "Masstree import template id; empty auto-selects a template from the run root");
 DEFINE_string(masstree_template_mode,
-              "",
-              "Masstree import template mode: empty|page_fast|legacy_records; empty preserves the current fast path");
-DEFINE_string(masstree_import_mode,
-              "simulated",
-              "Masstree import mode: simulated|real; simulated only updates demo overlay stats");
-DEFINE_string(masstree_sim_state_path,
-              "",
-              "Simulated Masstree import state file path; empty uses <demo_root>/data/mds/masstree_sim_overlay.tsv");
-DEFINE_uint64(masstree_sim_file_count, 100960182ULL, "Simulated file count per Masstree namespace import");
-DEFINE_uint64(masstree_sim_inode_count, 134414182ULL, "Simulated inode count per Masstree namespace import");
-DEFINE_uint64(masstree_sim_dentry_count, 134414181ULL, "Simulated dentry count per Masstree namespace import");
-DEFINE_string(masstree_sim_total_file_bytes,
-              "100961074964484700",
-              "Simulated total file bytes per Masstree namespace import");
-DEFINE_uint64(masstree_sim_metadata_bytes,
-              36027407800ULL,
-              "Simulated metadata bytes per Masstree namespace import");
-DEFINE_uint64(masstree_sim_avg_file_size_bytes,
-              10000008844ULL,
-              "Simulated average file size per Masstree namespace import");
-DEFINE_uint64(masstree_sim_min_file_size_bytes,
-              500000000ULL,
-              "Simulated minimum file size per Masstree namespace import");
-DEFINE_uint64(masstree_sim_max_file_size_bytes,
-              20000000000ULL,
-              "Simulated maximum file size per Masstree namespace import");
+              "page_fast",
+              "Masstree import template mode: page_fast|legacy_records");
 DEFINE_string(masstree_source_mode,
               "",
               "Masstree import source mode: empty|synthetic|path_list; empty keeps the server default");
@@ -156,6 +135,12 @@ DEFINE_string(reset_nodes_scope,
               "Comma-separated reset scope: real,virtual");
 DEFINE_bool(reset_nodes_purge_objects, true, "Reset node object payload/state");
 DEFINE_bool(reset_nodes_purge_file_meta, true, "Reset node-side file metadata/archive tracking");
+DEFINE_string(optical_disc_dir,
+              "",
+              "Directory containing disc_batch_*.bin files; empty uses <run_dir>/data/optical_discs/inventory");
+DEFINE_string(optical_disc_delta_path,
+              "",
+              "Optical disc catalog delta log; empty uses <run_dir>/data/optical_discs/catalog_delta.tsv");
 
 namespace {
 
@@ -210,19 +195,6 @@ std::string TrimCopy(std::string value) {
         return !std::isspace(ch);
     }).base(), value.end());
     return value;
-}
-
-std::string ShellQuote(const std::string& value) {
-    std::string quoted = "'";
-    for (char ch : value) {
-        if (ch == '\'') {
-            quoted += "'\\''";
-        } else {
-            quoted.push_back(ch);
-        }
-    }
-    quoted.push_back('\'');
-    return quoted;
 }
 
 struct LocalMasstreeNamespaceManifest {
@@ -379,8 +351,8 @@ std::string FormatBytes(uint64_t bytes) {
     const char* units[] = {"B", "KB", "MB", "GB", "TB", "PB", "EB"};
     double value = static_cast<double>(bytes);
     size_t unit = 0;
-    while (value >= 1024.0 && unit + 1 < sizeof(units) / sizeof(units[0])) {
-        value /= 1024.0;
+    while (value >= 1000.0 && unit + 1 < sizeof(units) / sizeof(units[0])) {
+        value /= 1000.0;
         ++unit;
     }
     std::ostringstream oss;
@@ -473,8 +445,8 @@ std::string FormatDecimalBytesWithHuman(const std::string& bytes) {
     }
     const char* units[] = {"B", "KB", "MB", "GB", "TB", "PB", "EB"};
     size_t unit = 0;
-    while (value >= 1024.0L && unit + 1 < sizeof(units) / sizeof(units[0])) {
-        value /= 1024.0L;
+    while (value >= 1000.0L && unit + 1 < sizeof(units) / sizeof(units[0])) {
+        value /= 1000.0L;
         ++unit;
     }
     std::ostringstream human;
@@ -486,67 +458,6 @@ std::string FormatDecimalBytesWithHuman(const std::string& bytes) {
     return normalized + " (" + human.str() + ")";
 }
 
-constexpr uint64_t kDemoFileSizeScaleNumerator = 13ULL;
-constexpr uint64_t kDemoFileSizeScaleDenominator = 10ULL;
-
-std::string MultiplyDecimalStringByU64(const std::string& decimal, uint64_t multiplier) {
-    if (multiplier == 0) {
-        return "0";
-    }
-    const std::string normalized = zb::mds::NormalizeDecimalString(decimal);
-    std::string out;
-    out.reserve(normalized.size() + 3U);
-    uint64_t carry = 0;
-    for (auto it = normalized.rbegin(); it != normalized.rend(); ++it) {
-        const uint64_t digit = static_cast<uint64_t>(*it - '0');
-        const uint64_t product = digit * multiplier + carry;
-        out.push_back(static_cast<char>('0' + (product % 10ULL)));
-        carry = product / 10ULL;
-    }
-    while (carry != 0) {
-        out.push_back(static_cast<char>('0' + (carry % 10ULL)));
-        carry /= 10ULL;
-    }
-    std::reverse(out.begin(), out.end());
-    return zb::mds::NormalizeDecimalString(std::move(out));
-}
-
-std::string DivideDecimalStringByU64ToString(const std::string& decimal, uint64_t divisor) {
-    if (divisor == 0) {
-        return "0";
-    }
-    const std::string normalized = zb::mds::NormalizeDecimalString(decimal);
-    std::string out;
-    out.reserve(normalized.size());
-    uint64_t remainder = 0;
-    bool started = false;
-    for (char ch : normalized) {
-        if (ch < '0' || ch > '9') {
-            continue;
-        }
-        const uint64_t current = remainder * 10ULL + static_cast<uint64_t>(ch - '0');
-        const uint64_t digit = current / divisor;
-        remainder = current % divisor;
-        if (digit != 0 || started) {
-            out.push_back(static_cast<char>('0' + digit));
-            started = true;
-        }
-    }
-    return out.empty() ? std::string("0") : zb::mds::NormalizeDecimalString(std::move(out));
-}
-
-std::string ScaleDemoFileSizeDecimal(const std::string& bytes) {
-    return DivideDecimalStringByU64ToString(MultiplyDecimalStringByU64(bytes, kDemoFileSizeScaleNumerator),
-                                            kDemoFileSizeScaleDenominator);
-}
-
-uint64_t ScaleDemoFileSize(uint64_t bytes) {
-    if (bytes > std::numeric_limits<uint64_t>::max() / kDemoFileSizeScaleNumerator) {
-        return std::numeric_limits<uint64_t>::max();
-    }
-    return (bytes * kDemoFileSizeScaleNumerator) / kDemoFileSizeScaleDenominator;
-}
-
 struct TierStats {
     uint64_t physical_node_count{0};
     uint64_t logical_node_count{0};
@@ -556,35 +467,16 @@ struct TierStats {
     uint64_t free_capacity_bytes{0};
 };
 
-struct SimulatedMasstreeImportRecord {
-    std::string namespace_id;
-    std::string generation_id;
-    std::string path_prefix;
-    uint64_t file_count{0};
-    uint64_t inode_count{0};
-    uint64_t dentry_count{0};
-    std::string total_file_bytes{"0"};
-    std::string total_metadata_bytes{"0"};
-    uint64_t avg_file_size_bytes{0};
-    uint64_t min_file_size_bytes{0};
-    uint64_t max_file_size_bytes{0};
-};
-
-struct SimulatedMasstreeOverlayStats {
-    uint64_t namespace_count{0};
-    uint64_t total_file_count{0};
-    uint64_t total_inode_count{0};
-    uint64_t total_dentry_count{0};
-    std::string total_file_bytes{"0"};
-    std::string total_metadata_bytes{"0"};
-    uint64_t avg_file_size_bytes{0};
-    uint64_t min_file_size_bytes{0};
-    uint64_t max_file_size_bytes{0};
-};
-
 struct TierIoDiagnostics {
     TierStats real_stats;
     TierStats virtual_stats;
+};
+
+struct MasstreeTemplateCandidate {
+    std::string template_id;
+    uint64_t target_file_count{0};
+    uint64_t file_count{0};
+    fs::file_time_type manifest_mtime{};
 };
 
 struct CheckResult {
@@ -646,8 +538,33 @@ void PrintDecimalMetric(const std::string& key, const std::string& value) {
     std::cout << key << "=" << FormatDecimalBytesWithHuman(value) << '\n';
 }
 
-void PrintDemoFileSizeDecimalMetric(const std::string& key, const std::string& value) {
-    PrintDecimalMetric(key, ScaleDemoFileSizeDecimal(value));
+std::string ApplyCapacityAdjustment(const std::string& base,
+                                    const zb::storagenode::DiscCapacityAdjustment& adjustment) {
+    if (adjustment.capacity_delta_abs_bytes == "0") {
+        return zb::mds::NormalizeDecimalString(base);
+    }
+    if (adjustment.capacity_delta_negative) {
+        return zb::mds::SubtractDecimalStrings(base, adjustment.capacity_delta_abs_bytes);
+    }
+    return zb::mds::AddDecimalStrings(base, adjustment.capacity_delta_abs_bytes);
+}
+
+std::string SignedCapacityAdjustmentString(const zb::storagenode::DiscCapacityAdjustment& adjustment) {
+    if (adjustment.capacity_delta_abs_bytes == "0") {
+        return "0";
+    }
+    return std::string(adjustment.capacity_delta_negative ? "-" : "") + adjustment.capacity_delta_abs_bytes;
+}
+
+uint64_t ApplyDiscCountAdjustment(uint64_t base, int64_t delta) {
+    if (delta >= 0) {
+        const uint64_t positive = static_cast<uint64_t>(delta);
+        return base > std::numeric_limits<uint64_t>::max() - positive
+                   ? std::numeric_limits<uint64_t>::max()
+                   : base + positive;
+    }
+    const uint64_t negative = static_cast<uint64_t>(-(delta + 1)) + 1ULL;
+    return base > negative ? base - negative : 0;
 }
 
 void PrintBoolMetric(const std::string& key, bool value) {
@@ -665,17 +582,7 @@ std::string PromptLine(const std::string& label) {
     return input;
 }
 
-std::vector<std::string> SplitTabLine(const std::string& line) {
-    std::vector<std::string> fields;
-    std::stringstream ss(line);
-    std::string field;
-    while (std::getline(ss, field, '\t')) {
-        fields.push_back(field);
-    }
-    return fields;
-}
-
-bool ParseUint64Field(const std::string& value, uint64_t* out) {
+bool ParseManifestUint64(const std::string& value, uint64_t* out) {
     if (!out) {
         return false;
     }
@@ -692,178 +599,205 @@ bool ParseUint64Field(const std::string& value, uint64_t* out) {
     }
 }
 
-std::string SimulatedMasstreeStatePath() {
-    if (!FLAGS_masstree_sim_state_path.empty()) {
-        return FLAGS_masstree_sim_state_path;
-    }
+fs::path ResolveDemoRunRoot() {
     fs::path root = fs::path(FLAGS_mount_point).parent_path();
     if (root.empty()) {
         root = fs::current_path();
     }
-    return (root / "data" / "mds" / "masstree_sim_overlay.tsv").string();
+    return root;
 }
 
-bool LoadSimulatedMasstreeRecords(std::map<std::string, SimulatedMasstreeImportRecord>* records,
-                                  std::string* error) {
-    if (!records) {
+bool ParseSequencedNamespaceId(const std::string& namespace_id,
+                               const std::string& prefix,
+                               uint64_t* sequence) {
+    if (!sequence) {
+        return false;
+    }
+    const std::string marker = prefix + "-";
+    if (namespace_id.rfind(marker, 0) != 0) {
+        return false;
+    }
+    const std::string suffix = namespace_id.substr(marker.size());
+    if (suffix.empty()) {
+        return false;
+    }
+    uint64_t parsed = 0;
+    for (char ch : suffix) {
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+        const uint64_t digit = static_cast<uint64_t>(ch - '0');
+        if (parsed > (std::numeric_limits<uint64_t>::max() - digit) / 10ULL) {
+            return false;
+        }
+        parsed = parsed * 10ULL + digit;
+    }
+    *sequence = parsed;
+    return true;
+}
+
+std::string FormatSequencedNamespaceId(const std::string& prefix, uint64_t sequence) {
+    std::ostringstream out;
+    out << prefix << "-" << std::setw(6) << std::setfill('0') << sequence;
+    return out.str();
+}
+
+std::string ResolveNextMasstreeNamespaceId(const std::string& prefix) {
+    const std::string effective_prefix = prefix.empty() ? std::string("demo-ns") : prefix;
+    const fs::path namespaces_root = ResolveDemoRunRoot() / "data" / "mds" / "masstree_meta" / "namespaces";
+    uint64_t max_sequence = 0;
+
+    std::error_code ec;
+    if (fs::exists(namespaces_root, ec) && fs::is_directory(namespaces_root, ec)) {
+        for (const auto& entry : fs::directory_iterator(namespaces_root, ec)) {
+            if (ec) {
+                break;
+            }
+            std::error_code entry_ec;
+            if (!entry.is_directory(entry_ec)) {
+                continue;
+            }
+            uint64_t sequence = 0;
+            if (ParseSequencedNamespaceId(entry.path().filename().string(), effective_prefix, &sequence)) {
+                max_sequence = std::max<uint64_t>(max_sequence, sequence);
+            }
+        }
+    }
+
+    return FormatSequencedNamespaceId(effective_prefix, max_sequence + 1);
+}
+
+bool LoadMasstreeTemplateCandidate(const fs::path& manifest_path,
+                                   MasstreeTemplateCandidate* candidate) {
+    if (!candidate) {
+        return false;
+    }
+    std::ifstream input(manifest_path);
+    if (!input.is_open()) {
+        return false;
+    }
+
+    MasstreeTemplateCandidate parsed;
+    parsed.template_id = manifest_path.parent_path().parent_path().filename().string();
+    std::string line;
+    while (std::getline(input, line)) {
+        const std::string trimmed = TrimCopy(line);
+        if (trimmed.empty() || trimmed[0] == '#') {
+            continue;
+        }
+        const size_t eq = trimmed.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        const std::string key = trimmed.substr(0, eq);
+        const std::string value = trimmed.substr(eq + 1);
+        if (key == "namespace_id" && !value.empty()) {
+            parsed.template_id = value;
+        } else if (key == "target_file_count") {
+            ParseManifestUint64(value, &parsed.target_file_count);
+        } else if (key == "file_count") {
+            ParseManifestUint64(value, &parsed.file_count);
+        }
+    }
+
+    std::error_code ec;
+    parsed.manifest_mtime = fs::last_write_time(manifest_path, ec);
+    if (ec) {
+        parsed.manifest_mtime = fs::file_time_type::min();
+    }
+    if (parsed.template_id.empty()) {
+        return false;
+    }
+    *candidate = std::move(parsed);
+    return true;
+}
+
+bool ResolveDefaultMasstreeTemplateId(std::string* template_id, std::string* error) {
+    if (!template_id) {
         if (error) {
-            *error = "simulated masstree records output is null";
+            *error = "template_id output is null";
         }
         return false;
     }
-    records->clear();
-    const std::string state_path = SimulatedMasstreeStatePath();
-    std::error_code ec;
-    if (!fs::exists(state_path, ec)) {
+    if (!FLAGS_masstree_template_id.empty()) {
+        *template_id = FLAGS_masstree_template_id;
         if (error) {
             error->clear();
         }
         return true;
     }
 
-    std::ifstream input(state_path);
-    if (!input.is_open()) {
+    const fs::path templates_root = ResolveDemoRunRoot() / "data" / "mds" / "masstree_meta" / "templates";
+    std::error_code ec;
+    if (!fs::exists(templates_root, ec) || !fs::is_directory(templates_root, ec)) {
         if (error) {
-            *error = "failed to open simulated masstree state: " + state_path;
+            *error = "missing Masstree template directory: " + templates_root.string();
         }
         return false;
     }
 
-    std::string line;
-    uint64_t line_no = 0;
-    while (std::getline(input, line)) {
-        ++line_no;
-        if (line.empty() || line[0] == '#') {
+    std::vector<MasstreeTemplateCandidate> candidates;
+    for (const auto& entry : fs::directory_iterator(templates_root, ec)) {
+        if (ec) {
+            break;
+        }
+        std::error_code entry_ec;
+        if (!entry.is_directory(entry_ec)) {
             continue;
         }
-        const auto fields = SplitTabLine(line);
-        if (fields.size() != 10U) {
-            if (error) {
-                *error = "invalid simulated masstree state line " + std::to_string(line_no);
-            }
-            return false;
+        const fs::path manifest_path = entry.path() / "template.staging" / "manifest.txt";
+        std::error_code manifest_ec;
+        if (!fs::exists(manifest_path, manifest_ec)) {
+            continue;
         }
-        SimulatedMasstreeImportRecord record;
-        record.namespace_id = fields[0];
-        record.generation_id = fields[1];
-        record.path_prefix = fields[2];
-        record.total_file_bytes = zb::mds::NormalizeDecimalString(fields[6]);
-        record.total_metadata_bytes = zb::mds::NormalizeDecimalString(fields[7]);
-        if (record.namespace_id.empty() || !ParseUint64Field(fields[3], &record.file_count) ||
-            !ParseUint64Field(fields[4], &record.inode_count) ||
-            !ParseUint64Field(fields[5], &record.dentry_count) ||
-            !ParseUint64Field(fields[8], &record.avg_file_size_bytes) ||
-            !ParseUint64Field(fields[9], &record.max_file_size_bytes)) {
-            if (error) {
-                *error = "invalid simulated masstree state payload at line " + std::to_string(line_no);
-            }
-            return false;
+        MasstreeTemplateCandidate candidate;
+        if (LoadMasstreeTemplateCandidate(manifest_path, &candidate)) {
+            candidates.push_back(std::move(candidate));
         }
-        record.min_file_size_bytes = FLAGS_masstree_sim_min_file_size_bytes;
-        (*records)[record.namespace_id] = std::move(record);
     }
-    if (error) {
-        error->clear();
-    }
-    return true;
-}
-
-bool SaveSimulatedMasstreeRecords(const std::map<std::string, SimulatedMasstreeImportRecord>& records,
-                                  std::string* error) {
-    const fs::path state_path(SimulatedMasstreeStatePath());
-    std::error_code ec;
-    fs::create_directories(state_path.parent_path(), ec);
     if (ec) {
         if (error) {
-            *error = "failed to create simulated masstree state directory: " + ec.message();
+            *error = "failed to scan Masstree template directory: " + ec.message();
+        }
+        return false;
+    }
+    if (candidates.empty()) {
+        if (error) {
+            *error = "no Masstree templates found under " + templates_root.string();
         }
         return false;
     }
 
-    const fs::path tmp_path(state_path.string() + ".tmp");
-    {
-        std::ofstream out(tmp_path, std::ios::out | std::ios::trunc);
-        if (!out.is_open()) {
-            if (error) {
-                *error = "failed to write simulated masstree state: " + tmp_path.string();
-            }
-            return false;
+    constexpr uint64_t kOneHundredMillionFiles = 100000000ULL;
+    auto candidate_score = [](const MasstreeTemplateCandidate& candidate) {
+        return std::max<uint64_t>(candidate.target_file_count, candidate.file_count);
+    };
+    auto less_preferred = [&](const MasstreeTemplateCandidate& lhs, const MasstreeTemplateCandidate& rhs) {
+        const uint64_t lhs_score = candidate_score(lhs);
+        const uint64_t rhs_score = candidate_score(rhs);
+        const bool lhs_eligible = lhs_score >= kOneHundredMillionFiles;
+        const bool rhs_eligible = rhs_score >= kOneHundredMillionFiles;
+        if (lhs_eligible != rhs_eligible) {
+            return !lhs_eligible && rhs_eligible;
         }
-        out << "# namespace_id\tgeneration_id\tpath_prefix\tfile_count\tinode_count\tdentry_count"
-               "\ttotal_file_bytes\ttotal_metadata_bytes\tavg_file_size_bytes\tmax_file_size_bytes\n";
-        for (const auto& item : records) {
-            const auto& record = item.second;
-            out << record.namespace_id << '\t'
-                << record.generation_id << '\t'
-                << record.path_prefix << '\t'
-                << record.file_count << '\t'
-                << record.inode_count << '\t'
-                << record.dentry_count << '\t'
-                << zb::mds::NormalizeDecimalString(record.total_file_bytes) << '\t'
-                << zb::mds::NormalizeDecimalString(record.total_metadata_bytes) << '\t'
-                << record.avg_file_size_bytes << '\t'
-                << record.max_file_size_bytes << '\n';
+        if (lhs_score != rhs_score) {
+            return lhs_score < rhs_score;
         }
-    }
-    fs::remove(state_path, ec);
-    ec.clear();
-    fs::rename(tmp_path, state_path, ec);
-    if (ec) {
+        return lhs.manifest_mtime < rhs.manifest_mtime;
+    };
+
+    const auto selected = std::max_element(candidates.begin(), candidates.end(), less_preferred);
+    if (selected == candidates.end()) {
         if (error) {
-            *error = "failed to install simulated masstree state: " + ec.message();
+            *error = "failed to select a Masstree template";
         }
         return false;
     }
+    *template_id = selected->template_id;
     if (error) {
         error->clear();
     }
     return true;
-}
-
-SimulatedMasstreeOverlayStats AggregateSimulatedMasstreeRecords(
-    const std::map<std::string, SimulatedMasstreeImportRecord>& records) {
-    SimulatedMasstreeOverlayStats stats;
-    stats.namespace_count = records.size();
-    for (const auto& item : records) {
-        const auto& record = item.second;
-        stats.total_file_count += record.file_count;
-        stats.total_inode_count += record.inode_count;
-        stats.total_dentry_count += record.dentry_count;
-        stats.total_file_bytes = zb::mds::AddDecimalStrings(stats.total_file_bytes, record.total_file_bytes);
-        stats.total_metadata_bytes = zb::mds::AddDecimalStrings(stats.total_metadata_bytes,
-                                                                record.total_metadata_bytes);
-        if (record.min_file_size_bytes != 0 &&
-            (stats.min_file_size_bytes == 0 || record.min_file_size_bytes < stats.min_file_size_bytes)) {
-            stats.min_file_size_bytes = record.min_file_size_bytes;
-        }
-        stats.max_file_size_bytes = std::max<uint64_t>(stats.max_file_size_bytes, record.max_file_size_bytes);
-    }
-    if (stats.total_file_count != 0) {
-        try {
-            stats.avg_file_size_bytes = static_cast<uint64_t>(
-                std::stoull(DivideDecimalStringByU64ToString(stats.total_file_bytes, stats.total_file_count)));
-        } catch (...) {
-            stats.avg_file_size_bytes = FLAGS_masstree_sim_avg_file_size_bytes;
-        }
-    }
-    return stats;
-}
-
-std::string MakeUniqueSimulatedMasstreeNamespaceId(
-    const std::string& namespace_prefix,
-    const std::map<std::string, SimulatedMasstreeImportRecord>& records) {
-    const std::string base = namespace_prefix.empty() ? std::string("demo-ns") : namespace_prefix;
-    const std::string timestamp = TimestampToken();
-    std::string candidate = base + "-" + timestamp;
-    if (records.find(candidate) == records.end()) {
-        return candidate;
-    }
-    for (uint64_t sequence = 1;; ++sequence) {
-        candidate = base + "-" + timestamp + "-" + std::to_string(sequence);
-        if (records.find(candidate) == records.end()) {
-            return candidate;
-        }
-    }
 }
 
 std::string JoinStrings(const std::vector<std::string>& values, const std::string& separator) {
@@ -1338,13 +1272,6 @@ std::string FormatSignedDecimalDelta(const std::string& after, const std::string
     return "-" + zb::mds::SubtractDecimalStrings(before, after);
 }
 
-std::string ScaleSignedDemoFileSizeDecimal(const std::string& value) {
-    if (!value.empty() && value.front() == '-') {
-        return "-" + ScaleDemoFileSizeDecimal(value.substr(1));
-    }
-    return ScaleDemoFileSizeDecimal(value);
-}
-
 std::string FormatSignedUint64Delta(uint64_t after, uint64_t before) {
     if (after >= before) {
         return std::to_string(after - before);
@@ -1752,6 +1679,34 @@ private:
         return true;
     }
 
+    bool LoadOpticalCapacityAdjustment(zb::storagenode::DiscCapacityAdjustment* adjustment,
+                                       std::string* error) const {
+        if (!adjustment) {
+            if (error) {
+                *error = "capacity adjustment output is null";
+            }
+            return false;
+        }
+        const std::string disc_dir =
+            FLAGS_optical_disc_dir.empty()
+                ? (fs::path(ResolveRunDirFromMountPoint(FLAGS_mount_point)) / "data" / "optical_discs" /
+                   "inventory")
+                      .string()
+                : FLAGS_optical_disc_dir;
+        const std::string delta_path =
+            FLAGS_optical_disc_delta_path.empty()
+                ? (fs::path(ResolveRunDirFromMountPoint(FLAGS_mount_point)) / "data" / "optical_discs" /
+                   "catalog_delta.tsv")
+                      .string()
+                : FLAGS_optical_disc_delta_path;
+        zb::storagenode::OpticalDiscCatalog catalog(disc_dir, delta_path);
+        zb::storagenode::CatalogLoadResult load_result;
+        if (!catalog.Load(&load_result, error)) {
+            return false;
+        }
+        return catalog.ComputeCapacityAdjustment(adjustment, error);
+    }
+
     bool RunHealthCheck() {
         PrintSection("\u73af\u5883\u5065\u5eb7\u68c0\u67e5");
         zb::rpc::InodeAttr attr;
@@ -1799,42 +1754,28 @@ private:
             std::cerr << "GetMasstreeClusterStats failed: " << masstree_stats.status().message() << '\n';
             return false;
         }
-        std::map<std::string, SimulatedMasstreeImportRecord> simulated_records;
-        std::string simulated_error;
-        if (!LoadSimulatedMasstreeRecords(&simulated_records, &simulated_error)) {
-            std::cerr << "Load simulated Masstree overlay failed: " << simulated_error << '\n';
+        zb::storagenode::DiscCapacityAdjustment capacity_adjustment;
+        std::string capacity_adjustment_error;
+        if (!LoadOpticalCapacityAdjustment(&capacity_adjustment, &capacity_adjustment_error)) {
+            std::cerr << "\u8bfb\u53d6\u5149\u76d8\u5e93\u5bb9\u91cf\u8c03\u6574\u5931\u8d25: "
+                      << capacity_adjustment_error << '\n';
             return false;
         }
-        const SimulatedMasstreeOverlayStats simulated_stats =
-            AggregateSimulatedMasstreeRecords(simulated_records);
-        const uint64_t display_total_file_count =
-            masstree_stats.total_file_count() + simulated_stats.total_file_count;
-        const std::string display_total_file_bytes =
-            zb::mds::AddDecimalStrings(masstree_stats.total_file_bytes(), simulated_stats.total_file_bytes);
-        const std::string display_total_metadata_bytes =
-            zb::mds::AddDecimalStrings(masstree_stats.total_metadata_bytes(),
-                                       simulated_stats.total_metadata_bytes);
-        const std::string display_used_capacity =
-            zb::mds::AddDecimalStrings(masstree_stats.used_capacity_bytes(), simulated_stats.total_file_bytes);
-        uint64_t display_avg_file_size = masstree_stats.avg_file_size_bytes();
-        if (display_total_file_count != 0) {
-            try {
-                display_avg_file_size = static_cast<uint64_t>(
-                    std::stoull(DivideDecimalStringByU64ToString(display_total_file_bytes,
-                                                                 display_total_file_count)));
-            } catch (...) {
-                display_avg_file_size = simulated_stats.avg_file_size_bytes != 0
-                                            ? simulated_stats.avg_file_size_bytes
-                                            : masstree_stats.avg_file_size_bytes();
-            }
-        }
-        uint64_t display_min_file_size = masstree_stats.min_file_size_bytes();
-        if (simulated_stats.min_file_size_bytes != 0 &&
-            (display_min_file_size == 0 || simulated_stats.min_file_size_bytes < display_min_file_size)) {
-            display_min_file_size = simulated_stats.min_file_size_bytes;
-        }
-        const uint64_t display_max_file_size =
-            std::max<uint64_t>(masstree_stats.max_file_size_bytes(), simulated_stats.max_file_size_bytes);
+        const uint64_t adjusted_optical_device_count =
+            ApplyDiscCountAdjustment(masstree_stats.optical_device_count(),
+                                     capacity_adjustment.disc_delta_count);
+        const uint64_t adjusted_total_disc_count =
+            ApplyDiscCountAdjustment(masstree_stats.total_disc_count(),
+                                     capacity_adjustment.disc_delta_count);
+        const uint64_t adjusted_unused_disc_count =
+            adjusted_total_disc_count > masstree_stats.used_disc_count()
+                ? adjusted_total_disc_count - masstree_stats.used_disc_count()
+                : 0;
+        const std::string adjusted_total_capacity_bytes =
+            ApplyCapacityAdjustment(masstree_stats.total_capacity_bytes(), capacity_adjustment);
+        const std::string adjusted_free_capacity_bytes =
+            zb::mds::SubtractDecimalStrings(adjusted_total_capacity_bytes,
+                                            masstree_stats.used_capacity_bytes());
 
         const uint64_t online_logical_node_count = real_stats.logical_node_count + virtual_stats.logical_node_count;
         std::cout << "real_physical_nodes=" << real_stats.physical_node_count << '\n';
@@ -1852,29 +1793,29 @@ private:
 
         std::cout << "online_logical_nodes=" << online_logical_node_count << '\n';
         std::cout << "optical_nodes=" << masstree_stats.optical_node_count() << '\n';
-        std::cout << "optical_devices=" << masstree_stats.optical_device_count() << '\n';
-        std::cout << "simulated_masstree_namespaces=" << simulated_stats.namespace_count << '\n';
-        std::cout << "simulated_masstree_state_path=" << SimulatedMasstreeStatePath() << '\n';
-        const std::string demo_cold_used_capacity = ScaleDemoFileSizeDecimal(display_used_capacity);
-        const std::string demo_cold_free_capacity =
-            zb::mds::SubtractDecimalStrings(masstree_stats.total_capacity_bytes(), demo_cold_used_capacity);
-        const std::string demo_total_file_bytes = ScaleDemoFileSizeDecimal(display_total_file_bytes);
-        const std::string demo_total_metadata_bytes = display_total_metadata_bytes;
-        const uint64_t demo_avg_file_size = ScaleDemoFileSize(display_avg_file_size);
-        const uint64_t demo_min_file_size = ScaleDemoFileSize(display_min_file_size);
-        const uint64_t demo_max_file_size = ScaleDemoFileSize(display_max_file_size);
-        PrintDecimalMetric("cold_total_capacity_bytes", masstree_stats.total_capacity_bytes());
-        PrintDecimalMetric("cold_used_capacity_bytes", demo_cold_used_capacity);
-        PrintDecimalMetric("cold_free_capacity_bytes", demo_cold_free_capacity);
-        std::cout << "total_file_count=" << display_total_file_count << '\n';
-        PrintDecimalMetric("total_file_bytes", demo_total_file_bytes);
-        std::cout << "avg_file_size_bytes=" << demo_avg_file_size
-                  << " (" << FormatBytes(demo_avg_file_size) << ")\n";
-        PrintDecimalMetric("total_metadata_bytes", demo_total_metadata_bytes);
-        std::cout << "min_file_size_bytes=" << demo_min_file_size
-                  << " (" << FormatBytes(demo_min_file_size) << ")\n";
-        std::cout << "max_file_size_bytes=" << demo_max_file_size
-                  << " (" << FormatBytes(demo_max_file_size) << ")\n";
+        std::cout << "optical_devices=" << adjusted_optical_device_count << '\n';
+        PrintDecimalMetric("cold_total_capacity_bytes", adjusted_total_capacity_bytes);
+        PrintDecimalMetric("cold_used_capacity_bytes", masstree_stats.used_capacity_bytes());
+        PrintDecimalMetric("cold_free_capacity_bytes", adjusted_free_capacity_bytes);
+        std::cout << "optical_inventory_disc_delta_count="
+                  << capacity_adjustment.disc_delta_count << '\n';
+        std::cout << "optical_inventory_capacity_delta_bytes="
+                  << SignedCapacityAdjustmentString(capacity_adjustment) << '\n';
+        std::cout << "optical_layout_version=" << masstree_stats.optical_layout_version() << '\n';
+        std::cout << "total_disc_count=" << adjusted_total_disc_count << '\n';
+        std::cout << "used_disc_count=" << masstree_stats.used_disc_count() << '\n';
+        std::cout << "unused_disc_count=" << adjusted_unused_disc_count << '\n';
+        std::cout << "sealed_legacy_disc_count=" << masstree_stats.sealed_legacy_disc_count() << '\n';
+        std::cout << "uniform_v2_used_disc_count=" << masstree_stats.uniform_v2_used_disc_count() << '\n';
+        std::cout << "total_file_count=" << masstree_stats.total_file_count() << '\n';
+        PrintDecimalMetric("allocated_file_bytes", masstree_stats.allocated_file_bytes());
+        std::cout << "avg_file_size_bytes=" << masstree_stats.avg_file_size_bytes()
+                  << " (" << FormatBytes(masstree_stats.avg_file_size_bytes()) << ")\n";
+        PrintDecimalMetric("total_metadata_bytes", masstree_stats.total_metadata_bytes());
+        std::cout << "min_file_size_bytes=" << masstree_stats.min_file_size_bytes()
+                  << " (" << FormatBytes(masstree_stats.min_file_size_bytes()) << ")\n";
+        std::cout << "max_file_size_bytes=" << masstree_stats.max_file_size_bytes()
+                  << " (" << FormatBytes(masstree_stats.max_file_size_bytes()) << ")\n";
         return true;
     }
 
@@ -1980,82 +1921,437 @@ private:
                RunMasstreeImportDemo() && RunMasstreeQueryDemo();
     }
 
-    bool ExtractScriptInvocation(const zb::demo::ParsedCommand& command,
-                                 std::string* script_path,
-                                 std::vector<std::string>* script_args,
-                                 std::string* error) const {
-        if (!script_path || !script_args) {
-            if (error) {
-                *error = "script invocation output is null";
-            }
+    static std::string OpticalDeltaPath() {
+        if (!FLAGS_optical_disc_delta_path.empty()) {
+            return FLAGS_optical_disc_delta_path;
+        }
+        return (fs::path(ResolveRunDirFromMountPoint(FLAGS_mount_point)) / "data" / "optical_discs" /
+                "catalog_delta.tsv")
+            .string();
+    }
+
+    static std::string OpticalDiscInventoryDir() {
+        if (!FLAGS_optical_disc_dir.empty()) {
+            return FLAGS_optical_disc_dir;
+        }
+        return (fs::path(ResolveRunDirFromMountPoint(FLAGS_mount_point)) / "data" / "optical_discs" /
+                "inventory")
+            .string();
+    }
+
+    static const char* OpticalDiscStatusDisplayName(zb::storagenode::DiscStatus status) {
+        switch (status) {
+            case zb::storagenode::DiscStatus::Blank:
+                return "\u7a7a\u767d";
+            case zb::storagenode::DiscStatus::InUse:
+                return "\u4f7f\u7528\u4e2d";
+            case zb::storagenode::DiscStatus::Recycled:
+                return "\u5df2\u56de\u6536";
+            case zb::storagenode::DiscStatus::Finalized:
+                return "\u5df2\u5c01\u5b58";
+            case zb::storagenode::DiscStatus::Lost:
+                return "\u4e22\u5931";
+        }
+        return "\u672a\u77e5";
+    }
+
+    static void PrintOpticalDisc(const zb::storagenode::OpticalDiscBin& disc) {
+        std::cout << "\u5149\u76d8ID="
+                  << zb::storagenode::FixedString(disc.device_id, sizeof(disc.device_id))
+                  << " \u5149\u76d8\u5e93ID="
+                  << zb::storagenode::FixedString(disc.library_id, sizeof(disc.library_id))
+                  << " \u5bb9\u91cf\u5b57\u8282=" << disc.capacity
+                  << " \u5bb9\u91cfTB=" << std::fixed << std::setprecision(2)
+                  << zb::storagenode::BytesToTB(disc.capacity)
+                  << " \u72b6\u6001=" << OpticalDiscStatusDisplayName(disc.status)
+                  << " \u5199\u5165\u901f\u5ea6MB\u6bcf\u79d2=" << disc.write_throughput_MBps
+                  << " \u8bfb\u53d6\u901f\u5ea6MB\u6bcf\u79d2=" << disc.read_throughput_MBps << '\n';
+    }
+
+    static void PrintOpticalDiscUsage(const zb::storagenode::DiscUsageView& usage) {
+        const auto& disc = usage.disc;
+        std::cout << "\u5149\u76d8\u5e93ID="
+                  << zb::storagenode::FixedString(disc.library_id, sizeof(disc.library_id))
+                  << " \u5149\u76d8ID="
+                  << zb::storagenode::FixedString(disc.device_id, sizeof(disc.device_id))
+                  << " \u5149\u76d8\u603b\u5bb9\u91cf\u5b57\u8282=" << usage.total_bytes
+                  << " (" << FormatBytes(usage.total_bytes) << ")"
+                  << " \u5149\u76d8\u5df2\u4f7f\u7528\u5b57\u8282=" << usage.used_bytes
+                  << " (" << FormatBytes(usage.used_bytes) << ")"
+                  << " \u5149\u76d8\u5269\u4f59\u5b57\u8282=" << usage.free_bytes
+                  << " (" << FormatBytes(usage.free_bytes) << ")"
+                  << " \u72b6\u6001=" << OpticalDiscStatusDisplayName(disc.status)
+                  << " \u5199\u5165\u901f\u5ea6MB\u6bcf\u79d2=" << disc.write_throughput_MBps
+                  << " \u8bfb\u53d6\u901f\u5ea6MB\u6bcf\u79d2=" << disc.read_throughput_MBps << '\n';
+    }
+
+    static void PrintOpticalLibraryUsage(const zb::storagenode::LibraryUsageView& usage) {
+        std::cout << "\u5149\u76d8\u5e93ID=" << usage.library_id
+                  << " \u5149\u76d8\u6570\u91cf=" << usage.disc_count
+                  << " \u5149\u76d8\u5e93\u603b\u5bb9\u91cf\u5b57\u8282="
+                  << FormatDecimalBytesWithHuman(usage.total_bytes)
+                  << " \u5149\u76d8\u5e93\u5df2\u4f7f\u7528\u5b57\u8282="
+                  << FormatDecimalBytesWithHuman(usage.used_bytes)
+                  << " \u5149\u76d8\u5e93\u5269\u4f59\u5b57\u8282="
+                  << FormatDecimalBytesWithHuman(usage.free_bytes)
+                  << " \u7a7a\u767d=" << usage.status_counts[0]
+                  << " \u4f7f\u7528\u4e2d=" << usage.status_counts[1]
+                  << " \u5df2\u56de\u6536=" << usage.status_counts[2]
+                  << " \u5df2\u5c01\u5b58=" << usage.status_counts[3]
+                  << " \u4e22\u5931=" << usage.status_counts[4] << '\n';
+    }
+
+    static void PrintOpticalStatistics(const zb::storagenode::DiscStatistics& statistics,
+                                       const std::string& scope_label,
+                                       const std::string& library_id = std::string()) {
+        const double average_write =
+            statistics.disc_count == 0
+                ? 0
+                : static_cast<double>(statistics.total_write_throughput_MBps / statistics.disc_count);
+        const double average_read =
+            statistics.disc_count == 0
+                ? 0
+                : static_cast<double>(statistics.total_read_throughput_MBps / statistics.disc_count);
+        std::cout << "\u7edf\u8ba1\u8303\u56f4=" << scope_label;
+        if (!library_id.empty()) {
+            std::cout << " \u5149\u76d8\u5e93ID=" << library_id;
+        }
+        std::cout << " \u5149\u76d8\u6570\u91cf=" << statistics.disc_count
+                  << " \u5bb9\u91cfTB=" << std::fixed << std::setprecision(2)
+                  << zb::storagenode::BytesToTB(statistics.capacity_bytes)
+                  << " \u7a7a\u767d=" << statistics.status_counts[0]
+                  << " \u4f7f\u7528\u4e2d=" << statistics.status_counts[1]
+                  << " \u5df2\u56de\u6536=" << statistics.status_counts[2]
+                  << " \u5df2\u5c01\u5b58=" << statistics.status_counts[3]
+                  << " \u4e22\u5931=" << statistics.status_counts[4]
+                  << " \u5e73\u5747\u5199\u5165\u901f\u5ea6MB\u6bcf\u79d2=" << average_write
+                  << " \u5e73\u5747\u8bfb\u53d6\u901f\u5ea6MB\u6bcf\u79d2=" << average_read << '\n';
+    }
+
+    bool PrintMetadataOpticalDiscUsage() {
+        zb::rpc::GetMasstreeClusterStatsReply stats;
+        if (!mds_.GetMasstreeClusterStats(&stats)) {
+            std::cerr << "GetMasstreeClusterStats failed: " << stats.status().message() << '\n';
             return false;
         }
-        script_path->clear();
-        script_args->clear();
-
-        bool found_script = false;
-        const std::vector<std::string>& tokens = command.tokens;
-        for (size_t i = 1; i < tokens.size(); ++i) {
-            const std::string& token = tokens[i];
-            if (!found_script) {
-                const std::string script_prefix = "script=";
-                if (token.rfind(script_prefix, 0) == 0) {
-                    *script_path = token.substr(script_prefix.size());
-                    found_script = true;
-                    continue;
-                }
-                if (token.find('=') != std::string::npos) {
-                    continue;
-                }
-                *script_path = token;
-                found_script = true;
-                continue;
-            }
-            script_args->push_back(token);
-        }
-
-        if (script_path->empty()) {
-            if (error) {
-                *error = "script path is required. Usage: 6 script=<path> [script args...]";
-            }
+        zb::storagenode::DiscCapacityAdjustment capacity_adjustment;
+        std::string capacity_adjustment_error;
+        if (!LoadOpticalCapacityAdjustment(&capacity_adjustment, &capacity_adjustment_error)) {
+            std::cerr << "\u8bfb\u53d6\u5149\u76d8\u5e93\u5bb9\u91cf\u8c03\u6574\u5931\u8d25: "
+                      << capacity_adjustment_error << '\n';
             return false;
         }
-        if (error) {
-            error->clear();
+        const uint64_t adjusted_total_disc_count =
+            ApplyDiscCountAdjustment(stats.total_disc_count(), capacity_adjustment.disc_delta_count);
+        const uint64_t adjusted_unused_disc_count =
+            adjusted_total_disc_count > stats.used_disc_count()
+                ? adjusted_total_disc_count - stats.used_disc_count()
+                : 0;
+        const std::string adjusted_total_capacity_bytes =
+            ApplyCapacityAdjustment(stats.total_capacity_bytes(), capacity_adjustment);
+        const std::string adjusted_free_capacity_bytes =
+            zb::mds::SubtractDecimalStrings(adjusted_total_capacity_bytes, stats.used_capacity_bytes());
+
+        std::cout << "\u5143\u6570\u636e\u5206\u914d\u6a21\u5f0f=\u987a\u5e8f\u5206\u914d\n";
+        std::cout << "\u5149\u76d8\u5e03\u5c40\u7248\u672c=" << stats.optical_layout_version() << '\n';
+        const bool uniform_layout =
+            stats.optical_layout_version() == zb::mds::MasstreeOpticalProfile::kUniform2TbLayoutName;
+        if (uniform_layout) {
+            std::cout << "\u5355\u5f20\u5149\u76d8\u5bb9\u91cf\u5b57\u8282=2000000000000\n";
+            std::cout << "\u6bcf\u5f20\u5149\u76d8\u955c\u50cf\u6570=20\n";
+        } else {
+            std::cout << "\u5149\u76d8\u5e03\u5c40\u6a21\u578b="
+                      << zb::mds::MasstreeOpticalProfile::kLegacyMixedLayoutName << '\n';
+            std::cout << "\u6bcf\u8282\u70b91TB\u5149\u76d8\u6570=9000\n";
+            std::cout << "1TB\u5149\u76d8\u5bb9\u91cf\u5b57\u8282=1000000000000\n";
+            std::cout << "1TB\u5149\u76d8\u955c\u50cf\u6570=10\n";
+            std::cout << "\u6bcf\u8282\u70b910TB\u5149\u76d8\u6570=1000\n";
+            std::cout << "10TB\u5149\u76d8\u5bb9\u91cf\u5b57\u8282=10000000000000\n";
+            std::cout << "10TB\u5149\u76d8\u955c\u50cf\u6570=100\n";
         }
+        std::cout << "\u5143\u6570\u636e\u5149\u76d8\u603b\u6570=" << adjusted_total_disc_count << '\n';
+        std::cout << "\u5143\u6570\u636e\u5149\u76d8\u603b\u5bb9\u91cf\u5b57\u8282=" << adjusted_total_capacity_bytes << '\n';
+        std::cout << "\u5143\u6570\u636e\u5df2\u4f7f\u7528\u5149\u76d8\u6570=" << stats.used_disc_count() << '\n';
+        std::cout << "\u5143\u6570\u636e\u672a\u4f7f\u7528\u5149\u76d8\u6570=" << adjusted_unused_disc_count << '\n';
+        std::cout << "\u5149\u76d8\u5e93\u76d8\u6570\u8c03\u6574=" << capacity_adjustment.disc_delta_count << '\n';
+        std::cout << "\u5149\u76d8\u5e93\u5bb9\u91cf\u8c03\u6574\u5b57\u8282="
+                  << SignedCapacityAdjustmentString(capacity_adjustment) << '\n';
+        std::cout << "\u5df2\u5c01\u5b58\u5386\u53f2\u5149\u76d8\u6570=" << stats.sealed_legacy_disc_count() << '\n';
+        std::cout << "uniform_v2\u5df2\u4f7f\u7528\u5149\u76d8\u6570=" << stats.uniform_v2_used_disc_count() << '\n';
+        std::cout << "\u5df2\u5206\u914d\u6587\u4ef6\u5b57\u8282=" << stats.allocated_file_bytes() << '\n';
+        std::cout << "\u5269\u4f59\u5bb9\u91cf\u5b57\u8282=" << adjusted_free_capacity_bytes << '\n';
+        std::cout << "\u5149\u76d8\u6e38\u6807\u8282\u70b9\u5e8f\u53f7=" << stats.cursor_node_index() << '\n';
+        std::cout << "\u5149\u76d8\u6e38\u6807\u5149\u76d8\u5e8f\u53f7=" << stats.cursor_disk_index() << '\n';
+        std::cout << "\u5149\u76d8\u6e38\u6807\u955c\u50cf\u5e8f\u53f7=" << stats.cursor_image_index() << '\n';
+        std::cout << "\u5149\u76d8\u6e38\u6807\u955c\u50cf\u5df2\u7528\u5b57\u8282=" << stats.cursor_image_used_bytes() << '\n';
         return true;
     }
 
-    bool RunScriptScenario(const std::string& script_path, const std::vector<std::string>& script_args) {
-        PrintSection("50yi file test");
-        if (script_path.empty()) {
-            std::cerr << "script path is required. Usage: 6 script=<path> [script args...]\n";
-            return false;
-        }
-        std::error_code ec;
-        if (!fs::exists(script_path, ec) || ec) {
-            std::cerr << "script not found: " << script_path << '\n';
-            return false;
-        }
-        if (!fs::is_regular_file(script_path, ec) || ec) {
-            std::cerr << "script is not a regular file: " << script_path << '\n';
-            return false;
-        }
-
-        std::string command = "bash " + ShellQuote(script_path);
-        for (const auto& arg : script_args) {
-            command += " " + ShellQuote(arg);
-        }
-        std::cout << "script_path=" << script_path << '\n';
-        if (!script_args.empty()) {
-            for (size_t i = 0; i < script_args.size(); ++i) {
-                std::cout << "script_arg_" << (i + 1) << "=" << script_args[i] << '\n';
+    bool RunOpticalDiscManagement(const zb::demo::ParsedCommand& command) {
+        PrintSection("\u5149\u76d8\u7ba1\u7406");
+        const std::unordered_set<std::string> supported_args = {
+            "op",          "disc_dir",       "delta_path",   "disc_id",       "device_id",
+            "library_id",  "capacity_bytes", "status",       "write_mbps",     "read_mbps",
+            "offset",      "limit",          "detail",
+        };
+        for (const auto& item : command.args) {
+            if (supported_args.count(item.first) == 0) {
+                std::cerr << "\u672a\u77e5\u5149\u76d8\u7ba1\u7406\u53c2\u6570: " << item.first << '\n';
+                return false;
             }
         }
-        std::cout << "command=" << command << '\n';
-        const int rc = std::system(command.c_str());
-        std::cout << "exit_code=" << rc << '\n';
-        return rc == 0;
+        if (!command.positionals.empty()) {
+            std::cerr << "\u5149\u76d8\u7ba1\u7406\u4e0d\u652f\u6301\u4f4d\u7f6e\u53c2\u6570\n";
+            return false;
+        }
+        auto argument = [&](const std::string& key, const std::string& fallback = std::string()) {
+            const auto it = command.args.find(key);
+            return it == command.args.end() ? fallback : it->second;
+        };
+        const std::string op = ToLowerCopy(argument("op", "stats"));
+        if (op == "stats") {
+            return PrintMetadataOpticalDiscUsage();
+        }
+
+        const std::string disc_dir = argument("disc_dir", OpticalDiscInventoryDir());
+        const std::string delta_path = argument("delta_path", OpticalDeltaPath());
+
+        zb::storagenode::OpticalDiscCatalog catalog(disc_dir, delta_path);
+        zb::storagenode::CatalogLoadResult load_result;
+        std::string error;
+        if (!catalog.Load(&load_result, &error)) {
+            std::cerr << "\u52a0\u8f7d\u5149\u76d8\u76ee\u5f55\u5931\u8d25: " << error << '\n';
+            return false;
+        }
+        std::cout << "\u5149\u76d8\u5e93\u5b58\u76ee\u5f55=" << disc_dir << '\n';
+        std::cout << "\u5149\u76d8\u53d8\u66f4\u65e5\u5fd7=" << delta_path << '\n';
+        std::cout << "\u6279\u6b21\u6587\u4ef6\u6570=" << load_result.batch_file_count << '\n';
+        std::cout << "\u8df3\u8fc7\u6279\u6b21\u6587\u4ef6\u6570=" << load_result.skipped_batch_file_count << '\n';
+        std::cout << "\u53d8\u66f4\u64cd\u4f5c\u6570=" << load_result.delta_operation_count << '\n';
+        zb::rpc::GetMasstreeClusterStatsReply overlay_stats;
+        if (!mds_.GetMasstreeClusterStats(&overlay_stats)) {
+            std::cerr << "\u83b7\u53d6 MDS \u5149\u76d8\u4f7f\u7528\u7edf\u8ba1\u5931\u8d25: "
+                      << overlay_stats.status().message() << '\n';
+            return false;
+        }
+        catalog.SetUsageOverlay({true,
+                                 overlay_stats.used_disc_count(),
+                                 overlay_stats.cursor_node_index(),
+                                 overlay_stats.cursor_disk_index(),
+                                 overlay_stats.cursor_image_index(),
+                                 overlay_stats.cursor_image_used_bytes()});
+        std::cout << "\u5e93\u5b58\u72b6\u6001\u540c\u6b65=\u5df2\u6309MDS\u5df2\u4f7f\u7528\u5149\u76d8\u6570\u8986\u76d6\n";
+        std::cout << "\u5e93\u5b58\u8986\u76d6\u5df2\u7528\u5149\u76d8\u6570="
+                  << overlay_stats.used_disc_count() << '\n';
+
+        if (op == "inventory_stats") {
+            if (!PrintMetadataOpticalDiscUsage()) {
+                return false;
+            }
+            zb::storagenode::DiscStatistics global;
+            std::vector<zb::storagenode::LibraryStatistics> libraries;
+            if (!catalog.ComputeStatistics(&global, &libraries, &error)) {
+                std::cerr << "\u8ba1\u7b97\u5149\u76d8\u7edf\u8ba1\u5931\u8d25: " << error << '\n';
+                return false;
+            }
+            std::cout << "\u5149\u76d8\u5e93\u6570\u91cf=" << libraries.size() << '\n';
+            PrintOpticalStatistics(global, "\u5168\u5c40");
+            const std::string detail = ToLowerCopy(argument("detail", "summary"));
+            if (detail == "summary" || detail == "global") {
+                std::cout << "\u660e\u7ec6\u8f93\u51fa=\u5df2\u7701\u7565\u5149\u76d8\u5e93\u660e\u7ec6"
+                          << " \u67e5\u770b\u660e\u7ec6\u8bf7\u4f7f\u7528 detail=library\n";
+                return true;
+            }
+            if (detail != "library") {
+                std::cerr << "detail \u53ea\u652f\u6301 summary|global|library\n";
+                return false;
+            }
+            std::uint64_t offset = 0;
+            std::uint64_t limit = 20;
+            if ((!argument("offset").empty() && !ParseUint64Value("offset", argument("offset"), &offset, &error)) ||
+                (!argument("limit").empty() && !ParseUint64Value("limit", argument("limit"), &limit, &error))) {
+                std::cerr << error << '\n';
+                return false;
+            }
+            if (limit == 0 || limit > 10000) {
+                std::cerr << "limit \u5fc5\u987b\u5728 [1, 10000] \u8303\u56f4\u5185\n";
+                return false;
+            }
+            const std::uint64_t total = static_cast<std::uint64_t>(libraries.size());
+            const std::uint64_t end = std::min<std::uint64_t>(total, offset + limit);
+            std::cout << "\u660e\u7ec6\u8f93\u51fa=\u5149\u76d8\u5e93"
+                      << " \u504f\u79fb=" << offset
+                      << " \u6570\u91cf\u9650\u5236=" << limit
+                      << " \u8fd4\u56de\u6570\u91cf=" << (offset < total ? end - offset : 0)
+                      << " \u5149\u76d8\u5e93\u603b\u6570=" << total << '\n';
+            for (std::uint64_t i = offset; i < end; ++i) {
+                const auto& library = libraries[static_cast<std::size_t>(i)];
+                PrintOpticalStatistics(library.statistics, "\u5149\u76d8\u5e93", library.library_id);
+            }
+            return true;
+        }
+
+        const std::string disc_id = argument("disc_id", argument("device_id"));
+        if (op == "get") {
+            const std::string library_id = argument("library_id");
+            if (library_id.empty()) {
+                std::cerr << "op=get \u9700\u8981 library_id\n";
+                return false;
+            }
+            if (disc_id.empty()) {
+                zb::storagenode::LibraryUsageView usage;
+                if (!catalog.GetLibraryUsage(library_id, &usage, &error)) {
+                    std::cerr << "\u67e5\u8be2\u5149\u76d8\u5e93\u4f7f\u7528\u60c5\u51b5\u5931\u8d25: "
+                              << error << '\n';
+                    return false;
+                }
+                PrintOpticalLibraryUsage(usage);
+                return true;
+            }
+            zb::storagenode::DiscUsageView usage;
+            bool found = false;
+            if (!catalog.GetDiscUsage(library_id, disc_id, &usage, &found, &error)) {
+                std::cerr << "\u67e5\u8be2\u5149\u76d8\u4f7f\u7528\u60c5\u51b5\u5931\u8d25: "
+                          << error << '\n';
+                return false;
+            }
+            if (!found) {
+                std::cerr << "\u672a\u627e\u5230\u5149\u76d8\u6216\u5149\u76d8\u4e0d\u5c5e\u4e8e\u6307\u5b9a\u5149\u76d8\u5e93: "
+                          << disc_id << '\n';
+                return false;
+            }
+            PrintOpticalDiscUsage(usage);
+            return true;
+        }
+
+        if (op == "list") {
+            const std::string library_id = argument("library_id");
+            if (library_id.empty()) {
+                std::cerr << "op=list \u9700\u8981 library_id\n";
+                return false;
+            }
+            std::uint64_t offset = 0;
+            std::uint64_t limit = 100;
+            if ((!argument("offset").empty() && !ParseUint64Value("offset", argument("offset"), &offset, &error)) ||
+                (!argument("limit").empty() && !ParseUint64Value("limit", argument("limit"), &limit, &error))) {
+                std::cerr << error << '\n';
+                return false;
+            }
+            if (limit == 0 || limit > 10000) {
+                std::cerr << "limit \u5fc5\u987b\u5728 [1, 10000] \u8303\u56f4\u5185\n";
+                return false;
+            }
+            std::vector<zb::storagenode::OpticalDiscBin> discs;
+            if (!catalog.ListDiscs(library_id, offset, limit, &discs, &error)) {
+                std::cerr << "\u5217\u51fa\u5149\u76d8\u5931\u8d25: " << error << '\n';
+                return false;
+            }
+            std::cout << "\u5149\u76d8\u5e93ID=" << library_id
+                      << " \u504f\u79fb=" << offset
+                      << " \u6570\u91cf\u9650\u5236=" << limit
+                      << " \u8fd4\u56de\u6570\u91cf=" << discs.size() << '\n';
+            for (const auto& disc : discs) {
+                PrintOpticalDisc(disc);
+            }
+            return true;
+        }
+
+        if (op == "add") {
+            const std::string library_id = argument("library_id");
+            if (library_id.empty()) {
+                std::cerr << "op=add \u9700\u8981 library_id\n";
+                return false;
+            }
+            std::string new_disc_id = disc_id;
+            if (new_disc_id.empty() && !catalog.NextAddedDiscId(&new_disc_id, &error)) {
+                std::cerr << "\u751f\u6210\u65b0\u5149\u76d8ID\u5931\u8d25: " << error << '\n';
+                return false;
+            }
+            zb::storagenode::OpticalDiscBin disc{};
+            if (!zb::storagenode::SetFixedString(disc.device_id, sizeof(disc.device_id), new_disc_id, &error) ||
+                !zb::storagenode::SetFixedString(disc.library_id, sizeof(disc.library_id), library_id, &error)) {
+                std::cerr << error << '\n';
+                return false;
+            }
+            disc.capacity = 1000000000000ULL;
+            disc.status = zb::storagenode::DiscStatus::Blank;
+            disc.write_throughput_MBps = zb::storagenode::kDefaultOpticalDiscWriteMbps;
+            disc.read_throughput_MBps = zb::storagenode::kDefaultOpticalDiscReadMbps;
+            if (!argument("capacity_bytes").empty() &&
+                !ParseUint64Value("capacity_bytes", argument("capacity_bytes"), &disc.capacity, &error)) {
+                std::cerr << error << '\n';
+                return false;
+            }
+            if (!argument("status").empty() &&
+                !zb::storagenode::ParseDiscStatus(ToLowerCopy(argument("status")), &disc.status)) {
+                std::cerr << "\u65e0\u6548\u72b6\u6001: " << argument("status") << '\n';
+                return false;
+            }
+            auto parse_throughput = [&](const std::string& key, double* output) {
+                const std::string value = argument(key);
+                if (value.empty()) {
+                    return true;
+                }
+                try {
+                    std::size_t consumed = 0;
+                    *output = std::stod(value, &consumed);
+                    return consumed == value.size() && *output >= 0;
+                } catch (...) {
+                    return false;
+                }
+            };
+            if (!parse_throughput("write_mbps", &disc.write_throughput_MBps) ||
+                !parse_throughput("read_mbps", &disc.read_throughput_MBps)) {
+                std::cerr << "write_mbps \u548c read_mbps \u5fc5\u987b\u662f\u975e\u8d1f\u6570\n";
+                return false;
+            }
+            if (!catalog.AddDisc(disc, &error)) {
+                std::cerr << "\u65b0\u589e\u5149\u76d8\u5931\u8d25: " << error << '\n';
+                return false;
+            }
+            std::cout << "\u5149\u76d8\u5df2\u65b0\u589e=true\n";
+            zb::storagenode::DiscUsageView usage;
+            usage.disc = disc;
+            usage.total_bytes = disc.capacity;
+            usage.used_bytes = 0;
+            usage.free_bytes = disc.capacity;
+            PrintOpticalDiscUsage(usage);
+            return true;
+        }
+
+        if (op == "delete") {
+            const std::string library_id = argument("library_id");
+            if (library_id.empty() || disc_id.empty()) {
+                std::cerr << "op=delete \u9700\u8981 library_id \u548c disc_id\n";
+                return false;
+            }
+            zb::storagenode::DiscUsageView usage;
+            bool found = false;
+            if (!catalog.GetDiscUsage(library_id, disc_id, &usage, &found, &error)) {
+                std::cerr << "\u67e5\u8be2\u5149\u76d8\u4f7f\u7528\u60c5\u51b5\u5931\u8d25: "
+                          << error << '\n';
+                return false;
+            }
+            if (!found) {
+                std::cerr << "\u672a\u627e\u5230\u5149\u76d8\u6216\u5149\u76d8\u4e0d\u5c5e\u4e8e\u6307\u5b9a\u5149\u76d8\u5e93: "
+                          << disc_id << '\n';
+                return false;
+            }
+            if (usage.used_bytes > 0 || usage.disc.status == zb::storagenode::DiscStatus::InUse) {
+                std::cerr << "\u5df2\u4f7f\u7528\u5149\u76d8\u7981\u6b62\u76f4\u63a5\u5220\u9664: "
+                          << disc_id << '\n';
+                return false;
+            }
+            if (!catalog.DeleteDisc(disc_id, &error)) {
+                std::cerr << "\u5220\u9664\u5149\u76d8\u5931\u8d25: " << error << '\n';
+                return false;
+            }
+            std::cout << "\u5149\u76d8\u5df2\u5220\u9664=true \u5149\u76d8ID=" << disc_id << '\n';
+            return true;
+        }
+
+        std::cerr << "\u4e0d\u652f\u6301\u7684\u5149\u76d8\u7ba1\u7406\u64cd\u4f5c: " << op << '\n';
+        return false;
     }
 
     void InitializeMenuActions() {
@@ -2072,8 +2368,8 @@ private:
         actions_.push_back({"3", "TC-P3 \u865a\u62df\u8282\u70b9\u8bfb\u5199", "\u5411\u865a\u62df\u5c42\u5199\u5165\u5e76\u56de\u8bfb\u6d4b\u8bd5\u6587\u4ef6", "3 [dir=<virtual_dir>]", {"virtual", "p3"}});
         actions_.push_back({"4",
                             "TC-P4 Masstree \u5bfc\u5165",
-                            "\u9ed8\u8ba4\u6a21\u62df\u5bfc\u5165\u4e00\u4e2a Masstree \u547d\u540d\u7a7a\u95f4\u5e76\u66f4\u65b0\u6f14\u793a\u7edf\u8ba1",
-                            "4 namespace=<id> generation=<id> [import_mode=simulated|real] [key=value ...]",
+                            "\u57fa\u4e8e\u5df2\u6709\u6a21\u677f\u771f\u5b9e\u5bfc\u5165\u4e00\u4e2a Masstree \u547d\u540d\u7a7a\u95f4",
+                            "4 namespace=<id> generation=<id> [template_id=<id>] [template_mode=page_fast]",
                             {"import", "p4"}});
         actions_.push_back({"5",
                             "TC-P5 Masstree \u67e5\u8be2",
@@ -2081,10 +2377,10 @@ private:
                             "5 [n=<count>] [query_mode=random_path_lookup|random_inode] [output_limit=<count>]",
                             {"query", "p5"}});
         actions_.push_back({"6",
-                            "50\u4ebf\u6587\u4ef6\u6d4b\u8bd5",
-                            "\u8f93\u5165\u811a\u672c\u8def\u5f84\u5e76\u6267\u884c\u8be5\u811a\u672c",
-                            "6 script=<path> [script args...]",
-                            {"50yi", "script"}});
+                            "\u5149\u76d8\u7ba1\u7406",
+                            "\u8f93\u51fa\u5149\u76d8\u5e93\u7edf\u8ba1\uff0c\u5e76\u652f\u6301\u67e5\u8be2\u3001\u6dfb\u52a0\u548c\u5220\u9664\u5149\u76d8",
+                            "6 [op=stats|inventory_stats|get|list|add|delete] [library_id=<id>] [disc_id=<id>]",
+                            {"optical", "disc"}});
         actions_.push_back({"q", "\u9000\u51fa", "\u9000\u51fa\u6f14\u793a\u63a7\u5236\u53f0", "q", {"\u9000\u51fa", "exit"}});
     }
 
@@ -2092,8 +2388,6 @@ private:
         if (should_exit) {
             *should_exit = false;
         }
-        current_command_has_template_id_ =
-            command.args.count("template_id") != 0 || command.args.count("masstree_template_id") != 0;
         const zb::demo::MenuActionSpec* action = zb::demo::FindAction(actions_, command.action);
         if (!action) {
             return BuildInfoResult("\u672a\u77e5\u547d\u4ee4",
@@ -2108,17 +2402,11 @@ private:
             return {};
         }
         if (action->id == "6") {
-            std::string script_path;
-            std::vector<std::string> script_args;
-            std::string script_error;
-            if (!ExtractScriptInvocation(command, &script_path, &script_args, &script_error)) {
-                return BuildInfoResult(action->title, false, script_error, action->usage);
-            }
             return ExecuteCapturedAction(*action,
                                          command.raw,
-                                         "50\u4ebf\u6587\u4ef6\u6d4b\u8bd5\u5b8c\u6210",
-                                         "50\u4ebf\u6587\u4ef6\u6d4b\u8bd5\u5931\u8d25",
-                                         [&]() { return RunScriptScenario(script_path, script_args); });
+                                         "\u5149\u76d8\u7ba1\u7406\u64cd\u4f5c\u5b8c\u6210",
+                                         "\u5149\u76d8\u7ba1\u7406\u64cd\u4f5c\u5931\u8d25",
+                                         [&]() { return RunOpticalDiscManagement(command); });
         }
 
         std::string apply_error;
@@ -2304,13 +2592,17 @@ private:
         }
         out << "\nExamples:\n";
         out << "  1 tc_p1_expected_real_node_count=1 tc_p1_expected_virtual_node_count=99\n";
-        out << "  10 template_id=template-pathlist-100m path_list_file=examples/masstree_path_list_sample.txt repeat_dir_prefix=copy leaf_nodes_are_files=true\n";
-        out << "  4 namespace=demo-ns generation=gen-report-001\n";
-        out << "  4 namespace=demo-ns generation=gen-report-002 import_mode=real template_id=template-pathlist-100m template_mode=page_fast\n";
+        out << "  4 namespace=demo-ns generation=gen-report-001 template_id=template-01-tijian template_mode=page_fast\n";
+        out << "  4 namespace=demo-ns generation=gen-report-002\n";
         out << "  5 n=1\n";
         out << "  5 n=1000 query_mode=random_path_lookup output_limit=5 log_file=logs/p5_run.log\n";
         out << "  5 n=1000 query_mode=random_inode output_limit=5 log_file=logs/p5_inode_run.log\n";
-        out << "  20 force=true confirm=RESET_NODE_DATA scope=real,virtual\n";
+        out << "  6 op=stats\n";
+        out << "  6 op=inventory_stats\n";
+        out << "  6 op=get library_id=lib_00000\n";
+        out << "  6 op=get library_id=lib_00000 disc_id=disc_0000008999\n";
+        out << "  6 op=add library_id=lib_00000\n";
+        out << "  6 op=delete library_id=lib_00000 disc_id=disc_extra_0000000001\n";
         return out.str();
     }
     bool ApplyCommandArgs(const zb::demo::ParsedCommand& command, std::string* error) {
@@ -2352,51 +2644,10 @@ private:
                 FLAGS_masstree_generation_id = value;
 	            } else if (key == "path_prefix" || key == "masstree_path_prefix") {
 	                FLAGS_masstree_path_prefix = value;
-	            } else if (key == "template_id" || key == "masstree_template_id") {
+            } else if (key == "template_id" || key == "masstree_template_id") {
 	                FLAGS_masstree_template_id = value;
 	            } else if (key == "template_mode" || key == "masstree_template_mode") {
 	                FLAGS_masstree_template_mode = value;
-	            } else if (key == "import_mode" || key == "masstree_import_mode") {
-	                FLAGS_masstree_import_mode = value;
-	            } else if (key == "sim_state_path" || key == "masstree_sim_state_path") {
-	                FLAGS_masstree_sim_state_path = value;
-	            } else if (key == "sim_file_count" || key == "masstree_sim_file_count") {
-                if (!ParseUint64Value(key, value, &parsed_u64, error)) {
-                    return false;
-                }
-                FLAGS_masstree_sim_file_count = parsed_u64;
-	            } else if (key == "sim_inode_count" || key == "masstree_sim_inode_count") {
-                if (!ParseUint64Value(key, value, &parsed_u64, error)) {
-                    return false;
-                }
-                FLAGS_masstree_sim_inode_count = parsed_u64;
-	            } else if (key == "sim_dentry_count" || key == "masstree_sim_dentry_count") {
-                if (!ParseUint64Value(key, value, &parsed_u64, error)) {
-                    return false;
-                }
-                FLAGS_masstree_sim_dentry_count = parsed_u64;
-	            } else if (key == "sim_total_file_bytes" || key == "masstree_sim_total_file_bytes") {
-	                FLAGS_masstree_sim_total_file_bytes = value;
-	            } else if (key == "sim_metadata_bytes" || key == "masstree_sim_metadata_bytes") {
-                if (!ParseUint64Value(key, value, &parsed_u64, error)) {
-                    return false;
-                }
-                FLAGS_masstree_sim_metadata_bytes = parsed_u64;
-	            } else if (key == "sim_avg_file_size_bytes" || key == "masstree_sim_avg_file_size_bytes") {
-                if (!ParseUint64Value(key, value, &parsed_u64, error)) {
-                    return false;
-                }
-                FLAGS_masstree_sim_avg_file_size_bytes = parsed_u64;
-	            } else if (key == "sim_min_file_size_bytes" || key == "masstree_sim_min_file_size_bytes") {
-                if (!ParseUint64Value(key, value, &parsed_u64, error)) {
-                    return false;
-                }
-                FLAGS_masstree_sim_min_file_size_bytes = parsed_u64;
-	            } else if (key == "sim_max_file_size_bytes" || key == "masstree_sim_max_file_size_bytes") {
-                if (!ParseUint64Value(key, value, &parsed_u64, error)) {
-                    return false;
-                }
-                FLAGS_masstree_sim_max_file_size_bytes = parsed_u64;
 	            } else if (key == "source_mode" || key == "masstree_source_mode") {
 	                FLAGS_masstree_source_mode = value;
 	            } else if (key == "path_list_file" || key == "masstree_path_list_file") {
@@ -3146,140 +3397,13 @@ private:
     }
 
     bool RunMasstreeImportDemo() {
-        const std::string mode = ToLowerCopy(TrimCopy(FLAGS_masstree_import_mode));
-        if (mode.empty() || mode == "simulated" || mode == "simulate" || mode == "sim") {
-            return RunMasstreeImportDemoSimulated();
-        }
-        if (mode == "real") {
-            return RunMasstreeImportDemoReal();
-        }
-        std::cerr << "Unsupported masstree_import_mode: " << FLAGS_masstree_import_mode
-                  << " (expected simulated|real)\n";
-        return false;
-    }
-
-    bool RunMasstreeImportDemoSimulated() {
-        PrintSection("Masstree Import Demo");
-        zb::rpc::GetMasstreeClusterStatsReply real_baseline;
-        if (!mds_.GetMasstreeClusterStats(&real_baseline)) {
-            std::cerr << "GetMasstreeClusterStats(real baseline) failed: "
-                      << real_baseline.status().message() << '\n';
-            return false;
-        }
-        std::map<std::string, SimulatedMasstreeImportRecord> records;
-        std::string error;
-        if (!LoadSimulatedMasstreeRecords(&records, &error)) {
-            std::cerr << "Load simulated Masstree state failed: " << error << '\n';
-            return false;
-        }
-        const std::string namespace_id =
-            MakeUniqueSimulatedMasstreeNamespaceId(FLAGS_masstree_namespace_id, records);
-        const std::string generation_id = FLAGS_masstree_generation_id.empty()
-                                              ? "gen-" + TimestampToken()
-                                              : FLAGS_masstree_generation_id;
-        const std::string path_prefix = FLAGS_masstree_path_prefix.empty()
-                                            ? "/masstree_demo/" + namespace_id
-                                            : NormalizeLogicalPath(FLAGS_masstree_path_prefix);
-        const SimulatedMasstreeOverlayStats before = AggregateSimulatedMasstreeRecords(records);
-        const auto previous = records.find(namespace_id);
-        const bool had_previous_namespace = previous != records.end();
-        const SimulatedMasstreeImportRecord previous_record =
-            had_previous_namespace ? previous->second : SimulatedMasstreeImportRecord();
-
-        SimulatedMasstreeImportRecord record;
-        record.namespace_id = namespace_id;
-        record.generation_id = generation_id;
-        record.path_prefix = path_prefix;
-        record.file_count = FLAGS_masstree_sim_file_count;
-        record.inode_count = FLAGS_masstree_sim_inode_count;
-        record.dentry_count = FLAGS_masstree_sim_dentry_count;
-        record.total_file_bytes = zb::mds::NormalizeDecimalString(FLAGS_masstree_sim_total_file_bytes);
-        record.total_metadata_bytes = std::to_string(FLAGS_masstree_sim_metadata_bytes);
-        record.avg_file_size_bytes = FLAGS_masstree_sim_avg_file_size_bytes;
-        record.min_file_size_bytes = FLAGS_masstree_sim_min_file_size_bytes;
-        record.max_file_size_bytes = FLAGS_masstree_sim_max_file_size_bytes;
-        records[namespace_id] = record;
-
-        if (!SaveSimulatedMasstreeRecords(records, &error)) {
-            std::cerr << "Save simulated Masstree state failed: " << error << '\n';
-            return false;
-        }
-        const SimulatedMasstreeOverlayStats after = AggregateSimulatedMasstreeRecords(records);
-        const uint64_t combined_before_total_file_count =
-            real_baseline.total_file_count() + before.total_file_count;
-        const uint64_t combined_after_total_file_count =
-            real_baseline.total_file_count() + after.total_file_count;
-        const std::string combined_before_total_file_bytes =
-            zb::mds::AddDecimalStrings(real_baseline.total_file_bytes(), before.total_file_bytes);
-        const std::string combined_after_total_file_bytes =
-            zb::mds::AddDecimalStrings(real_baseline.total_file_bytes(), after.total_file_bytes);
-        const std::string combined_before_total_metadata_bytes =
-            zb::mds::AddDecimalStrings(real_baseline.total_metadata_bytes(), before.total_metadata_bytes);
-        const std::string combined_after_total_metadata_bytes =
-            zb::mds::AddDecimalStrings(real_baseline.total_metadata_bytes(), after.total_metadata_bytes);
-        const std::string combined_before_used_capacity_bytes =
-            zb::mds::AddDecimalStrings(real_baseline.used_capacity_bytes(), before.total_file_bytes);
-        const std::string combined_after_used_capacity_bytes =
-            zb::mds::AddDecimalStrings(real_baseline.used_capacity_bytes(), after.total_file_bytes);
-
-        last_masstree_namespace_id_ = namespace_id;
-        last_masstree_path_prefix_ = path_prefix;
-        last_masstree_generation_id_ = generation_id;
-        last_masstree_manifest_path_ = SimulatedMasstreeStatePath();
-
-        std::cout << "import_mode=simulated\n";
-        std::cout << "state_path=" << SimulatedMasstreeStatePath() << '\n';
-        std::cout << "namespace_id=" << namespace_id << '\n';
-        std::cout << "generation_id=" << generation_id << '\n';
-        std::cout << "path_prefix=" << path_prefix << '\n';
-        std::cout << "job_status=completed elapsed=0s\n";
-        std::cout << "manifest_path=" << last_masstree_manifest_path_ << '\n';
-        std::cout << "root_inode_id=1\n";
-        std::cout << "inode_count=" << record.inode_count << '\n';
-        std::cout << "dentry_count=" << record.dentry_count << '\n';
-        std::cout << "file_count=" << record.file_count << '\n';
-        PrintDemoFileSizeDecimalMetric("import_total_file_bytes", record.total_file_bytes);
-        std::cout << "import_avg_file_size_bytes=" << ScaleDemoFileSize(record.avg_file_size_bytes) << '\n';
-        std::cout << "inode_range=[1, " << record.inode_count << "]\n";
-        std::cout << "inode_pages_bytes=" << record.total_metadata_bytes << '\n';
-        std::cout << "previous_namespace_present=" << (had_previous_namespace ? "true" : "false") << '\n';
-        if (had_previous_namespace) {
-            std::cout << "previous_namespace_generation_id=" << previous_record.generation_id << '\n';
-            std::cout << "previous_namespace_file_count=" << previous_record.file_count << '\n';
-            PrintDemoFileSizeDecimalMetric("previous_namespace_total_file_bytes", previous_record.total_file_bytes);
-            PrintDecimalMetric("previous_namespace_total_metadata_bytes", previous_record.total_metadata_bytes);
-        }
-        std::cout << "before_total_file_count=" << combined_before_total_file_count << '\n';
-        PrintDemoFileSizeDecimalMetric("before_total_file_bytes", combined_before_total_file_bytes);
-        PrintDecimalMetric("before_total_metadata_bytes", combined_before_total_metadata_bytes);
-        PrintDemoFileSizeDecimalMetric("before_used_capacity_bytes", combined_before_used_capacity_bytes);
-        std::cout << "after_total_file_count=" << combined_after_total_file_count << '\n';
-        PrintDemoFileSizeDecimalMetric("after_total_file_bytes", combined_after_total_file_bytes);
-        PrintDecimalMetric("after_total_metadata_bytes", combined_after_total_metadata_bytes);
-        PrintDemoFileSizeDecimalMetric("after_used_capacity_bytes", combined_after_used_capacity_bytes);
-        std::cout << "delta_total_file_count="
-                  << FormatSignedUint64Delta(combined_after_total_file_count,
-                                             combined_before_total_file_count) << '\n';
-        std::cout << "delta_total_file_bytes="
-                  << ScaleSignedDemoFileSizeDecimal(
-                         FormatSignedDecimalDelta(combined_after_total_file_bytes,
-                                                  combined_before_total_file_bytes))
-                  << '\n';
-        std::cout << "delta_total_metadata_bytes="
-                  << FormatSignedDecimalDelta(combined_after_total_metadata_bytes,
-                                              combined_before_total_metadata_bytes) << '\n';
-        std::cout << "delta_used_capacity_bytes="
-                  << ScaleSignedDemoFileSizeDecimal(
-                         FormatSignedDecimalDelta(combined_after_used_capacity_bytes,
-                                                  combined_before_used_capacity_bytes))
-                  << '\n';
-        return true;
+        return RunMasstreeImportDemoReal();
     }
 
     bool RunMasstreeImportDemoReal() {
         PrintSection("Masstree Import Demo");
         const std::string namespace_id = FLAGS_masstree_namespace_id.empty()
-                                             ? "demo-ns"
+                                             ? ResolveNextMasstreeNamespaceId("demo-ns")
                                              : FLAGS_masstree_namespace_id;
         const std::string generation_id = FLAGS_masstree_generation_id.empty()
                                               ? "gen-" + TimestampToken()
@@ -3309,17 +3433,21 @@ private:
             return false;
         }
 
-        const std::string selected_template_id =
-            current_command_has_template_id_ ? FLAGS_masstree_template_id
-                                             : (FLAGS_scenario != "interactive" ? FLAGS_masstree_template_id
-                                                                                 : std::string());
+        std::string selected_template_id;
+        std::string template_error;
+        if (!ResolveDefaultMasstreeTemplateId(&selected_template_id, &template_error)) {
+            std::cerr << "Resolve Masstree template failed: " << template_error << '\n';
+            return false;
+        }
+        const std::string selected_template_mode =
+            FLAGS_masstree_template_mode.empty() ? std::string("page_fast") : FLAGS_masstree_template_mode;
 
         zb::rpc::ImportMasstreeNamespaceRequest request;
-	        request.set_namespace_id(namespace_id);
-	        request.set_generation_id(generation_id);
-	        request.set_path_prefix(path_prefix);
-	        request.set_template_id(selected_template_id);
-	        request.set_template_mode(FLAGS_masstree_template_mode);
+        request.set_namespace_id(namespace_id);
+        request.set_generation_id(generation_id);
+        request.set_path_prefix(path_prefix);
+        request.set_template_id(selected_template_id);
+        request.set_template_mode(selected_template_mode);
         request.set_verify_inode_samples(FLAGS_masstree_verify_inode_samples);
         request.set_verify_dentry_samples(FLAGS_masstree_verify_dentry_samples);
         request.set_publish_route(true);
@@ -3335,19 +3463,14 @@ private:
         std::cout << "namespace_id=" << namespace_id << '\n';
         std::cout << "generation_id=" << generation_id << '\n';
         std::cout << "path_prefix=" << path_prefix << '\n';
-	        if (!selected_template_id.empty()) {
-	            std::cout << "template_id=" << selected_template_id << '\n';
-	        }
-	        if (!FLAGS_masstree_template_mode.empty()) {
-	            std::cout << "template_mode=" << FLAGS_masstree_template_mode << '\n';
-	        }
-	        std::cout << "job_id=" << reply.job_id() << '\n';
+        std::cout << "template_id=" << selected_template_id << '\n';
+        std::cout << "template_mode=" << selected_template_mode << '\n';
+        std::cout << "job_id=" << reply.job_id() << '\n';
 
         const auto poll_started_at = std::chrono::steady_clock::now();
         zb::rpc::MasstreeImportJobState last_state = zb::rpc::MASSTREE_IMPORT_JOB_PENDING;
         bool has_last_state = false;
         uint64_t last_printed_elapsed_bucket = std::numeric_limits<uint64_t>::max();
-        bool printed_selected_template_id = !selected_template_id.empty();
 
         while (true) {
             zb::rpc::GetMasstreeImportJobReply job_reply;
@@ -3365,10 +3488,6 @@ private:
                 std::chrono::steady_clock::now() - poll_started_at);
             const uint64_t elapsed_seconds = static_cast<uint64_t>(elapsed.count());
             const uint64_t elapsed_bucket = elapsed_seconds / 10ULL;
-            if (!printed_selected_template_id && !job.template_id().empty()) {
-                std::cout << "template_id=" << job.template_id() << '\n';
-                printed_selected_template_id = true;
-            }
             if (!has_last_state || job.state() != last_state || elapsed_bucket != last_printed_elapsed_bucket) {
                 std::cout << "job_status=" << MasstreeJobStateName(job.state())
                           << " elapsed=" << FormatDurationSeconds(elapsed_seconds) << '\n';
@@ -3422,16 +3541,6 @@ private:
                 const std::string expected_free_capacity_bytes =
                     zb::mds::SubtractDecimalStrings(cluster_after.total_capacity_bytes(),
                                                     expected_used_capacity_bytes);
-                const std::string demo_before_used_capacity =
-                    ScaleDemoFileSizeDecimal(cluster_before.used_capacity_bytes());
-                const std::string demo_after_used_capacity =
-                    ScaleDemoFileSizeDecimal(cluster_after.used_capacity_bytes());
-                const std::string demo_before_free_capacity =
-                    zb::mds::SubtractDecimalStrings(cluster_before.total_capacity_bytes(),
-                                                    demo_before_used_capacity);
-                const std::string demo_after_free_capacity =
-                    zb::mds::SubtractDecimalStrings(cluster_after.total_capacity_bytes(),
-                                                    demo_after_used_capacity);
 
                 std::cout << "manifest_path=" << job.manifest_path() << '\n';
                 std::cout << "root_inode_id=" << job.root_inode_id() << '\n';
@@ -3440,48 +3549,46 @@ private:
                 std::cout << "level1_dir_count=" << job.level1_dir_count() << '\n';
                 std::cout << "leaf_dir_count=" << job.leaf_dir_count() << '\n';
                 std::cout << "file_count=" << job.file_count() << '\n';
-                PrintDemoFileSizeDecimalMetric("import_total_file_bytes", job.total_file_bytes());
-                std::cout << "import_avg_file_size_bytes=" << ScaleDemoFileSize(job.avg_file_size_bytes()) << '\n';
+                PrintDecimalMetric("import_total_file_bytes", job.total_file_bytes());
+                std::cout << "import_avg_file_size_bytes=" << job.avg_file_size_bytes() << '\n';
                 std::cout << "inode_range=[" << job.inode_min() << ", " << job.inode_max() << "]\n";
                 std::cout << "inode_pages_bytes=" << job.inode_pages_bytes() << '\n';
                 std::cout << "previous_namespace_present=" << (had_previous_namespace ? "true" : "false") << '\n';
                 if (had_previous_namespace) {
                     std::cout << "previous_namespace_generation_id=" << previous_namespace_stats.generation_id() << '\n';
                     std::cout << "previous_namespace_file_count=" << previous_namespace_stats.file_count() << '\n';
-                    PrintDemoFileSizeDecimalMetric("previous_namespace_total_file_bytes",
-                                                   previous_namespace_stats.total_file_bytes());
+                    PrintDecimalMetric("previous_namespace_total_file_bytes",
+                                       previous_namespace_stats.total_file_bytes());
                     PrintDecimalMetric("previous_namespace_total_metadata_bytes",
                                        previous_namespace_stats.total_metadata_bytes());
                 }
                 std::cout << "before_total_file_count=" << cluster_before.total_file_count() << '\n';
-                PrintDemoFileSizeDecimalMetric("before_total_file_bytes", cluster_before.total_file_bytes());
+                PrintDecimalMetric("before_total_file_bytes", cluster_before.total_file_bytes());
                 PrintDecimalMetric("before_total_metadata_bytes", cluster_before.total_metadata_bytes());
-                PrintDecimalMetric("before_used_capacity_bytes", demo_before_used_capacity);
-                PrintDecimalMetric("before_free_capacity_bytes", demo_before_free_capacity);
+                PrintDecimalMetric("before_used_capacity_bytes", cluster_before.used_capacity_bytes());
+                PrintDecimalMetric("before_free_capacity_bytes", cluster_before.free_capacity_bytes());
                 std::cout << "after_total_file_count=" << cluster_after.total_file_count() << '\n';
-                PrintDemoFileSizeDecimalMetric("after_total_file_bytes", cluster_after.total_file_bytes());
+                PrintDecimalMetric("after_total_file_bytes", cluster_after.total_file_bytes());
                 PrintDecimalMetric("after_total_metadata_bytes", cluster_after.total_metadata_bytes());
-                PrintDecimalMetric("after_used_capacity_bytes", demo_after_used_capacity);
-                PrintDecimalMetric("after_free_capacity_bytes", demo_after_free_capacity);
+                PrintDecimalMetric("after_used_capacity_bytes", cluster_after.used_capacity_bytes());
+                PrintDecimalMetric("after_free_capacity_bytes", cluster_after.free_capacity_bytes());
                 std::cout << "delta_total_file_count="
                           << FormatSignedUint64Delta(cluster_after.total_file_count(),
                                                     cluster_before.total_file_count()) << '\n';
                 std::cout << "delta_total_file_bytes="
-                          << ScaleSignedDemoFileSizeDecimal(
-                                 FormatSignedDecimalDelta(cluster_after.total_file_bytes(),
-                                                          cluster_before.total_file_bytes()))
+                          << FormatSignedDecimalDelta(cluster_after.total_file_bytes(),
+                                                      cluster_before.total_file_bytes())
                           << '\n';
                 std::cout << "delta_total_metadata_bytes="
                           << FormatSignedDecimalDelta(cluster_after.total_metadata_bytes(),
                                                       cluster_before.total_metadata_bytes()) << '\n';
                 std::cout << "delta_used_capacity_bytes="
-                          << ScaleSignedDemoFileSizeDecimal(
-                                 FormatSignedDecimalDelta(cluster_after.used_capacity_bytes(),
-                                                          cluster_before.used_capacity_bytes()))
+                          << FormatSignedDecimalDelta(cluster_after.used_capacity_bytes(),
+                                                      cluster_before.used_capacity_bytes())
                           << '\n';
                 std::cout << "delta_free_capacity_bytes="
-                          << FormatSignedDecimalDelta(demo_after_free_capacity,
-                                                      demo_before_free_capacity) << '\n';
+                          << FormatSignedDecimalDelta(cluster_after.free_capacity_bytes(),
+                                                      cluster_before.free_capacity_bytes()) << '\n';
 
                 std::vector<CheckResult> checks;
                 AddCheck(&checks,
@@ -3890,9 +3997,8 @@ private:
             std::cout << "  mode=" << attr.mode() << '\n';
             std::cout << "  uid=" << attr.uid() << '\n';
             std::cout << "  gid=" << attr.gid() << '\n';
-            const uint64_t demo_size = ScaleDemoFileSize(attr.size());
-            std::cout << "  size_bytes=" << demo_size << '\n';
-            std::cout << "  size_human=" << FormatBytes(demo_size) << '\n';
+            std::cout << "  size_bytes=" << attr.size() << '\n';
+            std::cout << "  size_human=" << FormatBytes(attr.size()) << '\n';
             std::cout << "  atime=" << attr.atime() << '\n';
             std::cout << "  mtime=" << attr.mtime() << '\n';
             std::cout << "  ctime=" << attr.ctime() << '\n';
@@ -4068,7 +4174,6 @@ private:
     std::string last_masstree_namespace_id_;
     std::string last_masstree_path_prefix_;
     std::string last_masstree_generation_id_;
-    bool current_command_has_template_id_{false};
 };
 
 } // namespace

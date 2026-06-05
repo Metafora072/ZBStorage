@@ -571,6 +571,13 @@ message GetMasstreeClusterStatsReply {
   string total_metadata_bytes = 16;
   uint64 min_file_size_bytes = 17;
   uint64 max_file_size_bytes = 18;
+  string optical_layout_version = 19;
+  uint64 total_disc_count = 20;
+  uint64 used_disc_count = 21;
+  uint64 unused_disc_count = 22;
+  uint64 sealed_legacy_disc_count = 23;
+  uint64 uniform_v2_used_disc_count = 24;
+  string allocated_file_bytes = 25;
 }
 
 message GetMasstreeNamespaceStatsRequest {
@@ -595,6 +602,7 @@ message GetMasstreeNamespaceStatsReply {
   uint32 end_cursor_image_index = 15;
   uint64 end_cursor_image_used_bytes = 16;
   string total_metadata_bytes = 17;
+  string optical_layout_version = 18;
 }
 
 service MdsService {

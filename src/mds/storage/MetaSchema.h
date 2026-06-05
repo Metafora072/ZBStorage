@@ -159,6 +159,10 @@ inline std::string MasstreeClusterStatsCurrentKey() {
     return "MTS/cluster/current";
 }
 
+inline std::string MasstreeOpticalLayoutCurrentKey() {
+    return "MTS/optical/layout/current";
+}
+
 inline std::string MasstreeNamespaceStatsCurrentKey(const std::string& namespace_id) {
     return "MTS/namespace/" + namespace_id + "/current";
 }

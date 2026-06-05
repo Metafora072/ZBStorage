@@ -6,6 +6,8 @@
 #include <vector>
 
 #include "MasstreeDecimalUtils.h"
+#include "MasstreeOpticalLayoutStore.h"
+#include "MasstreeOpticalLayoutTranslator.h"
 #include "../storage/MetaSchema.h"
 
 namespace zb::mds {
@@ -20,6 +22,118 @@ std::string Trim(std::string value) {
         return std::isspace(ch) == 0;
     }).base(), value.end());
     return value;
+}
+
+bool UsedDiscCountForCursor(const MasstreeOpticalProfile& profile,
+                            const MasstreeOpticalClusterCursor& cursor,
+                            uint64_t* used_disc_count,
+                            std::string* error) {
+    if (!used_disc_count || !profile.IsValidCursor(cursor)) {
+        if (error) {
+            *error = "invalid optical allocation cursor";
+        }
+        return false;
+    }
+    const uint64_t cursor_disc_ordinal =
+        static_cast<uint64_t>(cursor.node_index) * static_cast<uint64_t>(profile.disks_per_node) +
+        static_cast<uint64_t>(cursor.disk_index);
+    *used_disc_count = cursor_disc_ordinal +
+                       ((cursor.image_index_in_disk > 0 || cursor.image_used_bytes > 0) ? 1ULL : 0ULL);
+    return true;
+}
+
+MasstreeOpticalProfile ProfileForLayoutVersion(uint32_t layout_version) {
+    return layout_version >= MasstreeOpticalProfile::kUniform2TbLayoutVersion
+               ? MasstreeOpticalProfile::Fixed()
+               : MasstreeOpticalProfile::LegacyMixed();
+}
+
+bool PopulateClusterDiscStats(RocksMetaStore* store,
+                              MasstreeClusterStatsRecord* record,
+                              std::string* error) {
+    if (!record) {
+        if (error) {
+            *error = "masstree cluster stats output is null";
+        }
+        return false;
+    }
+    const MasstreeOpticalProfile profile = ProfileForLayoutVersion(record->optical_layout_version);
+    const bool uses_uniform_layout =
+        profile.layout_version >= MasstreeOpticalProfile::kUniform2TbLayoutVersion;
+    uint64_t used_disc_count = 0;
+    if (!UsedDiscCountForCursor(profile, record->cursor, &used_disc_count, error)) {
+        return false;
+    }
+    record->optical_layout_version = profile.layout_version;
+    record->used_capacity_bytes = NormalizeDecimalString(record->used_capacity_bytes);
+    record->total_file_bytes = NormalizeDecimalString(record->total_file_bytes);
+    record->optical_node_count = profile.optical_node_count;
+    record->optical_device_count = static_cast<uint64_t>(profile.optical_node_count) *
+                                   static_cast<uint64_t>(profile.disks_per_node);
+    record->total_capacity_bytes = profile.TotalCapacityBytesDecimal();
+    record->free_capacity_bytes =
+        SubtractDecimalStrings(record->total_capacity_bytes, record->used_capacity_bytes);
+    record->total_disc_count = record->optical_device_count;
+    record->used_disc_count = used_disc_count;
+    record->unused_disc_count = used_disc_count <= record->total_disc_count
+                                    ? record->total_disc_count - used_disc_count
+                                    : 0;
+    record->sealed_legacy_disc_count = 0;
+    record->uniform_v2_used_disc_count = uses_uniform_layout ? used_disc_count : 0;
+    record->allocated_file_bytes = NormalizeDecimalString(record->total_file_bytes);
+
+    if (uses_uniform_layout && store) {
+        MasstreeOpticalLayoutStore layout_store(store);
+        MasstreeOpticalLayoutTranslation translation;
+        bool found = false;
+        if (!layout_store.LoadCurrent(&found, &translation, error)) {
+            return false;
+        }
+        if (found) {
+            record->sealed_legacy_disc_count = translation.cutover_disc_ordinal;
+            record->uniform_v2_used_disc_count =
+                used_disc_count >= translation.cutover_disc_ordinal
+                    ? used_disc_count - translation.cutover_disc_ordinal
+                    : 0;
+        }
+    }
+    if (record->used_disc_count > record->total_disc_count) {
+        if (error) {
+            *error = "masstree optical used disc count exceeds total disc count";
+        }
+        return false;
+    }
+    if (error) {
+        error->clear();
+    }
+    return true;
+}
+
+bool NormalizeNamespaceStatsToCurrentOpticalLayout(MasstreeNamespaceStatsRecord* record,
+                                                   std::string* error) {
+    if (!record) {
+        if (error) {
+            *error = "masstree namespace stats normalize output is null";
+        }
+        return false;
+    }
+    const MasstreeOpticalProfile current_profile = MasstreeOpticalProfile::Fixed();
+    if (record->optical_layout_version < MasstreeOpticalProfile::kUniform2TbLayoutVersion) {
+        const MasstreeOpticalProfile legacy_profile = MasstreeOpticalProfile::LegacyMixed();
+        MasstreeOpticalClusterCursor converted_start;
+        MasstreeOpticalClusterCursor converted_end;
+        if (!legacy_profile.ConvertCursorTo(record->start_cursor, current_profile, &converted_start) ||
+            !legacy_profile.ConvertCursorTo(record->end_cursor, current_profile, &converted_end)) {
+            if (error) {
+                *error = "failed to convert legacy masstree optical namespace cursor";
+            }
+            return false;
+        }
+        record->start_cursor = converted_start;
+        record->end_cursor = converted_end;
+    }
+    record->optical_layout_version = current_profile.layout_version;
+    return true;
 }
 
 } // namespace
@@ -39,7 +153,8 @@ bool MasstreeStatsStore::LoadClusterStats(MasstreeClusterStatsRecord* record, st
     std::string payload;
     std::string local_error;
     if (store_->Get(MasstreeClusterStatsCurrentKey(), &payload, &local_error)) {
-        return DecodeClusterStats(payload, record, error);
+        return DecodeClusterStats(payload, record, error) &&
+               PopulateClusterDiscStats(store_, record, error);
     }
     if (!local_error.empty()) {
         if (error) {
@@ -48,7 +163,8 @@ bool MasstreeStatsStore::LoadClusterStats(MasstreeClusterStatsRecord* record, st
         return false;
     }
 
-    const MasstreeOpticalProfile profile = MasstreeOpticalProfile::Fixed();
+    const MasstreeOpticalProfile profile = MasstreeOpticalProfile::LegacyMixed();
+    record->optical_layout_version = profile.layout_version;
     record->disk_node_count = 0;
     record->optical_node_count = profile.optical_node_count;
     record->disk_device_count = 0;
@@ -64,6 +180,9 @@ bool MasstreeStatsStore::LoadClusterStats(MasstreeClusterStatsRecord* record, st
     record->min_file_size_bytes = profile.min_file_size_bytes;
     record->max_file_size_bytes = profile.max_file_size_bytes;
     record->cursor = MasstreeOpticalClusterCursor();
+    if (!PopulateClusterDiscStats(store_, record, error)) {
+        return false;
+    }
     if (error) {
         error->clear();
     }
@@ -87,7 +206,8 @@ bool MasstreeStatsStore::LoadNamespaceStats(const std::string& namespace_id,
         }
         return false;
     }
-    return DecodeNamespaceStats(payload, record, error);
+    return DecodeNamespaceStats(payload, record, error) &&
+           NormalizeNamespaceStatsToCurrentOpticalLayout(record, error);
 }
 
 bool MasstreeStatsStore::LoadNamespaceStatsRaw(const std::string& namespace_id,
@@ -305,7 +425,8 @@ bool MasstreeStatsStore::DecodeClusterStats(const std::string& payload,
     }
 
     MasstreeClusterStatsRecord decoded;
-    const MasstreeOpticalProfile profile = MasstreeOpticalProfile::Fixed();
+    const MasstreeOpticalProfile profile = MasstreeOpticalProfile::LegacyMixed();
+    decoded.optical_layout_version = profile.layout_version;
     decoded.min_file_size_bytes = profile.min_file_size_bytes;
     decoded.max_file_size_bytes = profile.max_file_size_bytes;
     std::istringstream input(payload);
@@ -334,6 +455,10 @@ bool MasstreeStatsStore::DecodeClusterStats(const std::string& payload,
         const std::string value = Trim(trimmed.substr(eq + 1));
         if (key == "disk_node_count") {
             ParseU64Field(value, &decoded.disk_node_count);
+        } else if (key == "optical_layout_version") {
+            uint64_t parsed_version = 0;
+            ParseU64Field(value, &parsed_version);
+            decoded.optical_layout_version = static_cast<uint32_t>(parsed_version);
         } else if (key == "optical_node_count") {
             ParseU64Field(value, &decoded.optical_node_count);
         } else if (key == "disk_device_count") {
@@ -360,6 +485,18 @@ bool MasstreeStatsStore::DecodeClusterStats(const std::string& payload,
             ParseU64Field(value, &decoded.max_file_size_bytes);
         } else if (key == "cursor") {
             CursorFromString(value, &decoded.cursor);
+        } else if (key == "total_disc_count") {
+            ParseU64Field(value, &decoded.total_disc_count);
+        } else if (key == "used_disc_count") {
+            ParseU64Field(value, &decoded.used_disc_count);
+        } else if (key == "unused_disc_count") {
+            ParseU64Field(value, &decoded.unused_disc_count);
+        } else if (key == "sealed_legacy_disc_count") {
+            ParseU64Field(value, &decoded.sealed_legacy_disc_count);
+        } else if (key == "uniform_v2_used_disc_count") {
+            ParseU64Field(value, &decoded.uniform_v2_used_disc_count);
+        } else if (key == "allocated_file_bytes") {
+            decoded.allocated_file_bytes = NormalizeDecimalString(value);
         }
     }
 
@@ -414,6 +551,10 @@ bool MasstreeStatsStore::DecodeNamespaceStats(const std::string& payload,
         const std::string value = Trim(trimmed.substr(eq + 1));
         if (key == "namespace_id") {
             decoded.namespace_id = value;
+        } else if (key == "optical_layout_version") {
+            uint64_t parsed_version = 0;
+            ParseU64Field(value, &parsed_version);
+            decoded.optical_layout_version = static_cast<uint32_t>(parsed_version);
         } else if (key == "generation_id") {
             decoded.generation_id = value;
         } else if (key == "file_count") {
@@ -450,6 +591,7 @@ bool MasstreeStatsStore::DecodeNamespaceStats(const std::string& payload,
 std::string MasstreeStatsStore::EncodeClusterStats(const MasstreeClusterStatsRecord& record) {
     std::ostringstream out;
     out << "masstree_cluster_stats_v1\n";
+    out << "optical_layout_version=" << record.optical_layout_version << "\n";
     out << "disk_node_count=" << record.disk_node_count << "\n";
     out << "optical_node_count=" << record.optical_node_count << "\n";
     out << "disk_device_count=" << record.disk_device_count << "\n";
@@ -464,12 +606,19 @@ std::string MasstreeStatsStore::EncodeClusterStats(const MasstreeClusterStatsRec
     out << "min_file_size_bytes=" << record.min_file_size_bytes << "\n";
     out << "max_file_size_bytes=" << record.max_file_size_bytes << "\n";
     out << "cursor=" << CursorToString(record.cursor) << "\n";
+    out << "total_disc_count=" << record.total_disc_count << "\n";
+    out << "used_disc_count=" << record.used_disc_count << "\n";
+    out << "unused_disc_count=" << record.unused_disc_count << "\n";
+    out << "sealed_legacy_disc_count=" << record.sealed_legacy_disc_count << "\n";
+    out << "uniform_v2_used_disc_count=" << record.uniform_v2_used_disc_count << "\n";
+    out << "allocated_file_bytes=" << NormalizeDecimalString(record.allocated_file_bytes) << "\n";
     return out.str();
 }
 
 std::string MasstreeStatsStore::EncodeNamespaceStats(const MasstreeNamespaceStatsRecord& record) {
     std::ostringstream out;
     out << "masstree_namespace_stats_v1\n";
+    out << "optical_layout_version=" << record.optical_layout_version << "\n";
     out << "namespace_id=" << record.namespace_id << "\n";
     out << "generation_id=" << record.generation_id << "\n";
     out << "file_count=" << record.file_count << "\n";

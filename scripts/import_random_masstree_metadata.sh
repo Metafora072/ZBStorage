@@ -135,7 +135,6 @@ log "importing generated template through system_demo_tool real import"
   --scheduler="${SCHEDULER_ADDR}" \
   --mount_point="${MOUNT_POINT}" \
   --scenario=masstree_import \
-  --masstree_import_mode=real \
   --masstree_namespace_id="${NAMESPACE_ID}" \
   --masstree_generation_id="${GENERATION_ID}" \
   --masstree_path_prefix="${PATH_PREFIX}" \

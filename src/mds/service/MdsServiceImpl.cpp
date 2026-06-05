@@ -2334,6 +2334,16 @@ void MdsServiceImpl::GetMasstreeClusterStats(google::protobuf::RpcController* cn
     response->set_avg_file_size_bytes(stats.avg_file_size_bytes);
     response->set_min_file_size_bytes(stats.min_file_size_bytes);
     response->set_max_file_size_bytes(stats.max_file_size_bytes);
+    response->set_optical_layout_version(
+        stats.optical_layout_version >= MasstreeOpticalProfile::kUniform2TbLayoutVersion
+            ? MasstreeOpticalProfile::kUniform2TbLayoutName
+            : MasstreeOpticalProfile::kLegacyMixedLayoutName);
+    response->set_total_disc_count(stats.total_disc_count);
+    response->set_used_disc_count(stats.used_disc_count);
+    response->set_unused_disc_count(stats.unused_disc_count);
+    response->set_sealed_legacy_disc_count(stats.sealed_legacy_disc_count);
+    response->set_uniform_v2_used_disc_count(stats.uniform_v2_used_disc_count);
+    response->set_allocated_file_bytes(stats.allocated_file_bytes);
     response->set_cursor_node_index(stats.cursor.node_index);
     response->set_cursor_disk_index(stats.cursor.disk_index);
     response->set_cursor_image_index(stats.cursor.image_index_in_disk);
@@ -2386,6 +2396,10 @@ void MdsServiceImpl::GetMasstreeNamespaceStats(google::protobuf::RpcController* 
     response->set_end_cursor_image_index(stats.end_cursor.image_index_in_disk);
     response->set_end_cursor_image_used_bytes(stats.end_cursor.image_used_bytes);
     response->set_total_metadata_bytes(stats.total_metadata_bytes);
+    response->set_optical_layout_version(
+        stats.optical_layout_version >= MasstreeOpticalProfile::kUniform2TbLayoutVersion
+            ? MasstreeOpticalProfile::kUniform2TbLayoutName
+            : MasstreeOpticalProfile::kLegacyMixedLayoutName);
     FillStatus(response->mutable_status(), zb::rpc::MDS_OK, "OK");
 }
 

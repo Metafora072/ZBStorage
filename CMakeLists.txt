@@ -220,6 +220,29 @@ if(BRPC_DYNAMIC_LIB)
     target_link_libraries(virtual_node_test PRIVATE ${BRPC_DYNAMIC_LIB})
 endif()
 
+add_library(optical_disc_catalog
+    tools/storagenode/optical_disc_catalog.cpp
+)
+target_include_directories(optical_disc_catalog
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools
+)
+
+add_executable(generate_discs
+    tools/storagenode/generate_discs.cpp
+)
+target_link_libraries(generate_discs PRIVATE optical_disc_catalog)
+
+add_executable(generate_legacy_mixed_discs
+    tools/storagenode/generate_legacy_mixed_discs.cpp
+)
+target_link_libraries(generate_legacy_mixed_discs PRIVATE optical_disc_catalog)
+
+add_executable(import_discs_standalone
+    tools/storagenode/import_discs_standalone.cpp
+)
+target_link_libraries(import_discs_standalone PRIVATE optical_disc_catalog)
+
 add_executable(system_demo_tool
     tools/demo/demo_logger.cpp
     tools/demo/demo_menu.cpp
@@ -235,6 +258,7 @@ set_target_properties(system_demo_tool PROPERTIES
 target_include_directories(system_demo_tool
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools
         ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${GFLAGS_INCLUDE_PATH}
         ${CMAKE_CURRENT_BINARY_DIR}
@@ -242,6 +266,7 @@ target_include_directories(system_demo_tool
 target_link_libraries(system_demo_tool
     PRIVATE
         zb_proto
+        optical_disc_catalog
         brpc-static
         ${GFLAGS_LIBRARY}
         ${CMAKE_THREAD_LIBS_INIT}
@@ -559,6 +584,8 @@ add_executable(masstree_meta_build_tool
     src/mds/masstree_meta/MasstreeManifest.cpp
     src/mds/masstree_meta/MasstreeNamespaceCatalog.cpp
     src/mds/masstree_meta/MasstreeOpticalAllocator.cpp
+    src/mds/masstree_meta/MasstreeOpticalLayoutStore.cpp
+    src/mds/masstree_meta/MasstreeOpticalLayoutTranslator.cpp
     src/mds/masstree_meta/MasstreePageLayout.cpp
     src/mds/masstree_meta/MasstreePageReader.cpp
     src/mds/masstree_meta/MasstreeStatsStore.cpp
@@ -621,6 +648,71 @@ target_link_libraries(masstree_ns_route_tool
         zb_proto
         ${ROCKSDB_TARGET}
 )
+
+add_executable(masstree_optical_layout_migrate_tool
+    tools/masstree/masstree_optical_layout_migrate_tool.cpp
+    src/mds/masstree_meta/MasstreeOpticalLayoutStore.cpp
+    src/mds/masstree_meta/MasstreeOpticalLayoutTranslator.cpp
+    src/mds/masstree_meta/MasstreeStatsStore.cpp
+    src/mds/storage/RocksMetaStore.cpp
+)
+set_target_properties(masstree_optical_layout_migrate_tool PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+)
+target_include_directories(masstree_optical_layout_migrate_tool
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${ROCKSDB_ROOT}/include
+        ${CMAKE_CURRENT_BINARY_DIR}
+)
+target_link_libraries(masstree_optical_layout_migrate_tool
+    PRIVATE
+        ${ROCKSDB_TARGET}
+)
+
+add_executable(masstree_optical_layout_translation_test
+    tests/masstree_optical_layout_translation_test.cpp
+    src/mds/masstree_meta/MasstreeOpticalLayoutTranslator.cpp
+)
+set_target_properties(masstree_optical_layout_translation_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+)
+target_include_directories(masstree_optical_layout_translation_test
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+if(BUILD_TESTING)
+    add_test(NAME masstree_optical_layout_translation_test COMMAND masstree_optical_layout_translation_test)
+endif()
+
+add_executable(masstree_optical_layout_store_test
+    tests/masstree_optical_layout_store_test.cpp
+    src/mds/masstree_meta/MasstreeOpticalLayoutStore.cpp
+    src/mds/masstree_meta/MasstreeOpticalLayoutTranslator.cpp
+    src/mds/masstree_meta/MasstreeStatsStore.cpp
+    src/mds/storage/RocksMetaStore.cpp
+)
+set_target_properties(masstree_optical_layout_store_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+)
+target_include_directories(masstree_optical_layout_store_test
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${ROCKSDB_ROOT}/include
+)
+target_link_libraries(masstree_optical_layout_store_test
+    PRIVATE
+        ${ROCKSDB_TARGET}
+)
+if(BUILD_TESTING)
+    add_test(NAME masstree_optical_layout_store_test COMMAND masstree_optical_layout_store_test)
+endif()
 
 add_executable(module_io_smoke_test
     tests/module_io_smoke_test.cpp
@@ -703,6 +795,8 @@ add_executable(mds_server
     src/mds/masstree_meta/MasstreeMetaStore.cpp
     src/mds/masstree_meta/MasstreeNamespaceCatalog.cpp
     src/mds/masstree_meta/MasstreeOpticalAllocator.cpp
+    src/mds/masstree_meta/MasstreeOpticalLayoutStore.cpp
+    src/mds/masstree_meta/MasstreeOpticalLayoutTranslator.cpp
     src/mds/masstree_meta/MasstreePageLayout.cpp
     src/mds/masstree_meta/MasstreePageReader.cpp
     src/mds/masstree_meta/MasstreeStatsStore.cpp

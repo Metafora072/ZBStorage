@@ -29,8 +29,6 @@ MDS_STRICT_TIER_BYPASS_PG="${MDS_STRICT_TIER_BYPASS_PG:-true}"
 
 MODE="${1:-start}"
 
-mkdir -p "${CFG_DIR}" "${LOG_DIR}" "${PID_DIR}" "${DATA_DIR}" "${MOUNT_POINT}"
-
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
@@ -157,6 +155,17 @@ is_pid_alive() {
   [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1
 }
 
+launch_detached() {
+  local log_file="$1"
+  shift
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" >"${log_file}" 2>&1 < /dev/null &
+  else
+    nohup "$@" >"${log_file}" 2>&1 < /dev/null &
+  fi
+  echo "$!"
+}
+
 stop_by_name() {
   local name="$1"
   local pid
@@ -170,6 +179,25 @@ stop_by_name() {
     log "[STOP] ${name} pid=${pid}"
   fi
   rm -f "${PID_DIR}/${name}.pid"
+}
+
+unmount_fuse() {
+  if [[ ! -e "${MOUNT_POINT}" && ! -L "${MOUNT_POINT}" ]]; then
+    return
+  fi
+  if command -v fusermount3 >/dev/null 2>&1; then
+    fusermount3 -u "${MOUNT_POINT}" >/dev/null 2>&1 || true
+  elif command -v fusermount >/dev/null 2>&1; then
+    fusermount -u "${MOUNT_POINT}" >/dev/null 2>&1 || true
+  else
+    umount "${MOUNT_POINT}" >/dev/null 2>&1 || true
+  fi
+}
+
+prepare_run_dirs() {
+  mkdir -p "${CFG_DIR}" "${LOG_DIR}" "${PID_DIR}" "${DATA_DIR}"
+  unmount_fuse
+  mkdir -p "${MOUNT_POINT}"
 }
 
 render_configs() {
@@ -253,8 +281,8 @@ start_component() {
   shift 2
   local log_file="${LOG_DIR}/${name}.log"
   ensure_port_free "${name}" "${port}"
-  "$@" >"${log_file}" 2>&1 &
-  local pid="$!"
+  local pid
+  pid="$(launch_detached "${log_file}" "$@")"
   write_pid "${name}" "${pid}"
 
   local start_ts
@@ -289,6 +317,7 @@ start_all() {
   require_bin "${BUILD_DIR}/mds_server"
   require_bin "${BUILD_DIR}/zb_fuse_client"
 
+  prepare_run_dirs
   ensure_all_ports_free
   render_configs
 
@@ -305,29 +334,34 @@ start_all() {
     "${BUILD_DIR}/mds_server" --config="${CFG_DIR}/mds.conf" --port="${MDS_PORT}"
 
   local fuse_log="${LOG_DIR}/fuse.log"
-  "${BUILD_DIR}/zb_fuse_client" \
+  local fuse_pid
+  fuse_pid="$(launch_detached "${fuse_log}" "${BUILD_DIR}/zb_fuse_client" \
     --mds="127.0.0.1:${MDS_PORT}" \
     --scheduler="127.0.0.1:${SCHEDULER_PORT}" \
     --timeout_ms=30000 \
     --bootstrap_tier_dirs=true \
     --real_dir_name="${REAL_DIR_NAME}" \
     --virtual_dir_name="${VIRTUAL_DIR_NAME}" \
-    -- "${MOUNT_POINT}" -f >"${fuse_log}" 2>&1 &
-  write_pid "fuse" "$!"
+    -- "${MOUNT_POINT}" -f)"
+  write_pid "fuse" "${fuse_pid}"
   sleep 3
+  if ! is_pid_alive "${fuse_pid}"; then
+    log "[ERROR] fuse client exited before becoming ready. See log: ${fuse_log}"
+    tail -n 20 "${fuse_log}" || true
+    exit 1
+  fi
+  if command -v mountpoint >/dev/null 2>&1 && ! mountpoint -q "${MOUNT_POINT}"; then
+    log "[ERROR] fuse client did not mount ${MOUNT_POINT}. See log: ${fuse_log}"
+    tail -n 20 "${fuse_log}" || true
+    exit 1
+  fi
   log "[OK] fuse client started mount=${MOUNT_POINT}"
   log "[INFO] logs=${LOG_DIR}"
   log "[INFO] online topology: real_nodes=1 virtual_nodes=${VIRTUAL_NODE_COUNT} real_disks_per_node=${REAL_DISK_COUNT} virtual_disks_per_pool=${VIRTUAL_DISK_COUNT} disk_capacity_bytes=${ONLINE_DISK_CAPACITY_BYTES}"
 }
 
 stop_all() {
-  if command -v fusermount3 >/dev/null 2>&1; then
-    fusermount3 -u "${MOUNT_POINT}" >/dev/null 2>&1 || true
-  elif command -v fusermount >/dev/null 2>&1; then
-    fusermount -u "${MOUNT_POINT}" >/dev/null 2>&1 || true
-  else
-    umount "${MOUNT_POINT}" >/dev/null 2>&1 || true
-  fi
+  unmount_fuse
   stop_by_name "fuse"
   stop_by_name "mds"
   stop_by_name "virtual_node"

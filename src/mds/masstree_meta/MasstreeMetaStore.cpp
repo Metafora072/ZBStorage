@@ -9,6 +9,7 @@
 #include <string_view>
 
 #include "MasstreeInodeRecordCodec.h"
+#include "MasstreeOpticalLayoutTranslator.h"
 #include "MasstreeOpticalProfile.h"
 #include "MasstreePageReader.h"
 
@@ -330,6 +331,43 @@ bool BuildMasstreeOpticalFileLocation(const UnifiedInodeRecord& inode,
     if (error) {
         error->clear();
     }
+    return true;
+}
+
+bool ConvertLegacyOpticalLocationToCurrent(UnifiedInodeRecord* inode, std::string* error) {
+    if (!inode || inode->storage_tier != static_cast<uint8_t>(UnifiedStorageTier::kOptical)) {
+        return true;
+    }
+    if (inode->optical_node_id > std::numeric_limits<uint32_t>::max() ||
+        inode->optical_disk_id > std::numeric_limits<uint32_t>::max()) {
+        if (error) {
+            *error = "legacy masstree optical location ids exceed supported range";
+        }
+        return false;
+    }
+
+    const MasstreeOpticalLayoutTranslator translator;
+    uint32_t node_index = 0;
+    uint32_t disk_index = 0;
+    uint32_t image_index_in_disk = 0;
+    if (!translator.TranslateLegacyToActive(static_cast<uint32_t>(inode->optical_node_id),
+                                            static_cast<uint32_t>(inode->optical_disk_id),
+                                            inode->optical_image_id,
+                                            &node_index,
+                                            &disk_index,
+                                            &image_index_in_disk,
+                                            error)) {
+        if (error) {
+            *error = "failed to convert legacy masstree optical location";
+        }
+        return false;
+    }
+    inode->optical_node_id = node_index;
+    inode->optical_disk_id = disk_index;
+    inode->optical_image_id = image_index_in_disk;
+    inode->storage_loc0 = inode->optical_node_id;
+    inode->storage_loc1 = (inode->optical_disk_id << 32U) |
+                          static_cast<uint64_t>(inode->optical_image_id);
     return true;
 }
 
@@ -899,6 +937,10 @@ bool MasstreeMetaStore::ReadUnifiedInode(const LoadedGeneration& generation,
         return false;
     }
     *inode = record.inode;
+    if (generation.manifest->optical_layout_version != MasstreeOpticalProfile::kUniform2TbLayoutName &&
+        !ConvertLegacyOpticalLocationToCurrent(inode, error)) {
+        return false;
+    }
     if (error) {
         error->clear();
     }

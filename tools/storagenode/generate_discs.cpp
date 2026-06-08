@@ -12,7 +12,7 @@
 namespace {
 
 constexpr int kBatchSize = 100000;
-constexpr int kDiscsPerLibrary = 20000;
+constexpr int kDiscsPerLibrary = 10000;
 
 } // namespace
 
@@ -48,7 +48,7 @@ int main(int argc, char** argv) {
             char id_buf[32];
             char lib_buf[16];
             std::snprintf(id_buf, sizeof(id_buf), "disc_%05d%05d", batch, i);
-            int lib_idx = written_total / kDiscsPerLibrary; // 每 20000 张分配一个库
+            int lib_idx = written_total / kDiscsPerLibrary; // 每 10000 张分配一个库
             std::snprintf(lib_buf, sizeof(lib_buf), "lib_%05d", lib_idx);
 
             zb::storagenode::OpticalDiscBin disc{};

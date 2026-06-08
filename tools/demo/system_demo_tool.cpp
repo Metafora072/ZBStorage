@@ -2092,7 +2092,7 @@ private:
         const std::unordered_set<std::string> supported_args = {
             "op",          "disc_dir",       "delta_path",   "disc_id",       "device_id",
             "library_id",  "capacity_bytes", "status",       "write_mbps",     "read_mbps",
-            "offset",      "limit",          "detail",
+            "offset",      "limit",          "detail",       "profile",        "target",
         };
         for (const auto& item : command.args) {
             if (supported_args.count(item.first) == 0) {
@@ -2108,7 +2108,17 @@ private:
             const auto it = command.args.find(key);
             return it == command.args.end() ? fallback : it->second;
         };
-        const std::string op = ToLowerCopy(argument("op", "stats"));
+        std::string op = ToLowerCopy(argument("op", "stats"));
+        std::string target = ToLowerCopy(argument("target"));
+        if (op == "add" || op == "delete") {
+            if (target.empty()) {
+                target = "disc";
+            }
+            if (target != "disc" && target != "library") {
+                std::cerr << "target \u53ea\u652f\u6301 disc|library\n";
+                return false;
+            }
+        }
         if (op == "stats") {
             return PrintMetadataOpticalDiscUsage();
         }
@@ -2191,6 +2201,73 @@ private:
             return true;
         }
 
+        if (op == "add" && target == "library") {
+            std::string library_id = argument("library_id");
+            if (library_id.empty() && !catalog.NextAddedLibraryId(&library_id, &error)) {
+                std::cerr << "\u751f\u6210\u65b0\u5149\u76d8\u5e93ID\u5931\u8d25: " << error << '\n';
+                return false;
+            }
+            const std::string profile = argument("profile", "legacy_mixed_v1");
+            if (profile != "legacy_mixed_v1") {
+                std::cerr << "op=add target=library \u5f53\u524d\u53ea\u652f\u6301 profile=legacy_mixed_v1\n";
+                return false;
+            }
+            zb::storagenode::LibraryLayoutDelta library;
+            library.library_id = library_id;
+            library.profile = "legacy_mixed_v1";
+            library.disc_count = 10000ULL;
+            library.small_disc_count = 9000ULL;
+            library.small_disc_capacity_bytes = 1000000000000ULL;
+            library.large_disc_count = 1000ULL;
+            library.large_disc_capacity_bytes = 10000000000000ULL;
+            if (!catalog.AddLibrary(library, &error)) {
+                std::cerr << "\u65b0\u589e\u5149\u76d8\u5e93\u5931\u8d25: " << error << '\n';
+                return false;
+            }
+            zb::storagenode::LibraryUsageView usage;
+            if (!catalog.GetLibraryUsage(library_id, &usage, &error)) {
+                std::cerr << "\u67e5\u8be2\u65b0\u589e\u5149\u76d8\u5e93\u5931\u8d25: " << error << '\n';
+                return false;
+            }
+            std::cout << "\u5149\u76d8\u5e93\u5df2\u65b0\u589e=true\n";
+            std::cout << "\u5149\u76d8\u5e93ID=" << library_id << '\n';
+            std::cout << "\u65b0\u589e\u5149\u76d8\u6570\u91cf=" << library.disc_count << '\n';
+            std::cout << "1TB\u5149\u76d8\u6570\u91cf=" << library.small_disc_count << '\n';
+            std::cout << "10TB\u5149\u76d8\u6570\u91cf=" << library.large_disc_count << '\n';
+            std::cout << "\u65b0\u589e\u5bb9\u91cf\u5b57\u8282="
+                      << FormatDecimalBytesWithHuman(usage.total_bytes) << '\n';
+            PrintOpticalLibraryUsage(usage);
+            return true;
+        }
+
+        if (op == "delete" && target == "library") {
+            const std::string library_id = argument("library_id");
+            if (library_id.empty()) {
+                std::cerr << "op=delete target=library \u9700\u8981 library_id\n";
+                return false;
+            }
+            zb::storagenode::LibraryUsageView usage;
+            if (!catalog.GetLibraryUsage(library_id, &usage, &error)) {
+                std::cerr << "\u67e5\u8be2\u5149\u76d8\u5e93\u4f7f\u7528\u60c5\u51b5\u5931\u8d25: "
+                          << error << '\n';
+                return false;
+            }
+            if (usage.disc_count == 0) {
+                std::cerr << "\u672a\u627e\u5230\u5149\u76d8\u5e93: " << library_id << '\n';
+                return false;
+            }
+            if (!catalog.DeleteLibrary(library_id, &error)) {
+                std::cerr << "\u5220\u9664\u5149\u76d8\u5e93\u5931\u8d25: " << error << '\n';
+                return false;
+            }
+            std::cout << "\u5149\u76d8\u5e93\u5df2\u5220\u9664=true\n";
+            std::cout << "\u5149\u76d8\u5e93ID=" << library_id << '\n';
+            std::cout << "\u5220\u9664\u5149\u76d8\u6570\u91cf=" << usage.disc_count << '\n';
+            std::cout << "\u5220\u9664\u5bb9\u91cf\u5b57\u8282="
+                      << FormatDecimalBytesWithHuman(usage.total_bytes) << '\n';
+            return true;
+        }
+
         const std::string disc_id = argument("disc_id", argument("device_id"));
         if (op == "get") {
             const std::string library_id = argument("library_id");
@@ -2256,10 +2333,10 @@ private:
             return true;
         }
 
-        if (op == "add") {
+        if (op == "add" && target == "disc") {
             const std::string library_id = argument("library_id");
             if (library_id.empty()) {
-                std::cerr << "op=add \u9700\u8981 library_id\n";
+                std::cerr << "op=add target=disc \u9700\u8981 library_id\n";
                 return false;
             }
             std::string new_disc_id = disc_id;
@@ -2319,10 +2396,10 @@ private:
             return true;
         }
 
-        if (op == "delete") {
+        if (op == "delete" && target == "disc") {
             const std::string library_id = argument("library_id");
             if (library_id.empty() || disc_id.empty()) {
-                std::cerr << "op=delete \u9700\u8981 library_id \u548c disc_id\n";
+                std::cerr << "op=delete target=disc \u9700\u8981 library_id \u548c disc_id\n";
                 return false;
             }
             zb::storagenode::DiscUsageView usage;
@@ -2378,8 +2455,8 @@ private:
                             {"query", "p5"}});
         actions_.push_back({"6",
                             "\u5149\u76d8\u7ba1\u7406",
-                            "\u8f93\u51fa\u5149\u76d8\u5e93\u7edf\u8ba1\uff0c\u5e76\u652f\u6301\u67e5\u8be2\u3001\u6dfb\u52a0\u548c\u5220\u9664\u5149\u76d8",
-                            "6 [op=stats|inventory_stats|get|list|add|delete] [library_id=<id>] [disc_id=<id>]",
+                            "\u8f93\u51fa\u5149\u76d8\u5e93\u7edf\u8ba1\uff0c\u5e76\u652f\u6301\u67e5\u8be2\u3001\u6dfb\u52a0\u548c\u5220\u9664\u5149\u76d8/\u5149\u76d8\u5e93",
+                            "6 [op=stats|inventory_stats|get|list|add|delete] [target=disc|library] [library_id=<id>] [disc_id=<id>]",
                             {"optical", "disc"}});
         actions_.push_back({"q", "\u9000\u51fa", "\u9000\u51fa\u6f14\u793a\u63a7\u5236\u53f0", "q", {"\u9000\u51fa", "exit"}});
     }
@@ -2601,8 +2678,10 @@ private:
         out << "  6 op=inventory_stats\n";
         out << "  6 op=get library_id=lib_00000\n";
         out << "  6 op=get library_id=lib_00000 disc_id=disc_0000008999\n";
-        out << "  6 op=add library_id=lib_00000\n";
-        out << "  6 op=delete library_id=lib_00000 disc_id=disc_extra_0000000001\n";
+        out << "  6 op=add target=library\n";
+        out << "  6 op=delete target=library library_id=libx_000001\n";
+        out << "  6 op=add target=disc library_id=lib_09999 capacity_bytes=1000000000000\n";
+        out << "  6 op=delete target=disc library_id=lib_09999 disc_id=disc_extra_0000000001\n";
         return out.str();
     }
     bool ApplyCommandArgs(const zb::demo::ParsedCommand& command, std::string* error) {

@@ -19,6 +19,12 @@ namespace {
 
 constexpr char kDeltaHeader[] = "optical_disc_catalog_delta_v1";
 constexpr std::size_t kReadBufferRecords = 8192;
+constexpr const char* kLegacyMixedProfileName = "legacy_mixed_v1";
+constexpr std::uint64_t kLibraryDiscCount = 10000ULL;
+constexpr std::uint64_t kLibrarySmallDiscCount = 9000ULL;
+constexpr std::uint64_t kLibraryLargeDiscCount = 1000ULL;
+constexpr std::uint64_t kSmallDiscCapacityBytes = 1000000000000ULL;
+constexpr std::uint64_t kLargeDiscCapacityBytes = 10000000000000ULL;
 
 std::vector<std::string> SplitTabs(const std::string& line) {
     std::vector<std::string> fields;
@@ -73,6 +79,8 @@ bool IsValidIdentifier(const std::string& value) {
     });
 }
 
+std::string FormatLibraryDiscId(const std::string& library_id, std::uint64_t disc_index);
+
 OpticalDiscBin NormalizeBaselineDisc(OpticalDiscBin disc) {
     if (disc.capacity == 0) {
         disc.capacity = kDefaultOpticalDiscCapacityBytes;
@@ -124,6 +132,20 @@ void AddStatistics(const OpticalDiscBin& disc, DiscStatistics* statistics) {
     statistics->total_read_throughput_MBps += disc.read_throughput_MBps;
 }
 
+void AddLibraryStatistics(const LibraryLayoutDelta& library, DiscStatistics* statistics) {
+    statistics->disc_count += library.disc_count;
+    statistics->capacity_bytes +=
+        static_cast<long double>(library.small_disc_count) *
+            static_cast<long double>(library.small_disc_capacity_bytes) +
+        static_cast<long double>(library.large_disc_count) *
+            static_cast<long double>(library.large_disc_capacity_bytes);
+    statistics->status_counts[static_cast<std::size_t>(DiscStatus::Blank)] += library.disc_count;
+    statistics->total_write_throughput_MBps +=
+        static_cast<long double>(library.disc_count) * kDefaultOpticalDiscWriteMbps;
+    statistics->total_read_throughput_MBps +=
+        static_cast<long double>(library.disc_count) * kDefaultOpticalDiscReadMbps;
+}
+
 bool BuildDiscFromFields(const std::vector<std::string>& fields, OpticalDiscBin* disc, std::string* error) {
     if (!disc || fields.size() != 7) {
         if (error) {
@@ -150,6 +172,93 @@ bool BuildDiscFromFields(const std::vector<std::string>& fields, OpticalDiscBin*
     return true;
 }
 
+bool ValidateLibraryLayout(const LibraryLayoutDelta& library, std::string* error) {
+    if (!IsValidIdentifier(library.library_id) || library.library_id.size() >= sizeof(OpticalDiscBin::library_id)) {
+        if (error) {
+            *error = "invalid library_id or library_id is too long: " + library.library_id;
+        }
+        return false;
+    }
+    if (library.profile != kLegacyMixedProfileName) {
+        if (error) {
+            *error = "unsupported library profile: " + library.profile;
+        }
+        return false;
+    }
+    if (library.disc_count == 0 ||
+        library.small_disc_count + library.large_disc_count != library.disc_count ||
+        library.small_disc_capacity_bytes == 0 || library.large_disc_capacity_bytes == 0) {
+        if (error) {
+            *error = "invalid library layout for: " + library.library_id;
+        }
+        return false;
+    }
+    return true;
+}
+
+std::uint64_t LibraryDiscCapacityBytes(const LibraryLayoutDelta& library, std::uint64_t disc_index) {
+    return disc_index < library.small_disc_count
+               ? library.small_disc_capacity_bytes
+               : library.large_disc_capacity_bytes;
+}
+
+OpticalDiscBin BuildLibraryDisc(const LibraryLayoutDelta& library, std::uint64_t disc_index) {
+    OpticalDiscBin disc{};
+    std::string error;
+    SetFixedString(disc.device_id, sizeof(disc.device_id), FormatLibraryDiscId(library.library_id, disc_index), &error);
+    SetFixedString(disc.library_id, sizeof(disc.library_id), library.library_id, &error);
+    disc.capacity = LibraryDiscCapacityBytes(library, disc_index);
+    disc.status = DiscStatus::Blank;
+    disc.write_throughput_MBps = kDefaultOpticalDiscWriteMbps;
+    disc.read_throughput_MBps = kDefaultOpticalDiscReadMbps;
+    return disc;
+}
+
+#if defined(__SIZEOF_INT128__)
+unsigned __int128 LibraryCapacityBytesU128(const LibraryLayoutDelta& library) {
+    return static_cast<unsigned __int128>(library.small_disc_count) *
+               static_cast<unsigned __int128>(library.small_disc_capacity_bytes) +
+           static_cast<unsigned __int128>(library.large_disc_count) *
+               static_cast<unsigned __int128>(library.large_disc_capacity_bytes);
+}
+#else
+long double LibraryCapacityBytesLongDouble(const LibraryLayoutDelta& library) {
+    return static_cast<long double>(library.small_disc_count) *
+               static_cast<long double>(library.small_disc_capacity_bytes) +
+           static_cast<long double>(library.large_disc_count) *
+               static_cast<long double>(library.large_disc_capacity_bytes);
+}
+#endif
+
+bool BuildLibraryFromFields(const std::vector<std::string>& fields,
+                            LibraryLayoutDelta* library,
+                            std::string* error) {
+    if (!library || fields.size() != 8) {
+        if (error) {
+            *error = "invalid ADD_LIBRARY delta record";
+        }
+        return false;
+    }
+    LibraryLayoutDelta parsed;
+    parsed.library_id = fields[1];
+    parsed.profile = fields[2];
+    if (!ParseUint64(fields[3], &parsed.disc_count) ||
+        !ParseUint64(fields[4], &parsed.small_disc_count) ||
+        !ParseUint64(fields[5], &parsed.small_disc_capacity_bytes) ||
+        !ParseUint64(fields[6], &parsed.large_disc_count) ||
+        !ParseUint64(fields[7], &parsed.large_disc_capacity_bytes)) {
+        if (error) {
+            *error = "invalid ADD_LIBRARY delta fields";
+        }
+        return false;
+    }
+    if (!ValidateLibraryLayout(parsed, error)) {
+        return false;
+    }
+    *library = parsed;
+    return true;
+}
+
 std::string AddDeltaLine(const OpticalDiscBin& disc) {
     std::ostringstream out;
     out << "ADD\t" << FixedString(disc.device_id, sizeof(disc.device_id))
@@ -158,6 +267,18 @@ std::string AddDeltaLine(const OpticalDiscBin& disc) {
         << '\t' << DiscStatusName(disc.status)
         << '\t' << disc.write_throughput_MBps
         << '\t' << disc.read_throughput_MBps;
+    return out.str();
+}
+
+std::string AddLibraryDeltaLine(const LibraryLayoutDelta& library) {
+    std::ostringstream out;
+    out << "ADD_LIBRARY\t" << library.library_id
+        << '\t' << library.profile
+        << '\t' << library.disc_count
+        << '\t' << library.small_disc_count
+        << '\t' << library.small_disc_capacity_bytes
+        << '\t' << library.large_disc_count
+        << '\t' << library.large_disc_capacity_bytes;
     return out.str();
 }
 
@@ -213,6 +334,56 @@ bool ParseExtraDiscId(const std::string& device_id, std::uint64_t* sequence) {
 std::string FormatExtraDiscId(std::uint64_t sequence) {
     std::ostringstream out;
     out << "disc_extra_" << std::setw(10) << std::setfill('0') << sequence;
+    return out.str();
+}
+
+bool ParseExtraLibraryId(const std::string& library_id, std::uint64_t* sequence) {
+    constexpr const char* kPrefix = "libx_";
+    constexpr std::size_t kPrefixSize = 5;
+    constexpr std::size_t kDigitsSize = 6;
+    if (!sequence || library_id.size() != kPrefixSize + kDigitsSize ||
+        library_id.compare(0, kPrefixSize, kPrefix) != 0) {
+        return false;
+    }
+    const std::string digits = library_id.substr(kPrefixSize);
+    if (!std::all_of(digits.begin(), digits.end(), [](unsigned char ch) { return std::isdigit(ch) != 0; })) {
+        return false;
+    }
+    *sequence = static_cast<std::uint64_t>(std::stoull(digits));
+    return true;
+}
+
+std::string FormatExtraLibraryId(std::uint64_t sequence) {
+    std::ostringstream out;
+    out << "libx_" << std::setw(6) << std::setfill('0') << sequence;
+    return out.str();
+}
+
+bool ParseLibraryDiscId(const std::string& device_id,
+                        std::string* library_id,
+                        std::uint64_t* disc_index) {
+    constexpr const char* kPrefix = "disc_";
+    constexpr std::size_t kPrefixSize = 5;
+    constexpr std::size_t kDigitsSize = 5;
+    if (!library_id || !disc_index || device_id.rfind(kPrefix, 0) != 0) {
+        return false;
+    }
+    const std::size_t sep = device_id.rfind('_');
+    if (sep == std::string::npos || sep <= kPrefixSize || device_id.size() - sep - 1 != kDigitsSize) {
+        return false;
+    }
+    const std::string digits = device_id.substr(sep + 1);
+    if (!std::all_of(digits.begin(), digits.end(), [](unsigned char ch) { return std::isdigit(ch) != 0; })) {
+        return false;
+    }
+    *library_id = device_id.substr(kPrefixSize, sep - kPrefixSize);
+    *disc_index = static_cast<std::uint64_t>(std::stoull(digits));
+    return IsValidIdentifier(*library_id);
+}
+
+std::string FormatLibraryDiscId(const std::string& library_id, std::uint64_t disc_index) {
+    std::ostringstream out;
+    out << "disc_" << library_id << "_" << std::setw(5) << std::setfill('0') << disc_index;
     return out.str();
 }
 
@@ -311,6 +482,8 @@ bool OpticalDiscCatalog::Load(CatalogLoadResult* result, std::string* error) {
     batch_path_by_index_.clear();
     added_discs_.clear();
     deleted_discs_.clear();
+    added_libraries_.clear();
+    deleted_libraries_.clear();
     skipped_batch_file_count_ = 0;
     delta_operation_count_ = 0;
     if (!CollectBatchFiles(error) || !ReplayDeltaLog(error)) {
@@ -418,6 +591,19 @@ bool OpticalDiscCatalog::ReplayDeltaLog(std::string* error) {
         } else if (fields[0] == "DELETE" && fields.size() == 2 && IsValidIdentifier(fields[1])) {
             added_discs_.erase(fields[1]);
             deleted_discs_.insert(fields[1]);
+        } else if (fields[0] == "ADD_LIBRARY") {
+            LibraryLayoutDelta library;
+            if (!BuildLibraryFromFields(fields, &library, error)) {
+                if (error) {
+                    *error += " at delta line " + std::to_string(line_number);
+                }
+                return false;
+            }
+            added_libraries_[library.library_id] = library;
+            deleted_libraries_.erase(library.library_id);
+        } else if (fields[0] == "DELETE_LIBRARY" && fields.size() == 2 && IsValidIdentifier(fields[1])) {
+            added_libraries_.erase(fields[1]);
+            deleted_libraries_.insert(fields[1]);
         } else {
             if (error) {
                 *error = "invalid delta operation at line " + std::to_string(line_number);
@@ -494,12 +680,12 @@ bool OpticalDiscCatalog::ComputeStatistics(DiscStatistics* global,
             return false;
         }
         const std::string id = FixedString(disc.device_id, sizeof(disc.device_id));
-        if (deleted_discs_.count(id) != 0) {
-            return true;
-        }
         OpticalDiscBin effective_disc = disc;
         ApplyUsageOverlay(&effective_disc);
         const std::string library_id = FixedString(effective_disc.library_id, sizeof(effective_disc.library_id));
+        if (deleted_discs_.count(id) != 0 || deleted_libraries_.count(library_id) != 0) {
+            return true;
+        }
         AddStatistics(effective_disc, global);
         AddStatistics(effective_disc, &by_library[library_id]);
         return true;
@@ -516,8 +702,19 @@ bool OpticalDiscCatalog::ComputeStatistics(DiscStatistics* global,
     for (const auto& item : added_discs_) {
         OpticalDiscBin effective_disc = item.second;
         ApplyUsageOverlay(&effective_disc);
+        const std::string library_id = FixedString(effective_disc.library_id, sizeof(effective_disc.library_id));
+        if (deleted_libraries_.count(library_id) != 0) {
+            continue;
+        }
         AddStatistics(effective_disc, global);
-        AddStatistics(effective_disc, &by_library[FixedString(effective_disc.library_id, sizeof(effective_disc.library_id))]);
+        AddStatistics(effective_disc, &by_library[library_id]);
+    }
+    for (const auto& item : added_libraries_) {
+        if (deleted_libraries_.count(item.first) != 0) {
+            continue;
+        }
+        AddLibraryStatistics(item.second, global);
+        AddLibraryStatistics(item.second, &by_library[item.first]);
     }
     libraries->clear();
     libraries->reserve(by_library.size());
@@ -576,6 +773,120 @@ bool OpticalDiscCatalog::FindBaselineDisc(const std::string& device_id,
     return true;
 }
 
+bool OpticalDiscCatalog::FindBaselineLibrary(const std::string& library_id,
+                                             bool* found,
+                                             std::string* error) const {
+    if (!found || !IsValidIdentifier(library_id)) {
+        if (error) {
+            *error = "invalid library_id: " + library_id;
+        }
+        return false;
+    }
+    *found = false;
+    return ScanBaseline([&](const OpticalDiscBin& disc) {
+        if (FixedString(disc.library_id, sizeof(disc.library_id)) == library_id) {
+            *found = true;
+            return false;
+        }
+        return true;
+    }, error);
+}
+
+bool OpticalDiscCatalog::ComputeBaselineLibraryUsage(const std::string& library_id,
+                                                     LibraryUsageView* usage,
+                                                     std::string* error) const {
+    if (!usage || !IsValidIdentifier(library_id)) {
+        if (error) {
+            *error = "invalid library_id: " + library_id;
+        }
+        return false;
+    }
+    *usage = {};
+    usage->library_id = library_id;
+#if defined(__SIZEOF_INT128__)
+    unsigned __int128 total_bytes = 0;
+    unsigned __int128 used_bytes = 0;
+#else
+    long double total_bytes = 0;
+    long double used_bytes = 0;
+#endif
+    bool invalid_record = false;
+    const bool scan_ok = ScanBaseline([&](const OpticalDiscBin& disc) {
+        if (!IsValidDiscStatus(disc.status)) {
+            invalid_record = true;
+            return false;
+        }
+        OpticalDiscBin effective_disc = disc;
+        ApplyUsageOverlay(&effective_disc);
+        if (FixedString(effective_disc.library_id, sizeof(effective_disc.library_id)) != library_id) {
+            return true;
+        }
+        const std::uint64_t used = EstimateUsedBytes(effective_disc);
+        ++usage->disc_count;
+        ++usage->status_counts[static_cast<std::size_t>(effective_disc.status)];
+        total_bytes += effective_disc.capacity;
+        used_bytes += used;
+        return true;
+    }, error);
+    if (!scan_ok) {
+        return false;
+    }
+    if (invalid_record) {
+        if (error) {
+            *error = "invalid disc status found in baseline batch files";
+        }
+        return false;
+    }
+#if defined(__SIZEOF_INT128__)
+    const unsigned __int128 free_bytes = total_bytes > used_bytes ? total_bytes - used_bytes : 0;
+    usage->total_bytes = UInt128ToString(total_bytes);
+    usage->used_bytes = UInt128ToString(used_bytes);
+    usage->free_bytes = UInt128ToString(free_bytes);
+#else
+    const long double free_bytes = total_bytes > used_bytes ? total_bytes - used_bytes : 0;
+    usage->total_bytes = std::to_string(static_cast<std::uint64_t>(total_bytes));
+    usage->used_bytes = std::to_string(static_cast<std::uint64_t>(used_bytes));
+    usage->free_bytes = std::to_string(static_cast<std::uint64_t>(free_bytes));
+#endif
+    if (error) {
+        error->clear();
+    }
+    return true;
+}
+
+bool OpticalDiscCatalog::FindAddedLibraryDisc(const std::string& device_id,
+                                              OpticalDiscBin* disc,
+                                              bool* found,
+                                              std::string* error) const {
+    if (!found || !IsValidIdentifier(device_id)) {
+        if (error) {
+            *error = "invalid device_id: " + device_id;
+        }
+        return false;
+    }
+    *found = false;
+    std::string library_id;
+    std::uint64_t disc_index = 0;
+    if (!ParseLibraryDiscId(device_id, &library_id, &disc_index)) {
+        return true;
+    }
+    if (deleted_libraries_.count(library_id) != 0) {
+        return true;
+    }
+    const auto library_it = added_libraries_.find(library_id);
+    if (library_it == added_libraries_.end() || disc_index >= library_it->second.disc_count) {
+        return true;
+    }
+    if (disc) {
+        *disc = BuildLibraryDisc(library_it->second, disc_index);
+    }
+    *found = true;
+    if (error) {
+        error->clear();
+    }
+    return true;
+}
+
 bool OpticalDiscCatalog::GetDisc(const std::string& device_id,
                                  OpticalDiscBin* disc,
                                  bool* found,
@@ -592,6 +903,9 @@ bool OpticalDiscCatalog::GetDisc(const std::string& device_id,
     }
     const auto added_it = added_discs_.find(device_id);
     if (added_it != added_discs_.end()) {
+        if (deleted_libraries_.count(FixedString(added_it->second.library_id, sizeof(added_it->second.library_id))) != 0) {
+            return true;
+        }
         if (disc) {
             *disc = added_it->second;
             ApplyUsageOverlay(disc);
@@ -599,7 +913,19 @@ bool OpticalDiscCatalog::GetDisc(const std::string& device_id,
         *found = true;
         return true;
     }
-    return FindBaselineDisc(device_id, disc, found, error);
+    if (!FindAddedLibraryDisc(device_id, disc, found, error)) {
+        return false;
+    }
+    if (*found) {
+        return true;
+    }
+    if (!FindBaselineDisc(device_id, disc, found, error)) {
+        return false;
+    }
+    if (*found && disc && deleted_libraries_.count(FixedString(disc->library_id, sizeof(disc->library_id))) != 0) {
+        *found = false;
+    }
+    return true;
 }
 
 bool OpticalDiscCatalog::ListDiscs(const std::string& library_id,
@@ -619,7 +945,8 @@ bool OpticalDiscCatalog::ListDiscs(const std::string& library_id,
     if (!ScanBaseline([&](const OpticalDiscBin& disc) {
             OpticalDiscBin effective_disc = disc;
             ApplyUsageOverlay(&effective_disc);
-            if (FixedString(effective_disc.library_id, sizeof(effective_disc.library_id)) != library_id ||
+            if (deleted_libraries_.count(FixedString(effective_disc.library_id, sizeof(effective_disc.library_id))) != 0 ||
+                FixedString(effective_disc.library_id, sizeof(effective_disc.library_id)) != library_id ||
                 deleted_discs_.count(FixedString(effective_disc.device_id, sizeof(effective_disc.device_id))) != 0) {
                 return true;
             }
@@ -638,7 +965,8 @@ bool OpticalDiscCatalog::ListDiscs(const std::string& library_id,
     for (const auto& item : added_discs_) {
         OpticalDiscBin effective_disc = item.second;
         ApplyUsageOverlay(&effective_disc);
-        if (FixedString(effective_disc.library_id, sizeof(effective_disc.library_id)) == library_id) {
+        if (deleted_libraries_.count(FixedString(effective_disc.library_id, sizeof(effective_disc.library_id))) == 0 &&
+            FixedString(effective_disc.library_id, sizeof(effective_disc.library_id)) == library_id) {
             additions.push_back(effective_disc);
         }
     }
@@ -648,6 +976,14 @@ bool OpticalDiscCatalog::ListDiscs(const std::string& library_id,
     for (const auto& disc : additions) {
         if (matched++ >= offset && discs->size() < limit) {
             discs->push_back(disc);
+        }
+    }
+    const auto library_it = added_libraries_.find(library_id);
+    if (library_it != added_libraries_.end() && deleted_libraries_.count(library_id) == 0) {
+        for (std::uint64_t i = 0; i < library_it->second.disc_count && discs->size() < limit; ++i) {
+            if (matched++ >= offset) {
+                discs->push_back(BuildLibraryDisc(library_it->second, i));
+            }
         }
     }
     return true;
@@ -717,8 +1053,10 @@ bool OpticalDiscCatalog::GetLibraryUsage(const std::string& library_id,
         OpticalDiscBin effective_disc = disc;
         ApplyUsageOverlay(&effective_disc);
         const std::string id = FixedString(effective_disc.device_id, sizeof(effective_disc.device_id));
+        const std::string effective_library_id = FixedString(effective_disc.library_id, sizeof(effective_disc.library_id));
         if (deleted_discs_.count(id) != 0 ||
-            FixedString(effective_disc.library_id, sizeof(effective_disc.library_id)) != library_id) {
+            deleted_libraries_.count(effective_library_id) != 0 ||
+            effective_library_id != library_id) {
             return true;
         }
         const std::uint64_t used = EstimateUsedBytes(effective_disc);
@@ -740,7 +1078,8 @@ bool OpticalDiscCatalog::GetLibraryUsage(const std::string& library_id,
     for (const auto& item : added_discs_) {
         OpticalDiscBin effective_disc = item.second;
         ApplyUsageOverlay(&effective_disc);
-        if (FixedString(effective_disc.library_id, sizeof(effective_disc.library_id)) != library_id) {
+        const std::string effective_library_id = FixedString(effective_disc.library_id, sizeof(effective_disc.library_id));
+        if (deleted_libraries_.count(effective_library_id) != 0 || effective_library_id != library_id) {
             continue;
         }
         const std::uint64_t used = EstimateUsedBytes(effective_disc);
@@ -748,6 +1087,16 @@ bool OpticalDiscCatalog::GetLibraryUsage(const std::string& library_id,
         ++usage->status_counts[static_cast<std::size_t>(effective_disc.status)];
         total_bytes += effective_disc.capacity;
         used_bytes += used;
+    }
+    const auto library_it = added_libraries_.find(library_id);
+    if (library_it != added_libraries_.end() && deleted_libraries_.count(library_id) == 0) {
+        usage->disc_count += library_it->second.disc_count;
+        usage->status_counts[static_cast<std::size_t>(DiscStatus::Blank)] += library_it->second.disc_count;
+#if defined(__SIZEOF_INT128__)
+        total_bytes += LibraryCapacityBytesU128(library_it->second);
+#else
+        total_bytes += LibraryCapacityBytesLongDouble(library_it->second);
+#endif
     }
 #if defined(__SIZEOF_INT128__)
     const unsigned __int128 free_bytes = total_bytes > used_bytes ? total_bytes - used_bytes : 0;
@@ -781,8 +1130,22 @@ bool OpticalDiscCatalog::ComputeCapacityAdjustment(DiscCapacityAdjustment* adjus
     long double capacity_delta = 0;
 #endif
     for (const auto& item : added_discs_) {
+        if (deleted_libraries_.count(FixedString(item.second.library_id, sizeof(item.second.library_id))) != 0) {
+            continue;
+        }
         ++adjustment->disc_delta_count;
         capacity_delta += item.second.capacity;
+    }
+    for (const auto& item : added_libraries_) {
+        if (deleted_libraries_.count(item.first) != 0) {
+            continue;
+        }
+        adjustment->disc_delta_count += static_cast<std::int64_t>(item.second.disc_count);
+#if defined(__SIZEOF_INT128__)
+        capacity_delta += static_cast<__int128>(LibraryCapacityBytesU128(item.second));
+#else
+        capacity_delta += LibraryCapacityBytesLongDouble(item.second);
+#endif
     }
     for (const auto& id : deleted_discs_) {
         OpticalDiscBin baseline{};
@@ -793,8 +1156,32 @@ bool OpticalDiscCatalog::ComputeCapacityAdjustment(DiscCapacityAdjustment* adjus
         if (!found) {
             continue;
         }
+        if (deleted_libraries_.count(FixedString(baseline.library_id, sizeof(baseline.library_id))) != 0) {
+            continue;
+        }
         --adjustment->disc_delta_count;
         capacity_delta -= baseline.capacity;
+    }
+    for (const auto& library_id : deleted_libraries_) {
+        LibraryUsageView baseline_usage;
+        if (!ComputeBaselineLibraryUsage(library_id, &baseline_usage, error)) {
+            return false;
+        }
+        if (baseline_usage.disc_count == 0) {
+            continue;
+        }
+        adjustment->disc_delta_count -= static_cast<std::int64_t>(baseline_usage.disc_count);
+#if defined(__SIZEOF_INT128__)
+        __int128 baseline_capacity = 0;
+        for (char ch : baseline_usage.total_bytes) {
+            if (ch >= '0' && ch <= '9') {
+                baseline_capacity = baseline_capacity * 10 + static_cast<int>(ch - '0');
+            }
+        }
+        capacity_delta -= baseline_capacity;
+#else
+        capacity_delta -= std::stold(baseline_usage.total_bytes);
+#endif
     }
 #if defined(__SIZEOF_INT128__)
     adjustment->capacity_delta_negative = capacity_delta < 0;
@@ -841,6 +1228,65 @@ bool OpticalDiscCatalog::NextAddedDiscId(std::string* device_id, std::string* er
         error->clear();
     }
     return true;
+}
+
+bool OpticalDiscCatalog::NextAddedLibraryId(std::string* library_id, std::string* error) const {
+    if (!library_id) {
+        if (error) {
+            *error = "library_id output is null";
+        }
+        return false;
+    }
+    std::uint64_t max_sequence = 0;
+    for (const auto& item : added_libraries_) {
+        std::uint64_t sequence = 0;
+        if (ParseExtraLibraryId(item.first, &sequence)) {
+            max_sequence = std::max(max_sequence, sequence);
+        }
+    }
+    for (const auto& id : deleted_libraries_) {
+        std::uint64_t sequence = 0;
+        if (ParseExtraLibraryId(id, &sequence)) {
+            max_sequence = std::max(max_sequence, sequence);
+        }
+    }
+    if (max_sequence >= 999999ULL) {
+        if (error) {
+            *error = "extra library id sequence is exhausted";
+        }
+        return false;
+    }
+    *library_id = FormatExtraLibraryId(max_sequence + 1);
+    if (error) {
+        error->clear();
+    }
+    return true;
+}
+
+bool OpticalDiscCatalog::LibraryExists(const std::string& library_id,
+                                       bool* exists,
+                                       std::string* error) const {
+    if (!exists || !IsValidIdentifier(library_id)) {
+        if (error) {
+            *error = "invalid library_id: " + library_id;
+        }
+        return false;
+    }
+    *exists = false;
+    if (deleted_libraries_.count(library_id) != 0) {
+        return true;
+    }
+    if (added_libraries_.count(library_id) != 0) {
+        *exists = true;
+        return true;
+    }
+    for (const auto& item : added_discs_) {
+        if (FixedString(item.second.library_id, sizeof(item.second.library_id)) == library_id) {
+            *exists = true;
+            return true;
+        }
+    }
+    return FindBaselineLibrary(library_id, exists, error);
 }
 
 void OpticalDiscCatalog::SetUsageOverlay(const DiscUsageOverlay& overlay) {
@@ -934,6 +1380,13 @@ bool OpticalDiscCatalog::AddDisc(const OpticalDiscBin& disc, std::string* error)
     if (!ValidateDisc(disc, error)) {
         return false;
     }
+    if (deleted_libraries_.count(FixedString(disc.library_id, sizeof(disc.library_id))) != 0) {
+        if (error) {
+            *error = "cannot add disc to deleted library: " +
+                     FixedString(disc.library_id, sizeof(disc.library_id));
+        }
+        return false;
+    }
     const std::string id = FixedString(disc.device_id, sizeof(disc.device_id));
     OpticalDiscBin existing{};
     bool found = false;
@@ -982,6 +1435,72 @@ bool OpticalDiscCatalog::DeleteDisc(const std::string& device_id, std::string* e
     }
     added_discs_.erase(device_id);
     deleted_discs_.insert(device_id);
+    ++delta_operation_count_;
+    return true;
+}
+
+bool OpticalDiscCatalog::AddLibrary(const LibraryLayoutDelta& library, std::string* error) {
+    if (!ValidateLibraryLayout(library, error)) {
+        return false;
+    }
+    bool baseline_exists = false;
+    if (!FindBaselineLibrary(library.library_id, &baseline_exists, error)) {
+        return false;
+    }
+    if (baseline_exists) {
+        if (error) {
+            *error = "baseline library already exists: " + library.library_id;
+        }
+        return false;
+    }
+    bool exists = false;
+    if (!LibraryExists(library.library_id, &exists, error)) {
+        return false;
+    }
+    if (exists) {
+        if (error) {
+            *error = "library already exists: " + library.library_id;
+        }
+        return false;
+    }
+    if (!AppendDeltaLine(AddLibraryDeltaLine(library), error)) {
+        return false;
+    }
+    added_libraries_[library.library_id] = library;
+    deleted_libraries_.erase(library.library_id);
+    ++delta_operation_count_;
+    return true;
+}
+
+bool OpticalDiscCatalog::DeleteLibrary(const std::string& library_id, std::string* error) {
+    if (!IsValidIdentifier(library_id)) {
+        if (error) {
+            *error = "invalid library_id: " + library_id;
+        }
+        return false;
+    }
+    LibraryUsageView usage;
+    if (!GetLibraryUsage(library_id, &usage, error)) {
+        return false;
+    }
+    if (usage.disc_count == 0) {
+        if (error) {
+            *error = "library not found: " + library_id;
+        }
+        return false;
+    }
+    if (usage.used_bytes != "0" ||
+        usage.status_counts[static_cast<std::size_t>(DiscStatus::InUse)] != 0) {
+        if (error) {
+            *error = "used library cannot be deleted: " + library_id;
+        }
+        return false;
+    }
+    if (!AppendDeltaLine("DELETE_LIBRARY\t" + library_id, error)) {
+        return false;
+    }
+    added_libraries_.erase(library_id);
+    deleted_libraries_.insert(library_id);
     ++delta_operation_count_;
     return true;
 }

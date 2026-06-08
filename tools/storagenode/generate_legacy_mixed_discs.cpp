@@ -15,7 +15,7 @@ constexpr std::uint64_t kDefaultNodeCount = 10000;
 constexpr std::uint64_t kDefaultDiscsPerNode = 10000;
 constexpr std::uint64_t kDefaultSmallDiscsPerNode = 9000;
 constexpr std::uint64_t kDefaultBatchSize = 100000;
-constexpr std::uint64_t kDiscsPerLibrary = 20000;
+constexpr std::uint64_t kDiscsPerLibrary = 10000;
 constexpr std::uint64_t kSmallDiscCapacityBytes = 1000000000000ULL;
 constexpr std::uint64_t kLargeDiscCapacityBytes = 10000000000000ULL;
 

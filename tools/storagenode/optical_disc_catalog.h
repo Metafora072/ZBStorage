@@ -85,6 +85,16 @@ struct LibraryUsageView {
     std::array<std::uint64_t, kDiscStatusCount> status_counts{};
 };
 
+struct LibraryLayoutDelta {
+    std::string library_id;
+    std::string profile{"legacy_mixed_v1"};
+    std::uint64_t disc_count{10000};
+    std::uint64_t small_disc_count{9000};
+    std::uint64_t small_disc_capacity_bytes{1000000000000ULL};
+    std::uint64_t large_disc_count{1000};
+    std::uint64_t large_disc_capacity_bytes{10000000000000ULL};
+};
+
 struct DiscCapacityAdjustment {
     std::int64_t disc_delta_count{0};
     bool capacity_delta_negative{false};
@@ -123,10 +133,14 @@ public:
     bool ComputeCapacityAdjustment(DiscCapacityAdjustment* adjustment,
                                    std::string* error) const;
     bool NextAddedDiscId(std::string* device_id, std::string* error) const;
+    bool NextAddedLibraryId(std::string* library_id, std::string* error) const;
+    bool LibraryExists(const std::string& library_id, bool* exists, std::string* error) const;
     void SetUsageOverlay(const DiscUsageOverlay& overlay);
     void ClearUsageOverlay();
     bool AddDisc(const OpticalDiscBin& disc, std::string* error);
     bool DeleteDisc(const std::string& device_id, std::string* error);
+    bool AddLibrary(const LibraryLayoutDelta& library, std::string* error);
+    bool DeleteLibrary(const std::string& library_id, std::string* error);
 
     const std::filesystem::path& disc_dir() const { return disc_dir_; }
     const std::filesystem::path& delta_path() const { return delta_path_; }
@@ -143,7 +157,15 @@ private:
     bool CollectBatchFiles(std::string* error);
     bool ReplayDeltaLog(std::string* error);
     bool FindBaselineDisc(const std::string& device_id, OpticalDiscBin* disc, bool* found, std::string* error) const;
+    bool FindBaselineLibrary(const std::string& library_id, bool* found, std::string* error) const;
+    bool ComputeBaselineLibraryUsage(const std::string& library_id,
+                                     LibraryUsageView* usage,
+                                     std::string* error) const;
     bool ScanBaseline(const std::function<bool(const OpticalDiscBin&)>& visitor, std::string* error) const;
+    bool FindAddedLibraryDisc(const std::string& device_id,
+                              OpticalDiscBin* disc,
+                              bool* found,
+                              std::string* error) const;
     std::uint64_t EstimateUsedBytes(const OpticalDiscBin& disc) const;
     void ApplyUsageOverlay(OpticalDiscBin* disc) const;
     bool AppendDeltaLine(const std::string& line, std::string* error) const;
@@ -154,6 +176,8 @@ private:
     std::unordered_map<std::uint64_t, std::filesystem::path> batch_path_by_index_;
     std::unordered_map<std::string, OpticalDiscBin> added_discs_;
     std::unordered_set<std::string> deleted_discs_;
+    std::unordered_map<std::string, LibraryLayoutDelta> added_libraries_;
+    std::unordered_set<std::string> deleted_libraries_;
     DiscUsageOverlay usage_overlay_;
     std::size_t skipped_batch_file_count_{0};
     std::size_t delta_operation_count_{0};

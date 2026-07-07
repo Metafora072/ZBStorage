@@ -884,6 +884,29 @@ if(BRPC_DYNAMIC_LIB)
     target_link_libraries(scheduler_server PRIVATE ${BRPC_DYNAMIC_LIB})
 endif()
 
+add_executable(api_gateway
+    gateway/api_gateway.cpp
+    gateway/demo_runner.cpp
+)
+target_include_directories(api_gateway
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/gateway
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
+        ${GFLAGS_INCLUDE_PATH}
+        ${CMAKE_CURRENT_BINARY_DIR}
+)
+target_link_libraries(api_gateway
+    PRIVATE
+        zb_proto
+        brpc-static
+        ${GFLAGS_LIBRARY}
+        ${CMAKE_THREAD_LIBS_INIT}
+)
+if(BRPC_DYNAMIC_LIB)
+    target_link_libraries(api_gateway PRIVATE ${BRPC_DYNAMIC_LIB})
+endif()
+
 if(UNIX)
     add_executable(zb_fuse_client
         src/client/fuse/zb_fuse_client.cpp

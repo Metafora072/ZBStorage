@@ -223,6 +223,11 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
                 }
                 return {};
             }
+        } else if (key == "LIBRARY_DISC_SLOTS") {
+            if (!ParseUint32(value, &cfg.library_disc_slots)) {
+                if (error) *error = "Invalid LIBRARY_DISC_SLOTS at line " + std::to_string(line_no);
+                return {};
+            }
         } else if (key == "MAX_IMAGE_SIZE_BYTES") {
             if (!ParseUint64(value, &cfg.max_image_size_bytes)) {
                 if (error) {
@@ -297,6 +302,7 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
     if (cfg.cache_disc_slots == 0) {
         cfg.cache_disc_slots = 1;
     }
+    if (cfg.library_disc_slots == 0) cfg.library_disc_slots = 10000;
     return cfg;
 }
 

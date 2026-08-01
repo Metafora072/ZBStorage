@@ -2067,7 +2067,25 @@ int FuseRead(const char* path, char* buf, size_t size, off_t offset, struct fuse
                                            &resolved_meta,
                                            &slices,
                                            &data_status)) {
-        return -StatusToErrno(data_status);
+        // A verified drain migration copies immutable objects before the MDS
+        // location is switched. The destination may not yet have the data
+        // node's optional file-meta acceleration record, while the MDS still
+        // has the authoritative size and object-unit metadata. Fall back to
+        // deterministic object slicing only for that specific absence; RPC,
+        // integrity, and other storage errors must remain visible.
+        if (data_status.code() != zb::rpc::STATUS_NOT_FOUND ||
+            hint_file_size == 0 || hint_object_unit_size == 0) {
+            return -StatusToErrno(data_status);
+        }
+        resolved_meta.set_inode_id(inode_id);
+        resolved_meta.set_file_size(hint_file_size);
+        resolved_meta.set_object_unit_size(hint_object_unit_size);
+        BuildObjectSlices(inode_id,
+                          request_offset,
+                          static_cast<uint64_t>(size),
+                          hint_object_unit_size,
+                          anchor.disk_id(),
+                          &slices);
     }
     const uint64_t object_unit_size = resolved_meta.object_unit_size() > 0
                                           ? resolved_meta.object_unit_size()

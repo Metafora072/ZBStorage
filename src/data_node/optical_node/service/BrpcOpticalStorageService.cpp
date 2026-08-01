@@ -32,7 +32,9 @@ void FillStatus(const zb::msg::Status& status, zb::rpc::Status* out) {
 
 } // namespace
 
-BrpcOpticalStorageService::BrpcOpticalStorageService(OpticalStorageServiceImpl* service) : service_(service) {}
+BrpcOpticalStorageService::BrpcOpticalStorageService(OpticalStorageServiceImpl* service,
+                                                     zb::metrics::NodeMetricsCollector* metrics)
+    : service_(service), metrics_(metrics) {}
 
 void BrpcOpticalStorageService::WriteObject(google::protobuf::RpcController* cntl_base,
                                             const zb::rpc::WriteObjectRequest* request,
@@ -48,6 +50,8 @@ void BrpcOpticalStorageService::WriteObject(google::protobuf::RpcController* cnt
         }
         return;
     }
+    auto metric = metrics_ ? metrics_->Start(zb::metrics::OperationKind::kWrite)
+                           : zb::metrics::NodeMetricsCollector::ScopedOperation{};
 
     zb::msg::WriteObjectRequest internal_req;
     internal_req.disk_id = request->disk_id();
@@ -74,6 +78,9 @@ void BrpcOpticalStorageService::WriteObject(google::protobuf::RpcController* cnt
     response->set_image_id(internal_reply.image_id);
     response->set_image_offset(internal_reply.image_offset);
     response->set_image_length(internal_reply.image_length);
+    if (internal_reply.status.ok()) {
+        metric.SetBytes(internal_reply.bytes);
+    }
 }
 
 void BrpcOpticalStorageService::ReadObject(google::protobuf::RpcController* cntl_base,
@@ -90,6 +97,8 @@ void BrpcOpticalStorageService::ReadObject(google::protobuf::RpcController* cntl
         }
         return;
     }
+    auto metric = metrics_ ? metrics_->Start(zb::metrics::OperationKind::kRead)
+                           : zb::metrics::NodeMetricsCollector::ScopedOperation{};
 
     zb::msg::ReadObjectRequest internal_req;
     internal_req.disk_id = request->disk_id();
@@ -104,6 +113,9 @@ void BrpcOpticalStorageService::ReadObject(google::protobuf::RpcController* cntl
     FillStatus(internal_reply.status, response->mutable_status());
     response->set_bytes(internal_reply.bytes);
     response->set_data(internal_reply.data);
+    if (internal_reply.status.ok()) {
+        metric.SetBytes(internal_reply.bytes);
+    }
 }
 
 void BrpcOpticalStorageService::DeleteObject(google::protobuf::RpcController* cntl_base,
@@ -120,12 +132,29 @@ void BrpcOpticalStorageService::DeleteObject(google::protobuf::RpcController* cn
         }
         return;
     }
+    auto metric = metrics_ ? metrics_->Start(zb::metrics::OperationKind::kOther)
+                           : zb::metrics::NodeMetricsCollector::ScopedOperation{};
 
     zb::msg::DeleteObjectRequest internal_req;
     internal_req.disk_id = request->disk_id();
     internal_req.SetArchiveObjectId(request->object_id());
     const zb::msg::DeleteObjectReply internal_reply = service_->DeleteObject(internal_req);
     FillStatus(internal_reply.status, response->mutable_status());
+}
+
+void BrpcOpticalStorageService::ListObjects(google::protobuf::RpcController* cntl_base,
+                                            const zb::rpc::ListObjectsRequest* request,
+                                            zb::rpc::ListObjectsReply* response,
+                                            google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+    (void)cntl_base;
+    (void)request;
+    if (!response) {
+        return;
+    }
+    response->mutable_status()->set_code(zb::rpc::STATUS_INVALID_ARGUMENT);
+    response->mutable_status()->set_message(
+        "optical media is immutable and is not enumerated by the disk drain API");
 }
 
 void BrpcOpticalStorageService::ResetNodeData(google::protobuf::RpcController* cntl_base,
@@ -156,6 +185,8 @@ void BrpcOpticalStorageService::ReadArchivedFile(google::protobuf::RpcController
         }
         return;
     }
+    auto metric = metrics_ ? metrics_->Start(zb::metrics::OperationKind::kRead)
+                           : zb::metrics::NodeMetricsCollector::ScopedOperation{};
 
     zb::msg::ReadArchivedFileRequest internal_req;
     internal_req.disc_id = request->disc_id();
@@ -168,6 +199,9 @@ void BrpcOpticalStorageService::ReadArchivedFile(google::protobuf::RpcController
     FillStatus(internal_reply.status, response->mutable_status());
     response->set_bytes(internal_reply.bytes);
     response->set_data(internal_reply.data);
+    if (internal_reply.status.ok()) {
+        metric.SetBytes(internal_reply.bytes);
+    }
 }
 
 void BrpcOpticalStorageService::UpdateArchiveState(google::protobuf::RpcController* cntl_base,

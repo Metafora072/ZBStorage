@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -34,7 +35,8 @@ public:
                           FileArchiveCandidateQueue* candidate_queue,
                           ArchiveBatchStager* batch_stager,
                           ArchiveLeaseManager* lease_manager,
-                          Options options);
+                          Options options,
+                          std::shared_mutex* placement_transaction_mu = nullptr);
 
     // Runs one archive + eviction round. Returns true if the round completed.
     bool RunOnce(std::string* error);
@@ -118,6 +120,7 @@ private:
     ArchiveBatchStager* batch_stager_{};
     ArchiveLeaseManager* lease_manager_{};
     Options options_;
+    std::shared_mutex* placement_transaction_mu_{};
     bool archive_mode_{false};
 
     std::unordered_map<std::string, std::unique_ptr<brpc::Channel>> channels_;

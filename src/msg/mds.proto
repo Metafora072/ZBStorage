@@ -4,6 +4,8 @@ package zb.rpc;
 
 option cc_generic_services = true;
 
+import "scheduler.proto";
+
 enum MdsStatusCode {
   MDS_OK = 0;
   MDS_INVALID_ARGUMENT = 1;
@@ -108,6 +110,78 @@ message DiskFileLocation {
   string node_id = 1;
   string node_address = 2;
   string disk_id = 3;
+}
+
+// Scheduler calls this only after every object of the inode has been copied
+// and verified at target.  MDS performs a compare-and-swap of the file-level
+// location; source data is deleted only after this RPC succeeds.
+message CommitFileMigrationRequest {
+  string migration_id = 1;
+  uint64 inode_id = 2;
+  DiskFileLocation expected_source = 3;
+  DiskFileLocation target = 4;
+}
+
+message CommitFileMigrationReply {
+  MdsStatus status = 1;
+  DiskFileLocation location = 2;
+  bool already_committed = 3;
+}
+
+// Scheduler proposes operational state, but CMS is the authority that commits
+// membership, compact identifiers and the placement-visible node catalog.
+message CmsNodeCatalogEntry {
+  NodeView placement_view = 1;
+  ManagedNodeView managed_view = 2;
+}
+
+message CommitCmsNodeCatalogRequest {
+  uint64 scheduler_generation = 1;
+  repeated CmsNodeCatalogEntry nodes = 2;
+}
+
+message CmsNodeCompactIdAssignment {
+  string node_id = 1;
+  uint32 compact_id = 2;
+}
+
+message CommitCmsNodeCatalogReply {
+  MdsStatus status = 1;
+  uint64 cms_generation = 2;
+  uint64 scheduler_generation = 3;
+  repeated CmsNodeCompactIdAssignment assignments = 4;
+}
+
+message GetCmsNodeCatalogRequest {}
+
+message GetCmsNodeCatalogReply {
+  MdsStatus status = 1;
+  uint64 cms_generation = 2;
+  uint64 scheduler_generation = 3;
+  repeated CmsNodeCatalogEntry nodes = 4;
+}
+
+// CMS-private durable image. It is stored in the MDS RocksDB and is not an
+// RPC payload; explicit version/cursors make compact-ID recovery independent
+// of Scheduler publication order.
+message CmsNodeCatalogSnapshot {
+  uint32 format_version = 1;
+  uint64 cms_generation = 2;
+  uint64 scheduler_generation = 3;
+  uint32 next_storage_compact_id = 4;
+  uint32 next_optical_compact_id = 5;
+  repeated CmsNodeCatalogEntry nodes = 6;
+}
+
+message VerifyNodeReferencesRequest {
+  string node_id = 1;
+}
+
+message VerifyNodeReferencesReply {
+  MdsStatus status = 1;
+  uint64 disk_inode_references = 2;
+  uint64 optical_inode_references = 3;
+  bool zero_references = 4;
 }
 
 message OpticalFileLocation {
@@ -617,6 +691,10 @@ service MdsService {
   rpc Unlink(UnlinkRequest) returns (UnlinkReply);
   rpc Rmdir(RmdirRequest) returns (RmdirReply);
   rpc GetFileLocation(GetFileLocationRequest) returns (GetFileLocationReply);
+  rpc CommitFileMigration(CommitFileMigrationRequest) returns (CommitFileMigrationReply);
+  rpc CommitCmsNodeCatalog(CommitCmsNodeCatalogRequest) returns (CommitCmsNodeCatalogReply);
+  rpc GetCmsNodeCatalog(GetCmsNodeCatalogRequest) returns (GetCmsNodeCatalogReply);
+  rpc VerifyNodeReferences(VerifyNodeReferencesRequest) returns (VerifyNodeReferencesReply);
   rpc UpdateInodeStat(UpdateInodeStatRequest) returns (UpdateInodeStatReply);
   rpc ReportArchiveCandidates(ReportArchiveCandidatesRequest) returns (ReportArchiveCandidatesReply);
   rpc ReportFileArchiveCandidates(ReportFileArchiveCandidatesRequest) returns (ReportFileArchiveCandidatesReply);

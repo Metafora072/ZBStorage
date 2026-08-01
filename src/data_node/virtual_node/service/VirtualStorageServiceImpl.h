@@ -121,6 +121,7 @@ public:
     void SetArchiveTrackingMaxObjects(size_t max_objects);
     std::vector<ArchiveCandidateStat> CollectArchiveCandidates(uint32_t max_candidates, uint64_t min_age_ms) const;
     std::vector<FileArchiveCandidateStat> CollectFileArchiveCandidates(uint32_t max_candidates, uint64_t min_age_ms) const;
+    std::vector<real_node::ArchiveObjectMeta> ListTrackedObjects() const;
 
 private:
     struct PreloadedFileObjectInfo {

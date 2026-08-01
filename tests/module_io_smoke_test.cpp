@@ -120,6 +120,160 @@ bool TestScheduler(const std::string& endpoint, std::string* detail) {
     return true;
 }
 
+bool TestCmsCatalog(const std::string& endpoint, std::string* detail) {
+    brpc::Channel channel;
+    std::string error;
+    if (!InitChannel(endpoint, &channel, &error)) {
+        if (detail) *detail = error;
+        return false;
+    }
+    zb::rpc::MdsService_Stub stub(&channel);
+    zb::rpc::GetCmsNodeCatalogRequest request;
+    zb::rpc::GetCmsNodeCatalogReply response;
+    brpc::Controller controller;
+    stub.GetCmsNodeCatalog(&controller, &request, &response, nullptr);
+    if (controller.Failed() || response.status().code() != zb::rpc::MDS_OK) {
+        if (detail) *detail = controller.Failed() ? controller.ErrorText()
+                                                   : response.status().message();
+        return false;
+    }
+    bool has_ready_storage = false;
+    for (const auto& entry : response.nodes()) {
+        const auto& node = entry.managed_view();
+        if (node.compact_id() == 0 || !node.has_readiness()) {
+            if (detail) *detail = "CMS exposed a node without compact ID/readiness";
+            return false;
+        }
+        if (node.spec().kind() == zb::rpc::MANAGED_KIND_STORAGE &&
+            node.lifecycle() == zb::rpc::MANAGED_LIFECYCLE_WORKING &&
+            node.health() == zb::rpc::MANAGED_HEALTH_HEALTHY &&
+            node.readiness().observed() && node.readiness().initialization_complete() &&
+            node.readiness().inventory_ready() && node.readiness().metadata_ready()) {
+            has_ready_storage = true;
+        }
+    }
+    if (!has_ready_storage) {
+        if (detail) *detail = "CMS has no fully ready working storage node";
+        return false;
+    }
+    if (detail) {
+        *detail = "cms_generation=" + std::to_string(response.cms_generation()) +
+                  " scheduler_generation=" + std::to_string(response.scheduler_generation()) +
+                  " nodes=" + std::to_string(response.nodes_size());
+    }
+    return true;
+}
+
+bool TestCmsScheduledIo(const std::string& endpoint,
+                        const std::string& uniq,
+                        std::string* detail) {
+    brpc::Channel mds_channel;
+    std::string error;
+    if (!InitChannel(endpoint, &mds_channel, &error)) {
+        if (detail) *detail = error;
+        return false;
+    }
+    zb::rpc::MdsService_Stub mds(&mds_channel);
+    const std::string path = "/cms_scheduled_io_" + uniq;
+    zb::rpc::CreateRequest create;
+    create.set_path(path);
+    create.set_mode(0644);
+    create.set_uid(0);
+    create.set_gid(0);
+    create.set_replica(1);
+    create.set_object_unit_size(4 * 1024 * 1024ULL);
+    zb::rpc::CreateReply created;
+    brpc::Controller create_controller;
+    mds.Create(&create_controller, &create, &created, nullptr);
+    if (create_controller.Failed() || created.status().code() != zb::rpc::MDS_OK) {
+        if (detail) *detail = create_controller.Failed() ? create_controller.ErrorText()
+                                                         : created.status().message();
+        return false;
+    }
+    const auto& location = created.location().disk_location();
+    if (location.node_id().empty() || location.node_address().empty() ||
+        location.disk_id().empty()) {
+        if (detail) *detail = "CMS allocator returned an incomplete disk location";
+        return false;
+    }
+
+    zb::rpc::GetCmsNodeCatalogRequest catalog_request;
+    zb::rpc::GetCmsNodeCatalogReply catalog;
+    brpc::Controller catalog_controller;
+    mds.GetCmsNodeCatalog(&catalog_controller, &catalog_request, &catalog, nullptr);
+    bool committed_target = false;
+    for (const auto& entry : catalog.nodes()) {
+        const std::string& catalog_node_id = entry.managed_view().spec().node_id();
+        const bool identity_matches = catalog_node_id == location.node_id() ||
+            location.node_id().rfind(catalog_node_id + "-v", 0) == 0;
+        if (identity_matches &&
+            entry.managed_view().lifecycle() == zb::rpc::MANAGED_LIFECYCLE_WORKING &&
+            entry.managed_view().service_mode() == zb::rpc::MANAGED_SERVICE_READ_WRITE) {
+            committed_target = true;
+            break;
+        }
+    }
+    if (!committed_target) {
+        if (detail) *detail = "allocated target is not in the committed CMS working catalog";
+        return false;
+    }
+
+    brpc::Channel data_channel;
+    if (!InitChannel(location.node_address(), &data_channel, &error)) {
+        if (detail) *detail = error;
+        return false;
+    }
+    zb::rpc::RealNodeService_Stub data(&data_channel);
+    const std::string object_id = "obj-" +
+        std::to_string(created.location().attr().inode_id()) + "-0";
+    const std::string payload = "cms_scheduler_real_io_" + uniq;
+    zb::rpc::WriteObjectRequest write;
+    write.set_disk_id(location.disk_id());
+    write.set_object_id(object_id);
+    write.set_data(payload);
+    zb::rpc::WriteObjectReply written;
+    brpc::Controller write_controller;
+    data.WriteObject(&write_controller, &write, &written, nullptr);
+    if (write_controller.Failed() || written.status().code() != zb::rpc::STATUS_OK) {
+        if (detail) *detail = write_controller.Failed() ? write_controller.ErrorText()
+                                                        : written.status().message();
+        return false;
+    }
+    zb::rpc::ReadObjectRequest read;
+    read.set_disk_id(location.disk_id());
+    read.set_object_id(object_id);
+    read.set_size(payload.size());
+    zb::rpc::ReadObjectReply read_back;
+    brpc::Controller read_controller;
+    data.ReadObject(&read_controller, &read, &read_back, nullptr);
+    const bool ok = !read_controller.Failed() &&
+                    read_back.status().code() == zb::rpc::STATUS_OK &&
+                    read_back.data() == payload;
+
+    zb::rpc::DeleteObjectRequest remove_object;
+    remove_object.set_disk_id(location.disk_id());
+    remove_object.set_object_id(object_id);
+    zb::rpc::DeleteObjectReply removed_object;
+    brpc::Controller remove_object_controller;
+    data.DeleteObject(&remove_object_controller, &remove_object, &removed_object, nullptr);
+    zb::rpc::UnlinkRequest unlink;
+    unlink.set_path(path);
+    zb::rpc::UnlinkReply unlinked;
+    brpc::Controller unlink_controller;
+    mds.Unlink(&unlink_controller, &unlink, &unlinked, nullptr);
+
+    if (!ok) {
+        if (detail) *detail = read_controller.Failed() ? read_controller.ErrorText()
+                                                       : "scheduled data readback mismatch";
+        return false;
+    }
+    if (detail) {
+        *detail = "CMS target=" + location.node_id() + " disk=" + location.disk_id() +
+                  " bytes=" + std::to_string(payload.size());
+    }
+    return true;
+}
+
 bool TestMdsNamespace(const std::string& endpoint, const std::string& uniq, std::string* detail) {
     brpc::Channel channel;
     std::string error;
@@ -309,6 +463,7 @@ bool TestObjectRw(const std::string& endpoint,
                   const std::string& disk_id,
                   const std::string& object_id,
                   const std::string& payload,
+                  bool expect_exact_payload,
                   std::string* detail) {
     brpc::Channel channel;
     std::string error;
@@ -364,7 +519,11 @@ bool TestObjectRw(const std::string& endpoint,
             }
             return false;
         }
-        if (resp.data() != payload) {
+        const bool simulated_payload_ok = !expect_exact_payload &&
+            resp.data().size() == payload.size() &&
+            resp.data().find_first_not_of('x') == std::string::npos;
+        if ((expect_exact_payload && resp.data() != payload) ||
+            (!expect_exact_payload && !simulated_payload_ok)) {
             if (detail) {
                 *detail = "ReadObject payload mismatch";
             }
@@ -556,11 +715,18 @@ int main(int argc, char* argv[]) {
     summary.Add("scheduler.get_cluster_view", TestScheduler(FLAGS_scheduler, &detail), detail);
 
     detail.clear();
+    summary.Add("cms.authoritative_node_catalog", TestCmsCatalog(FLAGS_mds, &detail), detail);
+
+    detail.clear();
+    summary.Add("cms.scheduler_data_io", TestCmsScheduledIo(FLAGS_mds, uniq, &detail), detail);
+
+    detail.clear();
     summary.Add("mds.namespace_ops", TestMdsNamespace(FLAGS_mds, uniq, &detail), detail);
 
     detail.clear();
     summary.Add("real_node.object_rw",
-                TestObjectRw(FLAGS_real, FLAGS_real_disk, "real_smoke_object_" + uniq, "real_payload_" + uniq, &detail),
+                TestObjectRw(FLAGS_real, FLAGS_real_disk, "real_smoke_object_" + uniq,
+                             "real_payload_" + uniq, true, &detail),
                 detail);
 
     detail.clear();
@@ -569,6 +735,7 @@ int main(int argc, char* argv[]) {
                              FLAGS_virtual_disk,
                              "virtual_smoke_object_" + uniq,
                              "virtual_payload_" + uniq,
+                             false,
                              &detail),
                 detail);
 

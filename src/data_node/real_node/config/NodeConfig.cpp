@@ -91,6 +91,20 @@ NodeConfig NodeConfig::LoadFromFile(const std::string& path, std::string* error)
                 }
                 return {};
             }
+        } else if (key == "DISK_READ_BYTES_PER_SEC") {
+            try {
+                cfg.disk_read_bytes_per_sec = static_cast<uint64_t>(std::stoull(value));
+            } catch (const std::exception&) {
+                if (error) *error = "Invalid DISK_READ_BYTES_PER_SEC at line " + std::to_string(line_no);
+                return {};
+            }
+        } else if (key == "DISK_WRITE_BYTES_PER_SEC") {
+            try {
+                cfg.disk_write_bytes_per_sec = static_cast<uint64_t>(std::stoull(value));
+            } catch (const std::exception&) {
+                if (error) *error = "Invalid DISK_WRITE_BYTES_PER_SEC at line " + std::to_string(line_no);
+                return {};
+            }
         } else if (key == "NODE_ID") {
             cfg.node_id = value;
         } else if (key == "NODE_ADDRESS") {

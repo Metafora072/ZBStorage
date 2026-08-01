@@ -166,13 +166,15 @@ OpticalArchiveManager::OpticalArchiveManager(RocksMetaStore* store,
                                              FileArchiveCandidateQueue* candidate_queue,
                                              ArchiveBatchStager* batch_stager,
                                              ArchiveLeaseManager* lease_manager,
-                                             Options options)
+                                             Options options,
+                                             std::shared_mutex* placement_transaction_mu)
     : store_(store),
       cache_(cache),
       candidate_queue_(candidate_queue),
       batch_stager_(batch_stager),
       lease_manager_(lease_manager),
-      options_(options) {
+      options_(options),
+      placement_transaction_mu_(placement_transaction_mu) {
     if (options_.archive_target_bytes > options_.archive_trigger_bytes) {
         options_.archive_target_bytes = options_.archive_trigger_bytes;
     }
@@ -613,28 +615,38 @@ bool OpticalArchiveManager::RunOnce(std::string* error) {
                     }
                 }
                 if (!file_failed) {
-                    zb::rpc::InodeAttr inode;
-                    if (!LoadInodeAttr(file_candidate.inode_id, &inode, &local_error)) {
+                    std::shared_lock<std::shared_mutex> placement_guard;
+                    if (placement_transaction_mu_) {
+                        placement_guard = std::shared_lock<std::shared_mutex>(*placement_transaction_mu_);
+                    }
+                    if (!cache_->IsWriteAdmitted(last_optical_location.node_id())) {
                         file_failed = true;
-                        if (error && error->empty()) {
-                            *error = local_error;
-                        }
-                    } else {
-                        rocksdb::WriteBatch metadata_batch;
-                        zb::rpc::OpticalFileLocation location;
-                        location.set_node_id(last_optical_location.node_id());
-                        location.set_node_address(last_optical_location.node_address());
-                        location.set_disk_id(last_optical_location.disk_id());
-                        location.set_image_id(last_optical_location.image_id());
-                        location.set_file_id("inode-" + std::to_string(file_candidate.inode_id));
-                        location.set_file_path("/inode/" + std::to_string(file_candidate.inode_id));
-                        if (!SaveOpticalFileLocation(file_candidate.inode_id, location, &metadata_batch, &local_error)) {
+                        local_error = "optical target is no longer admitted by CMS";
+                    }
+                    if (!file_failed) {
+                        zb::rpc::InodeAttr inode;
+                        if (!LoadInodeAttr(file_candidate.inode_id, &inode, &local_error)) {
                             file_failed = true;
-                        } else if (!store_->WriteBatch(&metadata_batch, &local_error)) {
-                            file_failed = true;
-                        }
-                        if (file_failed && error && error->empty() && !local_error.empty()) {
-                            *error = local_error;
+                            if (error && error->empty()) {
+                                *error = local_error;
+                            }
+                        } else {
+                            rocksdb::WriteBatch metadata_batch;
+                            zb::rpc::OpticalFileLocation location;
+                            location.set_node_id(last_optical_location.node_id());
+                            location.set_node_address(last_optical_location.node_address());
+                            location.set_disk_id(last_optical_location.disk_id());
+                            location.set_image_id(last_optical_location.image_id());
+                            location.set_file_id("inode-" + std::to_string(file_candidate.inode_id));
+                            location.set_file_path("/inode/" + std::to_string(file_candidate.inode_id));
+                            if (!SaveOpticalFileLocation(file_candidate.inode_id, location, &metadata_batch, &local_error)) {
+                                file_failed = true;
+                            } else if (!store_->WriteBatch(&metadata_batch, &local_error)) {
+                                file_failed = true;
+                            }
+                            if (file_failed && error && error->empty() && !local_error.empty()) {
+                                *error = local_error;
+                            }
                         }
                     }
                 }
@@ -972,6 +984,10 @@ bool OpticalArchiveManager::BurnSealedBatch(const NodeSelection& optical,
 
         rocksdb::WriteBatch metadata_batch;
         std::string local_error;
+        std::shared_lock<std::shared_mutex> placement_guard;
+        if (placement_transaction_mu_) {
+            placement_guard = std::shared_lock<std::shared_mutex>(*placement_transaction_mu_);
+        }
         std::unordered_map<uint64_t, const PreparedBurnTask*> representative_tasks;
         for (const auto& item : prepared) {
             if (representative_tasks.find(item.inode_id) == representative_tasks.end()) {
@@ -981,6 +997,12 @@ bool OpticalArchiveManager::BurnSealedBatch(const NodeSelection& optical,
         for (const auto& entry : representative_tasks) {
             const uint64_t inode_id = entry.first;
             const PreparedBurnTask& task = *entry.second;
+            if (!cache_->IsWriteAdmitted(task.optical_location.node_id())) {
+                if (error && error->empty()) {
+                    *error = "optical target is no longer admitted by CMS";
+                }
+                return false;
+            }
             zb::rpc::InodeAttr inode;
             if (!LoadInodeAttr(inode_id, &inode, &local_error)) {
                 if (error && error->empty()) {

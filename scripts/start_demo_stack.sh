@@ -15,17 +15,25 @@ MOUNT_POINT="${MOUNT_POINT:-${RUN_DIR}/mnt}"
 SCHEDULER_PORT="${SCHEDULER_PORT:-9100}"
 MDS_PORT="${MDS_PORT:-9000}"
 REAL_PORT="${REAL_PORT:-19080}"
+SECOND_REAL_PORT="${SECOND_REAL_PORT:-19081}"
 VIRTUAL_PORT="${VIRTUAL_PORT:-29080}"
+OPTICAL_PORT="${OPTICAL_PORT:-39080}"
 
 REAL_NODE_ID="${REAL_NODE_ID:-node-real-01}"
+SECOND_REAL_NODE_ID="${SECOND_REAL_NODE_ID:-node-real-02}"
 VIRTUAL_NODE_ID="${VIRTUAL_NODE_ID:-vpool}"
+OPTICAL_NODE_ID="${OPTICAL_NODE_ID:-optical-01}"
 REAL_DIR_NAME="${REAL_DIR_NAME:-real}"
 VIRTUAL_DIR_NAME="${VIRTUAL_DIR_NAME:-virtual}"
 REAL_DISK_COUNT="${REAL_DISK_COUNT:-24}"
 VIRTUAL_NODE_COUNT="${VIRTUAL_NODE_COUNT:-99}"
 VIRTUAL_DISK_COUNT="${VIRTUAL_DISK_COUNT:-24}"
 ONLINE_DISK_CAPACITY_BYTES="${ONLINE_DISK_CAPACITY_BYTES:-2000000000000}"
+SECOND_REAL_DISK_CAPACITY_BYTES="${SECOND_REAL_DISK_CAPACITY_BYTES:-${ONLINE_DISK_CAPACITY_BYTES}}"
 MDS_STRICT_TIER_BYPASS_PG="${MDS_STRICT_TIER_BYPASS_PG:-true}"
+START_OPTICAL="${START_OPTICAL:-false}"
+START_SECOND_REAL="${START_SECOND_REAL:-false}"
+OPTICAL_DISC_COUNT="${OPTICAL_DISC_COUNT:-4}"
 
 MODE="${1:-start}"
 
@@ -61,6 +69,19 @@ build_virtual_disk_list() {
       result+=","
     fi
     result+="disk${i}"
+  done
+  echo "${result}"
+}
+
+build_optical_disc_list() {
+  local count="$1"
+  local result=""
+  local i
+  for ((i=0; i<count; ++i)); do
+    if [[ -n "${result}" ]]; then
+      result+=","
+    fi
+    result+="odisk${i}"
   done
   echo "${result}"
 }
@@ -133,7 +154,13 @@ ensure_all_ports_free() {
   ensure_port_free "scheduler" "${SCHEDULER_PORT}"
   ensure_port_free "mds" "${MDS_PORT}"
   ensure_port_free "real_node" "${REAL_PORT}"
+  if [[ "${START_SECOND_REAL}" == "true" ]]; then
+    ensure_port_free "second_real_node" "${SECOND_REAL_PORT}"
+  fi
   ensure_port_free "virtual_node" "${VIRTUAL_PORT}"
+  if [[ "${START_OPTICAL}" == "true" ]]; then
+    ensure_port_free "optical_node" "${OPTICAL_PORT}"
+  fi
 }
 
 write_pid() {
@@ -201,11 +228,15 @@ prepare_run_dirs() {
 }
 
 render_configs() {
-  mkdir -p "${DATA_DIR}/real/disks" "${DATA_DIR}/virtual/meta" "${DATA_DIR}/mds"
+  mkdir -p "${DATA_DIR}/real/disks" "${DATA_DIR}/real2/disks" \
+    "${DATA_DIR}/virtual/meta" "${DATA_DIR}/optical" "${DATA_DIR}/mds" \
+    "${DATA_DIR}/scheduler"
   local real_disks
   local virtual_disks
+  local optical_discs
   real_disks="$(build_real_disk_list "${REAL_DISK_COUNT}")"
   virtual_disks="$(build_virtual_disk_list "${VIRTUAL_DISK_COUNT}")"
+  optical_discs="$(build_optical_disc_list "${OPTICAL_DISC_COUNT}")"
 
   cat > "${CFG_DIR}/scheduler.conf" <<EOF
 SUSPECT_TIMEOUT_MS=6000
@@ -213,6 +244,24 @@ DEAD_TIMEOUT_MS=15000
 TICK_INTERVAL_MS=1000
 CLUSTER_VIEW_SNAPSHOT_INTERVAL_MS=5000
 CLUSTER_VIEW_SNAPSHOT_PATH=${LOG_DIR}/scheduler_cluster_view.txt
+MANAGED_STATE_SNAPSHOT_PATH=${DATA_DIR}/scheduler/managed_nodes.pb
+MDS_ADDRESS=127.0.0.1:${MDS_PORT}
+MIGRATION_RPC_TIMEOUT_MS=10000
+MIGRATION_COPY_CHUNK_BYTES=4194304
+MIGRATION_RETRY_BASE_MS=1000
+MIGRATION_MAX_RETRIES=20
+POWER_PEAK_UTILIZATION=0.80
+POWER_PEAK_QUEUE_DEPTH=8
+POWER_METRICS_FRESHNESS_MS=5000
+POWER_STANDBY_AFTER_MS=60000
+POWER_OFF_AFTER_MS=600000
+POWER_MINIMUM_RESIDENCY_MS=1000
+POWER_ALLOW_OFF_WITH_RESIDENT_DATA=false
+POWER_MIN_ONLINE_STORAGE_NODES=1
+POWER_MIN_ONLINE_METADATA_NODES=1
+POWER_MIN_ONLINE_OPTICAL_NODES=0
+POWER_ACTUATION_ENABLED=false
+METRICS_HISTORY_MAX_SAMPLES=100000
 EOF
 
   cat > "${CFG_DIR}/real_node.conf" <<EOF
@@ -223,6 +272,21 @@ REPLICATION_ENABLED=false
 NODE_ID=${REAL_NODE_ID}
 NODE_ADDRESS=127.0.0.1:${REAL_PORT}
 GROUP_ID=${REAL_NODE_ID}
+NODE_ROLE=PRIMARY
+NODE_WEIGHT=1
+SCHEDULER_ADDR=127.0.0.1:${SCHEDULER_PORT}
+MDS_ADDR=127.0.0.1:${MDS_PORT}
+HEARTBEAT_INTERVAL_MS=2000
+EOF
+
+  cat > "${CFG_DIR}/second_real_node.conf" <<EOF
+DISK_BASE_DIR=${DATA_DIR}/real2/disks
+DISK_COUNT=${REAL_DISK_COUNT}
+DISK_CAPACITY_BYTES=${SECOND_REAL_DISK_CAPACITY_BYTES}
+REPLICATION_ENABLED=false
+NODE_ID=${SECOND_REAL_NODE_ID}
+NODE_ADDRESS=127.0.0.1:${SECOND_REAL_PORT}
+GROUP_ID=${SECOND_REAL_NODE_ID}
 NODE_ROLE=PRIMARY
 NODE_WEIGHT=1
 SCHEDULER_ADDR=127.0.0.1:${SCHEDULER_PORT}
@@ -255,6 +319,37 @@ ARCHIVE_META_SNAPSHOT_INTERVAL_OPS=20000
 ARCHIVE_META_WAL_FSYNC=false
 EOF
 
+  cat > "${CFG_DIR}/optical_node.conf" <<EOF
+NODE_ID=${OPTICAL_NODE_ID}
+NODE_ADDRESS=127.0.0.1:${OPTICAL_PORT}
+GROUP_ID=${OPTICAL_NODE_ID}
+NODE_ROLE=PRIMARY
+REPLICATION_ENABLED=false
+NODE_WEIGHT=1
+VIRTUAL_NODE_COUNT=1
+SCHEDULER_ADDR=127.0.0.1:${SCHEDULER_PORT}
+HEARTBEAT_INTERVAL_MS=2000
+DISKS=${optical_discs}
+ARCHIVE_ROOT=${DATA_DIR}/optical/archive
+CACHE_ROOT=${DATA_DIR}/optical/cache
+SIMULATE_IO=false
+OPTICAL_READ_BYTES_PER_SEC=104857600
+OPTICAL_WRITE_BYTES_PER_SEC=52428800
+CACHE_READ_BYTES_PER_SEC=419430400
+CACHE_DISC_SLOTS=4
+MAX_IMAGE_SIZE_BYTES=1073741824
+DISK_CAPACITY_BYTES=10000000000000
+MOUNT_POINT_PREFIX=${DATA_DIR}/optical/mount
+STARTUP_SCAN_MODE=fast
+EOF
+
+  local mds_nodes="${REAL_NODE_ID}@127.0.0.1:${REAL_PORT},type=REAL,weight=1;${VIRTUAL_NODE_ID}@127.0.0.1:${VIRTUAL_PORT},type=VIRTUAL,weight=8,virtual_node_count=${VIRTUAL_NODE_COUNT}"
+  local mds_disks="${REAL_NODE_ID}:${real_disks};${VIRTUAL_NODE_ID}:${virtual_disks}"
+  if [[ "${START_SECOND_REAL}" == "true" ]]; then
+    mds_nodes+=";${SECOND_REAL_NODE_ID}@127.0.0.1:${SECOND_REAL_PORT},type=REAL,weight=1"
+    mds_disks+=";${SECOND_REAL_NODE_ID}:${real_disks}"
+  fi
+
   cat > "${CFG_DIR}/mds.conf" <<EOF
 MDS_DB_PATH=${DATA_DIR}/mds/db
 SCHEDULER_ADDR=127.0.0.1:${SCHEDULER_PORT}
@@ -270,8 +365,8 @@ ARCHIVE_SCAN_INTERVAL_MS=5000
 ARCHIVE_MAX_OBJECTS_PER_ROUND=64
 ARCHIVE_META_ROOT=${DATA_DIR}/mds/archive_meta
 MASSTREE_ROOT=${DATA_DIR}/mds/masstree_meta
-NODES=${REAL_NODE_ID}@127.0.0.1:${REAL_PORT},type=REAL,weight=1;${VIRTUAL_NODE_ID}@127.0.0.1:${VIRTUAL_PORT},type=VIRTUAL,weight=8,virtual_node_count=${VIRTUAL_NODE_COUNT}
-DISKS=${REAL_NODE_ID}:${real_disks};${VIRTUAL_NODE_ID}:${virtual_disks}
+NODES=${mds_nodes}
+DISKS=${mds_disks}
 EOF
 }
 
@@ -316,6 +411,9 @@ start_all() {
   require_bin "${BUILD_DIR}/virtual_node_server"
   require_bin "${BUILD_DIR}/mds_server"
   require_bin "${BUILD_DIR}/zb_fuse_client"
+  if [[ "${START_OPTICAL}" == "true" ]]; then
+    require_bin "${BUILD_DIR}/optical_node_server"
+  fi
 
   prepare_run_dirs
   ensure_all_ports_free
@@ -327,8 +425,18 @@ start_all() {
   start_component real_node "${REAL_PORT}" \
     "${BUILD_DIR}/real_node_server" --config="${CFG_DIR}/real_node.conf" --port="${REAL_PORT}"
 
+  if [[ "${START_SECOND_REAL}" == "true" ]]; then
+    start_component second_real_node "${SECOND_REAL_PORT}" \
+      "${BUILD_DIR}/real_node_server" --config="${CFG_DIR}/second_real_node.conf" --port="${SECOND_REAL_PORT}"
+  fi
+
   start_component virtual_node "${VIRTUAL_PORT}" \
     "${BUILD_DIR}/virtual_node_server" --config="${CFG_DIR}/virtual_node.conf" --port="${VIRTUAL_PORT}"
+
+  if [[ "${START_OPTICAL}" == "true" ]]; then
+    start_component optical_node "${OPTICAL_PORT}" \
+      "${BUILD_DIR}/optical_node_server" --config="${CFG_DIR}/optical_node.conf" --port="${OPTICAL_PORT}"
+  fi
 
   start_component mds "${MDS_PORT}" \
     "${BUILD_DIR}/mds_server" --config="${CFG_DIR}/mds.conf" --port="${MDS_PORT}"
@@ -357,20 +465,26 @@ start_all() {
   fi
   log "[OK] fuse client started mount=${MOUNT_POINT}"
   log "[INFO] logs=${LOG_DIR}"
-  log "[INFO] online topology: real_nodes=1 virtual_nodes=${VIRTUAL_NODE_COUNT} real_disks_per_node=${REAL_DISK_COUNT} virtual_disks_per_pool=${VIRTUAL_DISK_COUNT} disk_capacity_bytes=${ONLINE_DISK_CAPACITY_BYTES}"
+  local real_node_count=1
+  if [[ "${START_SECOND_REAL}" == "true" ]]; then
+    real_node_count=2
+  fi
+  log "[INFO] online topology: real_nodes=${real_node_count} virtual_nodes=${VIRTUAL_NODE_COUNT} real_disks_per_node=${REAL_DISK_COUNT} virtual_disks_per_pool=${VIRTUAL_DISK_COUNT} disk_capacity_bytes=${ONLINE_DISK_CAPACITY_BYTES}"
 }
 
 stop_all() {
   unmount_fuse
   stop_by_name "fuse"
   stop_by_name "mds"
+  stop_by_name "optical_node"
   stop_by_name "virtual_node"
+  stop_by_name "second_real_node"
   stop_by_name "real_node"
   stop_by_name "scheduler"
 }
 
 status_all() {
-  local names=("scheduler" "real_node" "virtual_node" "mds" "fuse")
+  local names=("scheduler" "real_node" "second_real_node" "virtual_node" "optical_node" "mds" "fuse")
   local name pid
   for name in "${names[@]}"; do
     pid="$(read_pid "${name}" || true)"

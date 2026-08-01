@@ -1,13 +1,15 @@
 #pragma once
 
 #include "VirtualStorageServiceImpl.h"
+#include "common/metrics/NodeMetricsCollector.h"
 #include "real_node.pb.h"
 
 namespace zb::virtual_node {
 
 class BrpcVirtualStorageService : public zb::rpc::RealNodeService {
 public:
-    explicit BrpcVirtualStorageService(VirtualStorageServiceImpl* service);
+    explicit BrpcVirtualStorageService(VirtualStorageServiceImpl* service,
+                                       zb::metrics::NodeMetricsCollector* metrics = nullptr);
 
     void WriteObject(google::protobuf::RpcController* cntl_base,
                      const zb::rpc::WriteObjectRequest* request,
@@ -23,6 +25,11 @@ public:
                       const zb::rpc::DeleteObjectRequest* request,
                       zb::rpc::DeleteObjectReply* response,
                       google::protobuf::Closure* done) override;
+
+    void ListObjects(google::protobuf::RpcController* cntl_base,
+                     const zb::rpc::ListObjectsRequest* request,
+                     zb::rpc::ListObjectsReply* response,
+                     google::protobuf::Closure* done) override;
 
     void ResetNodeData(google::protobuf::RpcController* cntl_base,
                        const zb::rpc::ResetNodeDataRequest* request,
@@ -71,6 +78,7 @@ public:
 
 private:
     VirtualStorageServiceImpl* service_{};
+    zb::metrics::NodeMetricsCollector* metrics_{};
 };
 
 } // namespace zb::virtual_node

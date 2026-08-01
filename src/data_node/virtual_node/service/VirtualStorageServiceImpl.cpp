@@ -1331,6 +1331,55 @@ std::string VirtualStorageServiceImpl::BuildStableObjectId(uint64_t inode_id, ui
     return "obj-" + std::to_string(inode_id) + "-" + std::to_string(object_index);
 }
 
+std::vector<real_node::ArchiveObjectMeta> VirtualStorageServiceImpl::ListTrackedObjects() const {
+    const auto tracked = archive_meta_store_.SnapshotMetas();
+    std::unordered_map<std::string, real_node::ArchiveObjectMeta> tracked_by_key;
+    for (const auto& meta : tracked) tracked_by_key[BuildObjectKey(meta.disk_id, meta.object_id)] = meta;
+    std::vector<real_node::ArchiveObjectMeta> out;
+    std::lock_guard<std::mutex> lock(object_mu_);
+    if (!file_meta_loaded_) {
+        std::string ignored;
+        (void)InitFileMetaStorePath();
+        (void)LoadFileMetaStoreLocked(&ignored);
+    }
+    out.reserve(object_sizes_.size() + preloaded_file_objects_.size());
+    std::unordered_set<std::string> emitted;
+    for (const auto& entry : object_sizes_) {
+        const size_t split = entry.first.find('|');
+        if (split == std::string::npos || split == 0 || split + 1 == entry.first.size()) continue;
+        real_node::ArchiveObjectMeta meta;
+        meta.disk_id = entry.first.substr(0, split);
+        meta.object_id = entry.first.substr(split + 1);
+        meta.size_bytes = entry.second;
+        auto tracked_it = tracked_by_key.find(entry.first);
+        if (tracked_it != tracked_by_key.end()) {
+            meta.checksum = tracked_it->second.checksum;
+            meta.last_access_ts_ms = tracked_it->second.last_access_ts_ms;
+        }
+        out.push_back(std::move(meta));
+        emitted.insert(entry.first);
+    }
+    for (const auto& preload : preloaded_file_objects_) {
+        auto file_it = file_meta_by_inode_.find(preload.first);
+        if (file_it == file_meta_by_inode_.end() || file_it->second.object_unit_size == 0) continue;
+        const uint64_t count = file_it->second.file_size == 0 ? 0 :
+            (file_it->second.file_size + file_it->second.object_unit_size - 1) /
+            file_it->second.object_unit_size;
+        for (uint64_t index = 0; index < count && index <= UINT32_MAX; ++index) {
+            real_node::ArchiveObjectMeta meta;
+            meta.disk_id = preload.second.home_disk_id;
+            meta.object_id = BuildStableObjectId(preload.first, static_cast<uint32_t>(index));
+            const std::string key = BuildObjectKey(meta.disk_id, meta.object_id);
+            if (!emitted.insert(key).second) continue;
+            const uint64_t offset = index * file_it->second.object_unit_size;
+            meta.size_bytes = std::min<uint64_t>(file_it->second.object_unit_size,
+                                                 file_it->second.file_size - offset);
+            out.push_back(std::move(meta));
+        }
+    }
+    return out;
+}
+
 bool VirtualStorageServiceImpl::ParseStableObjectId(const std::string& object_id,
                                                     uint64_t* inode_id,
                                                     uint32_t* object_index) {

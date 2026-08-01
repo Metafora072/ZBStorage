@@ -216,6 +216,7 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
     if (cfg.available_volume_id_count == 0) {
         cfg.available_volume_id_count = 5;
     }
+    if (cfg.library_disc_slots == 0) cfg.library_disc_slots = 10000;
     return cfg;
 }
 

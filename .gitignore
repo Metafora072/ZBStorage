@@ -1,5 +1,6 @@
 # 忽略编译目录
 build/
+build-release/
 cmake-build-debug/
 
 # 忽略日志文件
@@ -21,6 +22,10 @@ tests/*/results/
 *.o
 *.a
 *.so
+
+# 忽略 Python 运行缓存
+__pycache__/
+*.py[cod]
 
 # Ignore large masstree benchmark datasets and outputs
 masstree/Bplustreetest/txt/file_info.txt

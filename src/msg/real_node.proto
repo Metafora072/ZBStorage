@@ -86,6 +86,29 @@ message DeleteObjectReply {
   Status status = 1;
 }
 
+message StoredObjectInfo {
+  string disk_id = 1;
+  string object_id = 2;
+  uint64 size_bytes = 3;
+  uint64 checksum = 4;
+  uint64 last_access_ts_ms = 5;
+}
+
+message ListObjectsRequest {
+  // Opaque decimal offset returned by the previous response.  Listing is a
+  // stable snapshot for the duration of one drain enumeration.
+  string page_token = 1;
+  uint32 max_objects = 2;
+}
+
+message ListObjectsReply {
+  Status status = 1;
+  repeated StoredObjectInfo objects = 2;
+  string next_page_token = 3;
+  uint64 total_objects = 4;
+  uint64 total_bytes = 5;
+}
+
 message ResetNodeDataRequest {
   string confirm_token = 1;
   bool purge_objects = 2;
@@ -215,6 +238,7 @@ service RealNodeService {
   rpc WriteObject(WriteObjectRequest) returns (WriteObjectReply);
   rpc ReadObject(ReadObjectRequest) returns (ReadObjectReply);
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectReply);
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsReply);
   rpc ResetNodeData(ResetNodeDataRequest) returns (ResetNodeDataReply);
   rpc ReadArchivedFile(ReadArchivedFileRequest) returns (ReadArchivedFileReply);
   rpc UpdateArchiveState(UpdateArchiveStateRequest) returns (UpdateArchiveStateReply);

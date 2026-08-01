@@ -42,6 +42,7 @@ struct MdsConfig {
     std::string db_path;
     std::string scheduler_address;
     uint32_t scheduler_refresh_ms{2000};
+    std::string managed_node_id;
     uint64_t pg_view_epoch{1};
     uint32_t pg_count{1024};
     bool strict_tier_bypass_pg{false};

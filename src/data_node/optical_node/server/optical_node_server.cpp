@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -39,7 +40,12 @@ public:
                                uint32_t node_weight,
                                uint32_t virtual_node_count,
                                uint32_t interval_ms,
-                               zb::optical_node::OpticalStorageServiceImpl* service)
+                               uint32_t library_disc_slots,
+                               uint64_t read_bandwidth_bytes_per_sec,
+                               uint64_t write_bandwidth_bytes_per_sec,
+                               std::string staging_path,
+                               zb::optical_node::OpticalStorageServiceImpl* service,
+                               zb::metrics::NodeMetricsCollector* metrics)
         : scheduler_addr_(std::move(scheduler_addr)),
           node_id_(std::move(node_id)),
           node_address_(std::move(node_address)),
@@ -50,7 +56,12 @@ public:
           node_weight_(node_weight == 0 ? 1 : node_weight),
           virtual_node_count_(virtual_node_count == 0 ? 1 : virtual_node_count),
           interval_ms_(interval_ms == 0 ? 2000 : interval_ms),
-          service_(service) {}
+          library_disc_slots_(library_disc_slots == 0 ? 10000 : library_disc_slots),
+          read_bandwidth_bytes_per_sec_(read_bandwidth_bytes_per_sec),
+          write_bandwidth_bytes_per_sec_(write_bandwidth_bytes_per_sec),
+          staging_path_(std::move(staging_path)),
+          service_(service),
+          metrics_(metrics) {}
 
     bool Start() {
         if (scheduler_addr_.empty() || !service_) {
@@ -100,6 +111,10 @@ private:
             request.set_peer_node_id(peer_node_id_);
             request.set_peer_address(peer_address_);
             request.set_applied_lsn(service_->GetReplicationStatus().applied_lsn);
+            request.set_readiness_reported(true);
+            request.set_initialization_complete(true);
+            request.set_metadata_ready(true);
+            request.set_readiness_message("optical image store initialized");
 
             zb::rpc::HeartbeatReply response;
             brpc::Controller cntl;
@@ -117,6 +132,50 @@ private:
                                                    response.primary_address(),
                                                    response.secondary_node_id(),
                                                    response.secondary_address());
+                zb::rpc::ReportOpticalLibraryStatusRequest status_request;
+                status_request.set_node_id(node_id_);
+                auto* status = status_request.mutable_status();
+                status->set_observed(true);
+                status->set_total_slots(std::max<uint32_t>(library_disc_slots_, reports.reports.size()));
+                status->set_local_disc_count(static_cast<uint32_t>(reports.reports.size()));
+                for (const auto& disc : reports.reports) {
+                    if (!disc.is_healthy) {
+                        status->set_defective_disc_count(status->defective_disc_count() + 1);
+                    } else if (disc.free_bytes == disc.capacity_bytes) {
+                        status->set_blank_disc_count(status->blank_disc_count() + 1);
+                    } else {
+                        status->set_recorded_disc_count(status->recorded_disc_count() + 1);
+                    }
+                }
+                status->set_observed_at_ms(NowMs());
+                std::error_code space_error;
+                const auto space = std::filesystem::space(staging_path_, space_error);
+                if (!space_error) {
+                    status->set_staging_capacity_bytes(space.capacity);
+                    status->set_staging_used_bytes(space.capacity - space.available);
+                }
+                // Writes in the current optical service are synchronous; the
+                // controller therefore has no hidden queued write after an RPC returns.
+                status->set_pending_write_tasks(0);
+                zb::rpc::ManagedNodeReply status_reply;
+                brpc::Controller status_cntl;
+                stub.ReportOpticalLibraryStatus(&status_cntl, &status_request, &status_reply, nullptr);
+                if (status_cntl.Failed() ||
+                    status_reply.status().code() != zb::rpc::SCHED_OK) {
+                    std::cerr << "Optical library inventory report failed: "
+                              << (status_cntl.Failed() ? status_cntl.ErrorText()
+                                                      : status_reply.status().message())
+                              << std::endl;
+                }
+                std::string metrics_error;
+                if (!zb::metrics::ReportCollectedMetrics(channel.get(),
+                                                         node_id_,
+                                                         metrics_,
+                                                         zb::rpc::MANAGED_ACCESS_OPTICAL_DISC,
+                                                         NowMs(),
+                                                         &metrics_error)) {
+                    std::cerr << "Scheduler metrics report failed: " << metrics_error << std::endl;
+                }
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_));
@@ -133,7 +192,12 @@ private:
     uint32_t node_weight_{1};
     uint32_t virtual_node_count_{1};
     uint32_t interval_ms_{2000};
+    uint32_t library_disc_slots_{10000};
+    uint64_t read_bandwidth_bytes_per_sec_{100000000ULL};
+    uint64_t write_bandwidth_bytes_per_sec_{10000000ULL};
+    std::string staging_path_;
     zb::optical_node::OpticalStorageServiceImpl* service_{};
+    zb::metrics::NodeMetricsCollector* metrics_{};
     std::atomic<bool> stop_{false};
     std::thread thread_;
 };
@@ -208,15 +272,18 @@ int main(int argc, char* argv[]) {
                                         cfg.node_weight,
                                         cfg.virtual_node_count,
                                         cfg.heartbeat_interval_ms,
-                                        &storage_service);
-    if (!cfg.scheduler_addr.empty()) {
-        reporter.Start();
-    }
-
+                                        cfg.library_disc_slots,
+                                        cfg.optical_read_bytes_per_sec,
+                                        cfg.optical_write_bytes_per_sec,
+                                        cfg.cache_root,
+                                        &storage_service,
+                                        &node_metrics);
     if (server.Start(FLAGS_port, &options) != 0) {
         std::cerr << "Failed to start brpc server on port " << FLAGS_port << std::endl;
         return 1;
     }
+
+    if (!cfg.scheduler_addr.empty()) reporter.Start();
 
     server.RunUntilAskedToQuit();
     reporter.Stop();

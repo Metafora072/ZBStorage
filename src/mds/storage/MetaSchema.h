@@ -35,6 +35,10 @@ inline std::string PathPlacementPolicyPrefix() {
     return "PR/";
 }
 
+inline std::string CmsNodeCatalogSnapshotKey() {
+    return "SYS/CMS_NODE_CATALOG_V1";
+}
+
 inline std::string ArchiveNamespaceRouteKey(const std::string& normalized_path_prefix) {
     return "AN" + normalized_path_prefix;
 }

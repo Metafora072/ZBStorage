@@ -38,6 +38,12 @@ set(ROCKSDB_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(ROCKSDB_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ROCKSDB_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(ROCKSDB_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+# Upstream RocksDB uses WITH_* switches. Disable its private test/tool matrix
+# so the top-level ZBStorage CTest suite contains only built project tests.
+set(WITH_TESTS OFF CACHE BOOL "" FORCE)
+set(WITH_ALL_TESTS OFF CACHE BOOL "" FORCE)
+set(WITH_TOOLS OFF CACHE BOOL "" FORCE)
+set(WITH_BENCHMARK_TOOLS OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(${ROCKSDB_ROOT} ${CMAKE_CURRENT_BINARY_DIR}/third_party/rocksdb EXCLUDE_FROM_ALL)
 
@@ -73,6 +79,8 @@ target_include_directories(zb_proto PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(zb_proto PUBLIC ${Protobuf_LIBRARIES})
 
 set(REAL_NODE_SOURCES
+    src/common/metrics/NodeMetricsCollector.cpp
+    src/common/metrics/SchedulerMetricsClient.cpp
     src/data_node/real_node/config/NodeConfig.cpp
     src/data_node/real_node/io/DiskManager.cpp
     src/data_node/real_node/io/LocalPathResolver.cpp
@@ -108,6 +116,8 @@ if(BRPC_DYNAMIC_LIB)
 endif()
 
 add_executable(virtual_node_server
+    src/common/metrics/NodeMetricsCollector.cpp
+    src/common/metrics/SchedulerMetricsClient.cpp
     src/data_node/virtual_node/config/VirtualNodeConfig.cpp
     src/data_node/common/VirtualObjectStore.cpp
     src/data_node/real_node/service/ArchiveFileMetaStore.cpp
@@ -163,6 +173,8 @@ if(BRPC_DYNAMIC_LIB)
 endif()
 
 add_executable(optical_node_server
+    src/common/metrics/NodeMetricsCollector.cpp
+    src/common/metrics/SchedulerMetricsClient.cpp
     src/data_node/optical_node/config/OpticalNodeConfig.cpp
     src/data_node/optical_node/service/OpticalStorageServiceImpl.cpp
     src/data_node/optical_node/service/BrpcOpticalNodeService.cpp
@@ -772,11 +784,14 @@ add_executable(mds_server
     src/mds/storage/MetaStoreRouter.cpp
     src/mds/storage/RocksMetaStore.cpp
     src/mds/allocator/NodeStateCache.cpp
+    src/mds/allocator/CmsNodeRegistry.cpp
     src/mds/allocator/PGManager.cpp
     src/mds/allocator/ObjectAllocator.cpp
     src/mds/archive/ArchiveBatchStager.cpp
     src/mds/archive/ArchiveLeaseManager.cpp
     src/mds/archive/OpticalArchiveManager.cpp
+    src/common/metrics/NodeMetricsCollector.cpp
+    src/common/metrics/SchedulerMetricsClient.cpp
     src/mds/service/MdsServiceImpl.cpp
     src/mds/server/mds_server.cpp
 )
@@ -824,12 +839,156 @@ if(BRPC_DYNAMIC_LIB)
     target_link_libraries(mds_server PRIVATE ${BRPC_DYNAMIC_LIB})
 endif()
 
+add_library(zb_storage_model
+    src/storage_model/StorageModel.cpp
+)
+target_include_directories(zb_storage_model
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+set_target_properties(zb_storage_model PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+)
+
+add_executable(storage_model_test
+    tests/storage_model_test.cpp
+)
+target_link_libraries(storage_model_test PRIVATE zb_storage_model)
+if(BUILD_TESTING)
+    add_test(NAME storage_model_test COMMAND storage_model_test)
+endif()
+
+add_library(scheduler_node_model
+    src/scheduler/model/ManagedNode.cpp
+    src/scheduler/power/NodePowerManager.cpp
+)
+target_include_directories(scheduler_node_model
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+set_target_properties(scheduler_node_model PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+)
+target_link_libraries(scheduler_node_model PUBLIC zb_storage_model)
+
+add_executable(scheduler_node_model_test
+    tests/scheduler_node_model_test.cpp
+)
+target_link_libraries(scheduler_node_model_test PRIVATE scheduler_node_model)
+if(BUILD_TESTING)
+    add_test(NAME scheduler_node_model_test COMMAND scheduler_node_model_test)
+endif()
+
+add_executable(node_metrics_collector_test
+    tests/node_metrics_collector_test.cpp
+    src/common/metrics/NodeMetricsCollector.cpp
+)
+target_include_directories(node_metrics_collector_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+if(BUILD_TESTING)
+    add_test(NAME node_metrics_collector_test COMMAND node_metrics_collector_test)
+endif()
+
+add_executable(scheduler_snapshot_test
+    tests/scheduler_snapshot_test.cpp
+    src/scheduler/persistence/ManagedNodeSnapshotStore.cpp
+    src/scheduler/service/ManagedNodeProtoAdapter.cpp
+)
+target_include_directories(scheduler_snapshot_test
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_BINARY_DIR}
+)
+target_link_libraries(scheduler_snapshot_test PRIVATE scheduler_node_model zb_proto ${Protobuf_LIBRARIES})
+if(BUILD_TESTING)
+    add_test(NAME scheduler_snapshot_test COMMAND scheduler_snapshot_test)
+endif()
+
+add_executable(scheduler_managed_service_test
+    tests/scheduler_managed_service_test.cpp
+    src/scheduler/health/FailureDetector.cpp
+    src/scheduler/model/ClusterState.cpp
+    src/scheduler/lifecycle/LifecycleManager.cpp
+    src/scheduler/migration/DrainMigrationCoordinator.cpp
+    src/scheduler/service/ManagedNodeProtoAdapter.cpp
+    src/scheduler/service/SchedulerServiceImpl.cpp
+)
+target_include_directories(scheduler_managed_service_test
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
+        ${GFLAGS_INCLUDE_PATH}
+        ${CMAKE_CURRENT_BINARY_DIR}
+)
+target_link_libraries(scheduler_managed_service_test
+    PRIVATE
+        scheduler_node_model
+        zb_proto
+        brpc-static
+        ${GFLAGS_LIBRARY}
+        ${CMAKE_THREAD_LIBS_INIT}
+)
+if(BRPC_DYNAMIC_LIB)
+    target_link_libraries(scheduler_managed_service_test PRIVATE ${BRPC_DYNAMIC_LIB})
+endif()
+if(BUILD_TESTING)
+    add_test(NAME scheduler_managed_service_test COMMAND scheduler_managed_service_test)
+endif()
+
+add_executable(scheduler_drain_migration_test
+    tests/scheduler_drain_migration_test.cpp
+    src/scheduler/health/FailureDetector.cpp
+    src/scheduler/model/ClusterState.cpp
+    src/scheduler/lifecycle/LifecycleManager.cpp
+    src/scheduler/migration/DrainMigrationCoordinator.cpp
+)
+target_include_directories(scheduler_drain_migration_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(scheduler_drain_migration_test PRIVATE
+    scheduler_node_model zb_proto ${Protobuf_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
+if(BUILD_TESTING)
+    add_test(NAME scheduler_drain_migration_test COMMAND scheduler_drain_migration_test)
+endif()
+
+add_executable(cms_node_registry_test
+    tests/cms_node_registry_test.cpp
+    src/mds/allocator/CmsNodeRegistry.cpp
+    src/mds/allocator/NodeStateCache.cpp
+    src/mds/allocator/PGManager.cpp
+    src/mds/storage/RocksMetaStore.cpp
+)
+target_include_directories(cms_node_registry_test
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${ROCKSDB_ROOT}/include
+)
+target_link_libraries(cms_node_registry_test PRIVATE
+    zb_proto ${CMAKE_THREAD_LIBS_INIT} ${ROCKSDB_TARGET})
+set_target_properties(cms_node_registry_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+)
+if(BUILD_TESTING)
+    add_test(NAME cms_node_registry_test COMMAND cms_node_registry_test)
+endif()
+
 add_executable(scheduler_server
+    src/scheduler/cms/CmsNodeCatalogPublisher.cpp
     src/scheduler/config/SchedulerConfig.cpp
     src/scheduler/health/FailureDetector.cpp
     src/scheduler/model/ClusterState.cpp
     src/scheduler/lifecycle/NodeActuator.cpp
     src/scheduler/lifecycle/LifecycleManager.cpp
+    src/scheduler/migration/DrainMigrationCoordinator.cpp
+    src/scheduler/migration/BrpcObjectMigrationBackend.cpp
+    src/scheduler/power/PowerActuationController.cpp
+    src/scheduler/persistence/ManagedNodeSnapshotStore.cpp
+    src/scheduler/service/ManagedNodeProtoAdapter.cpp
     src/scheduler/service/SchedulerServiceImpl.cpp
     src/scheduler/server/scheduler_server.cpp
 )
@@ -842,6 +1001,7 @@ target_include_directories(scheduler_server
 )
 target_link_libraries(scheduler_server
     PRIVATE
+        scheduler_node_model
         zb_proto
         brpc-static
         ${GFLAGS_LIBRARY}
@@ -849,6 +1009,26 @@ target_link_libraries(scheduler_server
 )
 if(BRPC_DYNAMIC_LIB)
     target_link_libraries(scheduler_server PRIVATE ${BRPC_DYNAMIC_LIB})
+endif()
+
+add_executable(scheduler_trace_replay
+    tools/workload_trace/replay_trace.cpp
+)
+target_include_directories(scheduler_trace_replay
+    PRIVATE
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
+        ${GFLAGS_INCLUDE_PATH}
+        ${CMAKE_CURRENT_BINARY_DIR}
+)
+target_link_libraries(scheduler_trace_replay
+    PRIVATE
+        zb_proto
+        brpc-static
+        ${GFLAGS_LIBRARY}
+        ${CMAKE_THREAD_LIBS_INIT}
+)
+if(BRPC_DYNAMIC_LIB)
+    target_link_libraries(scheduler_trace_replay PRIVATE ${BRPC_DYNAMIC_LIB})
 endif()
 
 add_executable(api_gateway

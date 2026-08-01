@@ -6,12 +6,14 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "../allocator/ObjectAllocator.h"
+#include "../allocator/CmsNodeRegistry.h"
 #include "../archive_meta/ArchiveGenerationPublisher.h"
 #include "../archive_meta/ArchiveImportService.h"
 #include "../archive_meta/ArchiveMetaStore.h"
@@ -28,6 +30,7 @@
 #include "../storage/MetaSchema.h"
 #include "../storage/RocksMetaStore.h"
 #include "mds.pb.h"
+#include "common/metrics/NodeMetricsCollector.h"
 
 namespace zb::mds {
 
@@ -46,9 +49,13 @@ public:
                    uint64_t masstree_preload_memory_reserve_bytes,
                    double masstree_preload_estimate_multiplier,
                    bool masstree_preload_background,
+                   CmsNodeRegistry* node_registry,
                    FileArchiveCandidateQueue* candidate_queue = nullptr,
                    ArchiveLeaseManager* lease_manager = nullptr);
     ~MdsServiceImpl() override;
+
+    zb::metrics::NodeMetricsCollector* MetricsCollector() { return &metrics_; }
+    std::shared_mutex* PlacementTransactionMutex() { return &placement_transaction_mu_; }
 
     void Lookup(google::protobuf::RpcController* cntl_base,
                 const zb::rpc::LookupRequest* request,
@@ -103,6 +110,22 @@ public:
                        const zb::rpc::GetFileLocationRequest* request,
                        zb::rpc::GetFileLocationReply* response,
                        google::protobuf::Closure* done) override;
+    void CommitFileMigration(google::protobuf::RpcController* cntl_base,
+                             const zb::rpc::CommitFileMigrationRequest* request,
+                             zb::rpc::CommitFileMigrationReply* response,
+                             google::protobuf::Closure* done) override;
+    void CommitCmsNodeCatalog(google::protobuf::RpcController* cntl_base,
+                              const zb::rpc::CommitCmsNodeCatalogRequest* request,
+                              zb::rpc::CommitCmsNodeCatalogReply* response,
+                              google::protobuf::Closure* done) override;
+    void GetCmsNodeCatalog(google::protobuf::RpcController* cntl_base,
+                           const zb::rpc::GetCmsNodeCatalogRequest* request,
+                           zb::rpc::GetCmsNodeCatalogReply* response,
+                           google::protobuf::Closure* done) override;
+    void VerifyNodeReferences(google::protobuf::RpcController* cntl_base,
+                              const zb::rpc::VerifyNodeReferencesRequest* request,
+                              zb::rpc::VerifyNodeReferencesReply* response,
+                              google::protobuf::Closure* done) override;
     void UpdateInodeStat(google::protobuf::RpcController* cntl_base,
                          const zb::rpc::UpdateInodeStatRequest* request,
                          zb::rpc::UpdateInodeStatReply* response,
@@ -290,6 +313,7 @@ private:
 
     RocksMetaStore* store_{};
     ObjectAllocator* allocator_{};
+    CmsNodeRegistry* node_registry_{};
     uint64_t default_object_unit_size_{0};
     std::string archive_meta_root_;
     std::string masstree_root_;
@@ -316,9 +340,14 @@ private:
     std::unordered_map<std::string, std::shared_ptr<MasstreeImportJob>> masstree_import_jobs_;
     std::thread masstree_import_worker_;
     std::thread masstree_preload_worker_;
+    zb::metrics::NodeMetricsCollector metrics_;
     uint64_t masstree_import_next_job_id_{1};
     bool stop_masstree_import_worker_{false};
     mutable std::mutex channel_mu_;
+    mutable std::mutex file_migration_mu_;
+    // Shared by Create and exclusively held by catalog admission changes and
+    // retirement verification. This closes the allocation-vs-retire race.
+    mutable std::shared_mutex placement_transaction_mu_;
     std::unordered_map<std::string, std::unique_ptr<brpc::Channel>> channels_;
 };
 

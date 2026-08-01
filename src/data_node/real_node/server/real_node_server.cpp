@@ -18,6 +18,7 @@
 #include "../io/LocalPathResolver.h"
 #include "../service/BrpcStorageService.h"
 #include "../service/StorageServiceImpl.h"
+#include "common/metrics/SchedulerMetricsClient.h"
 #include "mds.pb.h"
 #include "scheduler.pb.h"
 
@@ -45,8 +46,11 @@ public:
                                std::string peer_address,
                                uint32_t node_weight,
                                uint32_t interval_ms,
+                               uint64_t read_bandwidth_bytes_per_sec,
+                               uint64_t write_bandwidth_bytes_per_sec,
                                zb::real_node::DiskManager* disk_manager,
-                               zb::real_node::StorageServiceImpl* storage_service)
+                               zb::real_node::StorageServiceImpl* storage_service,
+                               zb::metrics::NodeMetricsCollector* metrics)
         : scheduler_addr_(std::move(scheduler_addr)),
           node_id_(std::move(node_id)),
           node_address_(std::move(node_address)),
@@ -56,8 +60,11 @@ public:
           peer_address_(std::move(peer_address)),
           node_weight_(node_weight == 0 ? 1 : node_weight),
           interval_ms_(interval_ms == 0 ? 2000 : interval_ms),
+          read_bandwidth_bytes_per_sec_(read_bandwidth_bytes_per_sec),
+          write_bandwidth_bytes_per_sec_(write_bandwidth_bytes_per_sec),
           disk_manager_(disk_manager),
-          storage_service_(storage_service) {}
+          storage_service_(storage_service),
+          metrics_(metrics) {}
 
     bool Start() {
         if (scheduler_addr_.empty() || !disk_manager_ || !storage_service_) {
@@ -107,6 +114,10 @@ private:
             request.set_peer_node_id(peer_node_id_);
             request.set_peer_address(peer_address_);
             request.set_applied_lsn(storage_service_->GetReplicationStatus().applied_lsn);
+            request.set_readiness_reported(true);
+            request.set_initialization_complete(true);
+            request.set_metadata_ready(true);
+            request.set_readiness_message("real node storage initialized");
 
             const zb::msg::Status refresh_status = disk_manager_->Refresh();
             if (!refresh_status.ok()) {
@@ -120,6 +131,9 @@ private:
                 out->set_capacity_bytes(disk.capacity_bytes);
                 out->set_free_bytes(disk.free_bytes);
                 out->set_is_healthy(disk.is_healthy);
+                out->set_device_kind(zb::rpc::MANAGED_DEVICE_HDD);
+                out->set_read_bandwidth_bytes_per_sec(read_bandwidth_bytes_per_sec_);
+                out->set_write_bandwidth_bytes_per_sec(write_bandwidth_bytes_per_sec_);
             }
 
             zb::rpc::HeartbeatReply response;
@@ -138,6 +152,15 @@ private:
                                                            response.primary_address(),
                                                            response.secondary_node_id(),
                                                            response.secondary_address());
+                std::string metrics_error;
+                if (!zb::metrics::ReportCollectedMetrics(channel.get(),
+                                                         node_id_,
+                                                         metrics_,
+                                                         zb::rpc::MANAGED_ACCESS_DEFAULT,
+                                                         NowMs(),
+                                                         &metrics_error)) {
+                    std::cerr << "Scheduler metrics report failed: " << metrics_error << std::endl;
+                }
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_));
@@ -153,8 +176,11 @@ private:
     std::string peer_address_;
     uint32_t node_weight_{1};
     uint32_t interval_ms_{2000};
+    uint64_t read_bandwidth_bytes_per_sec_{200000000ULL};
+    uint64_t write_bandwidth_bytes_per_sec_{200000000ULL};
     zb::real_node::DiskManager* disk_manager_{};
     zb::real_node::StorageServiceImpl* storage_service_{};
+    zb::metrics::NodeMetricsCollector* metrics_{};
     std::atomic<bool> stop_{false};
     std::thread thread_;
 };
@@ -331,7 +357,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "Archive meta init failed: " << archive_meta_error << std::endl;
         return 1;
     }
-    zb::real_node::BrpcStorageService brpc_service(&storage_service);
+    zb::metrics::NodeMetricsCollector node_metrics;
+    zb::real_node::BrpcStorageService brpc_service(&storage_service, &node_metrics);
 
     brpc::Server server;
     if (server.AddService(&brpc_service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
@@ -365,12 +392,11 @@ int main(int argc, char* argv[]) {
                                         cfg.peer_address,
                                         cfg.node_weight,
                                         cfg.heartbeat_interval_ms,
+                                        cfg.disk_read_bytes_per_sec,
+                                        cfg.disk_write_bytes_per_sec,
                                         &disk_manager,
-                                        &storage_service);
-    if (!cfg.scheduler_addr.empty()) {
-        reporter.Start();
-    }
-
+                                        &storage_service,
+                                        &node_metrics);
     ArchiveCandidateReporter archive_reporter(cfg.mds_addr,
                                               node_id,
                                               node_address,
@@ -386,6 +412,10 @@ int main(int argc, char* argv[]) {
         std::cerr << "Failed to start brpc server on port " << FLAGS_port << std::endl;
         return 1;
     }
+
+    // A node may enter the Scheduler working set only after its data RPC
+    // endpoint is accepting requests.
+    if (!cfg.scheduler_addr.empty()) reporter.Start();
 
     server.RunUntilAskedToQuit();
     std::string snapshot_error;

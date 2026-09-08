@@ -7,6 +7,9 @@ logs/
 *.log
 .demo_run/
 
+# 忽略各测试模块生成的结果和日志
+tests/*/results/
+
 # 忽略 IDE 配置（如果你用 VSCode 或 CLion）
 .vscode/
 .idea/

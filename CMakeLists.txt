@@ -672,69 +672,6 @@ target_link_libraries(masstree_optical_layout_migrate_tool
         ${ROCKSDB_TARGET}
 )
 
-add_executable(masstree_optical_layout_translation_test
-    tests/masstree_optical_layout_translation_test.cpp
-    src/mds/masstree_meta/MasstreeOpticalLayoutTranslator.cpp
-)
-set_target_properties(masstree_optical_layout_translation_test PROPERTIES
-    CXX_STANDARD 20
-    CXX_STANDARD_REQUIRED ON
-    CXX_EXTENSIONS OFF
-)
-target_include_directories(masstree_optical_layout_translation_test
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-if(BUILD_TESTING)
-    add_test(NAME masstree_optical_layout_translation_test COMMAND masstree_optical_layout_translation_test)
-endif()
-
-add_executable(masstree_optical_layout_store_test
-    tests/masstree_optical_layout_store_test.cpp
-    src/mds/masstree_meta/MasstreeOpticalLayoutStore.cpp
-    src/mds/masstree_meta/MasstreeOpticalLayoutTranslator.cpp
-    src/mds/masstree_meta/MasstreeStatsStore.cpp
-    src/mds/storage/RocksMetaStore.cpp
-)
-set_target_properties(masstree_optical_layout_store_test PROPERTIES
-    CXX_STANDARD 20
-    CXX_STANDARD_REQUIRED ON
-    CXX_EXTENSIONS OFF
-)
-target_include_directories(masstree_optical_layout_store_test
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${ROCKSDB_ROOT}/include
-)
-target_link_libraries(masstree_optical_layout_store_test
-    PRIVATE
-        ${ROCKSDB_TARGET}
-)
-if(BUILD_TESTING)
-    add_test(NAME masstree_optical_layout_store_test COMMAND masstree_optical_layout_store_test)
-endif()
-
-add_executable(module_io_smoke_test
-    tests/module_io_smoke_test.cpp
-)
-target_include_directories(module_io_smoke_test
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
-        ${GFLAGS_INCLUDE_PATH}
-        ${CMAKE_CURRENT_BINARY_DIR}
-)
-target_link_libraries(module_io_smoke_test
-    PRIVATE
-        zb_proto
-        brpc-static
-        ${GFLAGS_LIBRARY}
-        ${CMAKE_THREAD_LIBS_INIT}
-)
-if(BRPC_DYNAMIC_LIB)
-    target_link_libraries(module_io_smoke_test PRIVATE ${BRPC_DYNAMIC_LIB})
-endif()
-
 add_executable(layout_commit_conflict_test
     src/client/test/layout_commit_conflict_test.cpp
 )

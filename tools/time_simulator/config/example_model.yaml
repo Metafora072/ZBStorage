@@ -1,0 +1,167 @@
+simulation:
+  # 仿真时间步数量
+  total_steps: 3
+
+  # day / week / month / year / custom
+  time_unit: day
+
+  # full / sampled / model
+  execution_mode: model
+
+  # 仿真结果输出目录
+  output_dir: ./time_sim_output/model
+
+  # full、sampled 模式下使用的 FUSE 挂载点
+  # model 模式可以为空
+  mount_point: ""
+
+  # 固定随机种子，保证相同配置可以复现
+  random_seed: 20260624
+
+  # 是否允许从上次状态继续运行
+  resume: true
+
+  # time_unit=custom 时使用
+  custom_step_duration_us: 0
+
+
+workload:
+  # 每个时间步的逻辑写请求数
+  writes_per_step: 1000
+
+  # 每个时间步的逻辑读请求数
+  reads_per_step: 5000
+
+  # 热点文件占全部文件的比例
+  hot_file_ratio: 0.20
+
+  # 热点文件承担的读请求比例
+  hot_request_ratio: 0.80
+
+  # 请求在时间步内的到达时间范围
+  # 一天：86400 * 1000000
+  arrival_window_us: 86400000000
+
+  file_size_distribution:
+    small:
+      ratio: 0.70
+      min_bytes: 4096
+      max_bytes: 1048576
+
+    medium:
+      ratio: 0.25
+      min_bytes: 1048577
+      max_bytes: 134217728
+
+    large:
+      ratio: 0.05
+      min_bytes: 134217729
+      max_bytes: 1073741824
+
+
+sampling:
+  # stratified：分层采样
+  strategy: stratified
+
+  # 每个分层至少执行多少个真实样本
+  min_samples_per_stratum: 100
+
+  # 默认采样比例
+  default_sample_ratio: 0.01
+
+  strata:
+    - op_type
+    - file_size_class
+    - heat_class
+    - access_pattern
+    - storage_tier
+
+
+capacity:
+  # 集群逻辑总容量，默认 100 TiB
+  total_capacity_bytes: 109951162777600
+
+  # 数据副本数
+  replica_factor: 3
+
+  # 压缩后大小 / 原始大小
+  # 1.0 表示不压缩
+  compression_ratio: 1.0
+
+  # ZBStorage 对象切片大小，默认 64 MiB
+  object_unit_size_bytes: 67108864
+
+  # 每个文件的估计元数据开销
+  metadata_bytes_per_file: 512
+
+
+resources:
+  client_thread_pool:
+    workers: 32
+    base_latency_us: 5
+    jitter_us: 2
+    bandwidth_bytes_per_sec: 0
+    max_ops_per_sec: 0
+
+  mds_worker:
+    workers: 16
+    base_latency_us: 80
+    jitter_us: 20
+    bandwidth_bytes_per_sec: 0
+    max_ops_per_sec: 50000
+
+  rocksdb_read:
+    workers: 8
+    base_latency_us: 100
+    jitter_us: 30
+    bandwidth_bytes_per_sec: 0
+    max_ops_per_sec: 80000
+
+  rocksdb_write:
+    workers: 4
+    base_latency_us: 300
+    jitter_us: 80
+    bandwidth_bytes_per_sec: 0
+    max_ops_per_sec: 50000
+
+  data_node_rpc:
+    workers: 32
+    base_latency_us: 100
+    jitter_us: 30
+    bandwidth_bytes_per_sec: 0
+    max_ops_per_sec: 100000
+
+  disk_read:
+    workers: 4
+    base_latency_us: 150
+    jitter_us: 50
+    bandwidth_bytes_per_sec: 1048576000
+    max_ops_per_sec: 0
+
+  disk_write:
+    workers: 4
+    base_latency_us: 200
+    jitter_us: 60
+    bandwidth_bytes_per_sec: 629145600
+    max_ops_per_sec: 0
+
+  network:
+    workers: 8
+    base_latency_us: 50
+    jitter_us: 20
+    bandwidth_bytes_per_sec: 1250000000
+    max_ops_per_sec: 0
+
+  client_cpu:
+    workers: 8
+    base_latency_us: 20
+    jitter_us: 5
+    bandwidth_bytes_per_sec: 2147483648
+    max_ops_per_sec: 0
+
+  cold_storage:
+    workers: 2
+    base_latency_us: 100000
+    jitter_us: 20000
+    bandwidth_bytes_per_sec: 104857600
+    max_ops_per_sec: 0

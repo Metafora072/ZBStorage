@@ -1,0 +1,131 @@
+# 真正通过 ZBStorage FUSE 正式链路执行请求。
+# 启动栈后，mount_point 必须能够被 findmnt 识别为 FUSE 挂载。
+
+simulation:
+  total_steps: 1
+  time_unit: day
+  execution_mode: full
+  output_dir: ./time_sim_output/full
+  mount_point: /mnt/md0/Projects/cgy/zb_run_dir_v3/mnt
+
+  # /real 由 zb_fuse_client 启动时创建，表示真实数据节点层。
+  # 需要测试虚拟节点时可改为 /virtual/time_sim。
+  namespace_root: /real/time_sim
+
+  random_seed: 20260624
+  custom_step_duration_us: 0
+  max_materialized_requests_per_step: 1000
+  real_concurrency: 4
+
+  # 当前 ZBStorage FUSE 未注册 fsync 回调，先保持 false。
+  # pwrite 返回前已经完成 AllocateFileWrite、对象写、CommitFileWrite 和 MDS 更新。
+  fsync_writes: false
+
+
+# 串行 Trace V1：先准备一组测试文件，再按下面的读写比例生成 Trace。
+# generated_trace_step_XXXX.csv 记录逻辑请求；operations_step_XXXX.csv
+# 记录这些请求真实通过 ZBStorage FUSE 执行后的结果。
+trace:
+  enabled: true
+  total_operations: 100
+  read_ratio: 0.70
+  write_ratio: 0.30
+  file_count: 10
+  io_size_bytes: 262144
+
+  # 请求强度：平均每秒生成多少条逻辑请求。
+  # 例如 1000 ops/s 对应平均请求间隔 1000 us。
+  request_rate_ops_per_sec: 1000
+
+  # 请求间隔分布：
+  #   fixed                固定间隔
+  #   poisson              泊松分布（离散微秒间隔）
+  #   negative_exponential 负指数分布
+  interval_distribution: fixed
+
+workload:
+  # 第一次真实联调先用小负载，确认链路正确后再逐步扩大。
+  writes_per_step: 4
+  reads_per_step: 8
+  readdirs_per_step: 1
+  growth_rate_per_step: 0.0
+  hot_file_ratio: 0.2
+  hot_request_ratio: 0.8
+  read_size_bytes: 262144
+  failure_probability: 0.0
+
+  file_size_distribution:
+    small:
+      ratio: 1.0
+      min_bytes: 262144
+      max_bytes: 1048576
+    medium:
+      ratio: 0.0
+      min_bytes: 1048576
+      max_bytes: 1048576
+    large:
+      ratio: 0.0
+      min_bytes: 1048576
+      max_bytes: 1048576
+
+sampling:
+  strategy: stratified
+  min_samples_per_stratum: 1
+  default_sample_ratio: 1.0
+  strata:
+    - op_type
+
+capacity:
+  total_capacity_bytes: 21990232555520
+  object_unit_size: 4194304
+  replica_factor: 1.0
+  compression_ratio: 1.0
+  metadata_bytes_per_file: 512
+
+resources:
+  client:
+    workers: 4
+    base_latency_us: 10
+    jitter_us: 5
+  mds_worker:
+    workers: 16
+    base_latency_us: 80
+    jitter_us: 20
+  rocksdb_read:
+    workers: 4
+    base_latency_us: 100
+    jitter_us: 20
+    max_ops_per_sec: 100000
+  rocksdb_write:
+    workers: 2
+    base_latency_us: 200
+    jitter_us: 50
+    max_ops_per_sec: 50000
+  data_node_read:
+    workers: 8
+    base_latency_us: 100
+    jitter_us: 20
+  data_node_write:
+    workers: 8
+    base_latency_us: 120
+    jitter_us: 30
+  disk_read:
+    workers: 4
+    base_latency_us: 150
+    jitter_us: 50
+    bandwidth_bytes_per_sec: 1048576000
+  disk_write:
+    workers: 4
+    base_latency_us: 200
+    jitter_us: 80
+    bandwidth_bytes_per_sec: 629145600
+  network:
+    workers: 4
+    base_latency_us: 50
+    jitter_us: 20
+    bandwidth_bytes_per_sec: 1250000000
+  cold_storage:
+    workers: 1
+    base_latency_us: 5000000
+    jitter_us: 500000
+    bandwidth_bytes_per_sec: 50000000

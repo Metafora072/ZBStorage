@@ -171,10 +171,14 @@ stop_by_name() {
   local pid
   pid="$(read_pid "${name}" || true)"
   if [[ -n "${pid}" ]] && is_pid_alive "${pid}"; then
-    kill "${pid}" >/dev/null 2>&1 || true
-    sleep 1
-    if is_pid_alive "${pid}"; then
-      kill -9 "${pid}" >/dev/null 2>&1 || true
+    if [[ "${name}" == "fuse" ]]; then
+      stop_fuse_client_pid "${pid}"
+    else
+      kill "${pid}" >/dev/null 2>&1 || true
+      sleep 1
+      if is_pid_alive "${pid}"; then
+        kill -9 "${pid}" >/dev/null 2>&1 || true
+      fi
     fi
     log "[STOP] ${name} pid=${pid}"
   fi
@@ -333,9 +337,11 @@ start_all() {
   start_component mds "${MDS_PORT}" \
     "${BUILD_DIR}/mds_server" --config="${CFG_DIR}/mds.conf" --port="${MDS_PORT}"
 
+  prepare_io_latency_args "${ROOT_DIR}"
   local fuse_log="${LOG_DIR}/fuse.log"
   local fuse_pid
   fuse_pid="$(launch_detached "${fuse_log}" "${BUILD_DIR}/zb_fuse_client" \
+    "${IO_LATENCY_ARGS[@]}" \
     --mds="127.0.0.1:${MDS_PORT}" \
     --scheduler="127.0.0.1:${SCHEDULER_PORT}" \
     --timeout_ms=30000 \

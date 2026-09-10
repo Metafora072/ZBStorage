@@ -33,18 +33,6 @@ std::vector<std::string> Split(const std::string& input, char delimiter) {
     return parts;
 }
 
-bool ParseUint64(const std::string& text, uint64_t* out) {
-    if (!out || text.empty()) {
-        return false;
-    }
-    try {
-        *out = std::stoull(text);
-        return true;
-    } catch (const std::exception&) {
-        return false;
-    }
-}
-
 bool ParseUint32(const std::string& text, uint32_t* out) {
     if (!out || text.empty()) {
         return false;
@@ -76,30 +64,28 @@ bool ParseBool(const std::string& value, bool* out) {
     return false;
 }
 
-bool ParseDiskCapacityMap(const std::string& value,
-                          std::unordered_map<std::string, uint64_t>* out) {
-    if (!out) {
+bool ParseUint64(const std::string& text, uint64_t* out) {
+    if (!out || text.empty()) {
         return false;
     }
-    out->clear();
-    if (value.empty()) {
+    try {
+        *out = static_cast<uint64_t>(std::stoull(text));
         return true;
+    } catch (const std::exception&) {
+        return false;
     }
-    const std::vector<std::string> items = Split(value, ',');
-    for (const auto& item : items) {
-        const size_t sep = item.find(':');
-        if (sep == std::string::npos) {
-            return false;
-        }
-        const std::string disk_id = Trim(item.substr(0, sep));
-        const std::string capacity_text = Trim(item.substr(sep + 1));
-        uint64_t capacity = 0;
-        if (disk_id.empty() || !ParseUint64(capacity_text, &capacity)) {
-            return false;
-        }
-        (*out)[disk_id] = capacity;
+}
+
+bool ParseDouble(const std::string& text, double* out) {
+    if (!out || text.empty()) {
+        return false;
     }
-    return true;
+    try {
+        *out = std::stod(text);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
 } // namespace
@@ -182,78 +168,54 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
                 }
                 return {};
             }
-        } else if (key == "DISKS") {
-            cfg.disk_ids = Split(value, ',');
         } else if (key == "ARCHIVE_ROOT") {
             cfg.archive_root = value;
-        } else if (key == "CACHE_ROOT") {
-            cfg.cache_root = value;
-        } else if (key == "SIMULATE_IO") {
-            if (!ParseBool(value, &cfg.simulate_io)) {
+        } else if (key == "VOLUME_SIZE_BYTES") {
+            if (!ParseUint64(value, &cfg.volume_size_bytes)) {
                 if (error) {
-                    *error = "Invalid SIMULATE_IO at line " + std::to_string(line_no);
+                    *error = "Invalid VOLUME_SIZE_BYTES at line " + std::to_string(line_no);
                 }
                 return {};
             }
-        } else if (key == "OPTICAL_READ_BYTES_PER_SEC") {
-            if (!ParseUint64(value, &cfg.optical_read_bytes_per_sec)) {
+        } else if (key == "SIZE_THRESHOLD") {
+            if (!ParseDouble(value, &cfg.size_threshold)) {
                 if (error) {
-                    *error = "Invalid OPTICAL_READ_BYTES_PER_SEC at line " + std::to_string(line_no);
+                    *error = "Invalid SIZE_THRESHOLD at line " + std::to_string(line_no);
                 }
                 return {};
             }
-        } else if (key == "OPTICAL_WRITE_BYTES_PER_SEC") {
-            if (!ParseUint64(value, &cfg.optical_write_bytes_per_sec)) {
+        } else if (key == "CAPACITY_IN_IMAGES") {
+            if (!ParseUint64(value, &cfg.capacity_in_images)) {
                 if (error) {
-                    *error = "Invalid OPTICAL_WRITE_BYTES_PER_SEC at line " + std::to_string(line_no);
+                    *error = "Invalid CAPACITY_IN_IMAGES at line " + std::to_string(line_no);
                 }
                 return {};
             }
-        } else if (key == "CACHE_READ_BYTES_PER_SEC") {
-            if (!ParseUint64(value, &cfg.cache_read_bytes_per_sec)) {
+        } else if (key == "AVAILABLE_VOLUME_ID_COUNT") {
+            uint32_t count = 0;
+            if (!ParseUint32(value, &count) || count > 255) {
                 if (error) {
-                    *error = "Invalid CACHE_READ_BYTES_PER_SEC at line " + std::to_string(line_no);
+                    *error = "Invalid AVAILABLE_VOLUME_ID_COUNT at line " + std::to_string(line_no);
                 }
                 return {};
             }
-        } else if (key == "CACHE_DISC_SLOTS") {
-            if (!ParseUint32(value, &cfg.cache_disc_slots)) {
-                if (error) {
-                    *error = "Invalid CACHE_DISC_SLOTS at line " + std::to_string(line_no);
+            cfg.available_volume_id_count = static_cast<uint8_t>(count);
+        } else if (key == "INITIAL_AVAILABLE_VOLUME_IDS") {
+            cfg.initial_available_volume_ids.clear();
+            for (const std::string& token : Split(value, ',')) {
+                uint64_t volume_id = 0;
+                if (!ParseUint64(token, &volume_id)) {
+                    if (error) {
+                        *error = "Invalid INITIAL_AVAILABLE_VOLUME_IDS at line " +
+                                 std::to_string(line_no);
+                    }
+                    return {};
                 }
-                return {};
+                cfg.initial_available_volume_ids.push_back(volume_id);
             }
-        } else if (key == "MAX_IMAGE_SIZE_BYTES") {
-            if (!ParseUint64(value, &cfg.max_image_size_bytes)) {
-                if (error) {
-                    *error = "Invalid MAX_IMAGE_SIZE_BYTES at line " + std::to_string(line_no);
-                }
-                return {};
-            }
-        } else if (key == "DISK_CAPACITY_BYTES") {
-            if (!ParseUint64(value, &cfg.disk_capacity_bytes)) {
-                if (error) {
-                    *error = "Invalid DISK_CAPACITY_BYTES at line " + std::to_string(line_no);
-                }
-                return {};
-            }
-        } else if (key == "DISK_CAPACITY_MAP") {
-            if (!ParseDiskCapacityMap(value, &cfg.disk_capacity_map)) {
-                if (error) {
-                    *error = "Invalid DISK_CAPACITY_MAP at line " + std::to_string(line_no);
-                }
-                return {};
-            }
-        } else if (key == "MOUNT_POINT_PREFIX") {
-            cfg.mount_point_prefix = value;
-        } else if (key == "STARTUP_SCAN_MODE") {
-            cfg.startup_scan_mode = value;
         }
     }
 
-    if (cfg.disk_ids.empty()) {
-        cfg.disk_ids.push_back("disk-01");
-    }
     if (cfg.node_weight == 0) {
         cfg.node_weight = 1;
     }
@@ -266,36 +228,20 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
     if (cfg.heartbeat_interval_ms == 0) {
         cfg.heartbeat_interval_ms = 2000;
     }
-    if (cfg.max_image_size_bytes == 0) {
-        cfg.max_image_size_bytes = 1024ULL * 1024ULL * 1024ULL;
-    }
     if (cfg.archive_root.empty()) {
         cfg.archive_root = "/tmp/zb_optical";
     }
-    if (cfg.cache_root.empty()) {
-        cfg.cache_root = cfg.archive_root + "/cache";
+    if (cfg.volume_size_bytes == 0) {
+        cfg.volume_size_bytes = 10ull * 1024 * 1024 * 1024;
     }
-    if (cfg.mount_point_prefix.empty()) {
-        cfg.mount_point_prefix = "/optical";
+    if (cfg.size_threshold <= 0.0 || cfg.size_threshold > 1.0) {
+        cfg.size_threshold = 0.9;
     }
-    std::transform(cfg.startup_scan_mode.begin(),
-                   cfg.startup_scan_mode.end(),
-                   cfg.startup_scan_mode.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    if (cfg.startup_scan_mode != "full" && cfg.startup_scan_mode != "fast") {
-        cfg.startup_scan_mode = "fast";
+    if (cfg.capacity_in_images == 0) {
+        cfg.capacity_in_images = 10;
     }
-    if (cfg.optical_read_bytes_per_sec == 0) {
-        cfg.optical_read_bytes_per_sec = 1;
-    }
-    if (cfg.optical_write_bytes_per_sec == 0) {
-        cfg.optical_write_bytes_per_sec = 1;
-    }
-    if (cfg.cache_read_bytes_per_sec == 0) {
-        cfg.cache_read_bytes_per_sec = 1;
-    }
-    if (cfg.cache_disc_slots == 0) {
-        cfg.cache_disc_slots = 1;
+    if (cfg.available_volume_id_count == 0) {
+        cfg.available_volume_id_count = 5;
     }
     return cfg;
 }

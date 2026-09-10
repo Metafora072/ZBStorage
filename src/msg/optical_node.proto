@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package zb.rpc;
+
+import "mds.proto";
+
+option cc_generic_services = true;
+
+// MDS 下发给光盘库节点的单个归档文件信息。
+// 只包含从 real_node 下载文件数据所需的最小字段集，目录结构等权威元数据仍留在 MDS。
+message ArchiveFile {
+  uint64 inode_id = 1;
+  uint64 size = 2;
+  uint64 object_unit_size = 3;
+  string target_node_id = 4;
+  string target_disk_id = 5;
+}
+
+message SendArchiveMetadataRequest {
+  uint64 batch_id = 1;
+  repeated ArchiveFile files = 2;
+}
+
+message ArchiveReply {
+  MdsStatus status = 1;
+}
+
+// 光盘库节点对外提供的归档入口服务：MDS 向节点下发待归档文件信息。
+service OpticalNodeService {
+  rpc SendArchiveMetadata(SendArchiveMetadataRequest) returns (ArchiveReply);
+}

@@ -1,3 +1,4 @@
+#include <brpc/channel.h>
 #include <brpc/server.h>
 #include <gflags/gflags.h>
 
@@ -11,9 +12,9 @@
 #include <utility>
 
 #include "../config/OpticalNodeConfig.h"
+#include "../service/BrpcOpticalNodeService.h"
 #include "../service/BrpcOpticalStorageService.h"
 #include "../service/OpticalStorageServiceImpl.h"
-#include "../storage/ImageStore.h"
 #include "scheduler.pb.h"
 
 DEFINE_string(config, "", "Path to optical node config file");
@@ -101,15 +102,6 @@ private:
             request.set_peer_address(peer_address_);
             request.set_applied_lsn(service_->GetReplicationStatus().applied_lsn);
 
-            zb::msg::DiskReportReply reports = service_->GetDiskReport();
-            for (const auto& disk : reports.reports) {
-                zb::rpc::DiskHeartbeat* out = request.add_disks();
-                out->set_disk_id(disk.id);
-                out->set_capacity_bytes(disk.capacity_bytes);
-                out->set_free_bytes(disk.free_bytes);
-                out->set_is_healthy(disk.is_healthy);
-            }
-
             zb::rpc::HeartbeatReply response;
             brpc::Controller cntl;
             stub.ReportHeartbeat(&cntl, &request, &response, nullptr);
@@ -176,30 +168,22 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    zb::optical_node::ImageStore image_store(cfg.archive_root,
-                                             cfg.cache_root,
-                                             cfg.disk_ids,
-                                             cfg.disk_capacity_map,
-                                             cfg.simulate_io,
-                                             cfg.optical_read_bytes_per_sec,
-                                             cfg.optical_write_bytes_per_sec,
-                                             cfg.cache_read_bytes_per_sec,
-                                             cfg.max_image_size_bytes,
-                                             cfg.disk_capacity_bytes,
-                                             cfg.mount_point_prefix,
-                                             cfg.cache_disc_slots,
-                                             cfg.startup_scan_mode == "full");
-    if (!image_store.Init(&config_error)) {
-        std::cerr << "Failed to init optical image store: " << config_error << std::endl;
+    zb::optical_node::OpticalStorageServiceImpl storage_service(cfg);
+    if (!storage_service.IsArchiveEngineReady()) {
+        std::cerr << "Failed to start archive engine: "
+                  << storage_service.GetArchiveStatusDetail() << std::endl;
         return 1;
     }
-
-    zb::optical_node::OpticalStorageServiceImpl storage_service(&image_store);
-    zb::optical_node::BrpcOpticalStorageService brpc_service(&storage_service);
+    zb::optical_node::BrpcOpticalStorageService brpc_service;
+    zb::optical_node::BrpcOpticalNodeService brpc_optical_node_service(&storage_service);
 
     brpc::Server server;
     if (server.AddService(&brpc_service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
         std::cerr << "Failed to add brpc service" << std::endl;
+        return 1;
+    }
+    if (server.AddService(&brpc_optical_node_service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
+        std::cerr << "Failed to add brpc optical node service" << std::endl;
         return 1;
     }
 

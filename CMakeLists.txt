@@ -22,6 +22,7 @@ set(ZBSTORAGE_BRPC_INCLUDE_DIRS
 find_package(Protobuf REQUIRED)
 find_package(GFLAGS REQUIRED)
 find_package(Threads REQUIRED)
+find_package(ZLIB REQUIRED)
 if(UNIX)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(FUSE3 REQUIRED fuse3)
@@ -61,6 +62,7 @@ set(PROTO_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/msg/real_node.proto
     ${CMAKE_CURRENT_SOURCE_DIR}/src/msg/mds.proto
     ${CMAKE_CURRENT_SOURCE_DIR}/src/msg/scheduler.proto
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/msg/optical_node.proto
 )
 set(PROTOBUF_IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src/msg ${Protobuf_INCLUDE_DIRS})
 
@@ -132,11 +134,31 @@ if(BRPC_DYNAMIC_LIB)
     target_link_libraries(virtual_node_server PRIVATE ${BRPC_DYNAMIC_LIB})
 endif()
 
+add_library(optical_node_manager STATIC
+    src/data_node/optical_node/optical_node_manager/optical_node_manager.cpp
+    src/data_node/optical_node/optical_node_manager/cd_manager_sim/cd_manager.cpp
+    src/data_node/optical_node/optical_node_manager/space_manager/image_dir_manager.cpp
+    src/data_node/optical_node/optical_node_manager/volume_manager/volume_manager.cpp
+    src/data_node/optical_node/optical_node_manager/volume_manager/serializer.cpp
+    src/data_node/optical_node/optical_node_manager/volume_manager/compression_utils.cpp
+    src/data_node/optical_node/optical_node_manager/volume_manager/error_codes.cpp
+    src/data_node/optical_node/optical_node_manager/volume_manager/utils.cpp
+)
+target_include_directories(optical_node_manager
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/data_node/optical_node/optical_node_manager
+)
+target_link_libraries(optical_node_manager
+    PRIVATE
+        ZLIB::ZLIB
+        ${CMAKE_THREAD_LIBS_INIT}
+)
+
 add_executable(optical_node_server
     src/data_node/optical_node/config/OpticalNodeConfig.cpp
-    src/data_node/optical_node/storage/ImageStore.cpp
     src/data_node/optical_node/service/OpticalStorageServiceImpl.cpp
     src/data_node/optical_node/service/BrpcOpticalStorageService.cpp
+    src/data_node/optical_node/service/BrpcOpticalNodeService.cpp
     src/data_node/optical_node/server/optical_node_server.cpp
 )
 target_include_directories(optical_node_server
@@ -148,6 +170,7 @@ target_include_directories(optical_node_server
 )
 target_link_libraries(optical_node_server
     PRIVATE
+        optical_node_manager
         zb_proto
         brpc-static
         ${GFLAGS_LIBRARY}

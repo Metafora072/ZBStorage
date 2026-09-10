@@ -12,13 +12,10 @@
 #include <unordered_set>
 #include <vector>
 
-#include <WR_task.h>
 #include <cd_manager_sim/cd_manager.h>
-#include <optical_node_manager_status.h>
+#include <optical_node_manager_structs.h>
 #include <space_manager/image_dir_manager.h>
-#include <volume_manager/error_codes.h>
 #include <volume_manager/volume_manager.h>
-#include <volume_task_map.h>
 
 namespace optical_node_manager {
 
@@ -26,7 +23,13 @@ namespace optical_node_manager {
 class OpticalNodeManager {
 public:
     // volume_size / size_threshold 透传给 volume_manager；同时构建 cd_manager 调度组件。
-    OpticalNodeManager(uint64_t volume_size, double size_threshold);
+    // root_dir / capacity_in_images / available_volume_id_count 为启动所需的工作目录、
+    // image_dir 镜像数上限与 volume_id 队列容量上限。
+    OpticalNodeManager(uint64_t volume_size,
+                       double size_threshold,
+                       const std::string& root_dir,
+                       uint64_t capacity_in_images,
+                       uint8_t available_volume_id_count);
     ~OpticalNodeManager();
 
     OpticalNodeManager(const OpticalNodeManager&) = delete;
@@ -66,13 +69,17 @@ public:
                                          uint64_t offset,
                                          uint64_t total_size);
 
+    // 接收 MDS 下发的一批归档文件信息（对应 OpticalNodeService.SendArchiveMetadata）。
+    // 仅校验入队，立即返回；光盘节点之后逐个按 target_node_id/target_disk_id 从热数据节点
+    // 下载文件并封装到镜像，封装/刻录结果通过两次上报（ReportFilesPackedToImage /
+    // ReportImagesBurnedToDisc）异步通知 MDS，本接口不等待这些阶段完成。
+    // 注意：当前为占位实现，直接返回错误，真实逻辑尚未落地。
+    volumemanager::ErrorCode SendArchiveMetadata(const SendArchiveMetadataRequest& request);
+
     // 初始化目录、构造底层组件并启动后台线程；成功后状态切到 RUNNING。
-    // available_volume_id_count 仅在首次 Run() 生效，灌入 initial_available_volume_ids
-    // 前 N 个元素（FIFO 顺序）。
-    bool Run(const std::string& root_dir,
-             uint64_t capacity_in_images,
-             uint8_t available_volume_id_count,
-             const std::vector<uint64_t>& initial_available_volume_ids);
+    // 按 FIFO 顺序灌入 initial_available_volume_ids 前 available_volume_id_count 个元素，
+    // 超出数量丢弃；
+    bool Run(const std::vector<uint64_t>& initial_available_volume_ids);
 
     // 当前运行状态字符串（manager_status::k*）。
     std::string GetStatus() const;
@@ -90,9 +97,9 @@ private:
     // 启动 cd_manager 与三个后台线程；任一失败回滚并返回 false。
     bool StartBackgroundWorkers();
 
-    // 设置 root_dir_，派生五个子目录并下发到 volume_manager；
+    // 规范化 root_dir_，派生五个子目录并下发到 volume_manager；
     // 构造 cd_manager_ / image_dir_manager_；失败回滚已建目录与路径下发。
-    bool InitializeDir(const std::string& root_dir, uint64_t capacity_in_images);
+    bool InitializeDir();
 
     // 倒序删除 InitializeDir 内部本次新建的目录；非空 / 无权限时静默跳过。
     void RollbackCreatedDirs(const std::vector<std::string>& created_dirs);
@@ -150,7 +157,7 @@ private:
     // 任务元数据索引（按 task_id）。
     WR_task::WRTaskMap* task_map_;
 
-    // 可用 volume_id 的 FIFO 池；容量由 Run() 的 available_volume_id_count 决定。
+    // 可用 volume_id 的 FIFO 池；容量由构造函数的 available_volume_id_count 决定。
     std::queue<uint64_t> available_volume_ids;
     uint8_t available_volume_id_count_{0};
 
@@ -204,6 +211,9 @@ private:
     std::string image_dir_;
     std::string read_dir_;
     std::string disc_sim_dir_;
+
+    // 构造函数给出的 image_dir 镜像数上限，InitializeDir 时下发给 image_dir_manager_。
+    uint64_t capacity_in_images_{0};
 
     // 原子地更新 status_ 与 last_status_reason_；提供稳定的字符串生命周期。
     void SetStatus(const std::string& new_status, const std::string& reason = std::string());

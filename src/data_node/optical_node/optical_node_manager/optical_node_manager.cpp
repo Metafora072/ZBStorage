@@ -16,7 +16,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <WR_task.h>
+#include <optical_node_manager_structs.h>
 
 namespace optical_node_manager {
     volumemanager::ErrorCode ReadFileToStringMmap(const std::string& file_path,
@@ -45,13 +45,20 @@ namespace optical_node_manager {
         return os << "[" << NowLogTimestamp() << "][" << prefix << "] ";
     }
 
-    OpticalNodeManager::OpticalNodeManager(uint64_t volume_size, double size_threshold)
+    OpticalNodeManager::OpticalNodeManager(uint64_t volume_size,
+                                           double size_threshold,
+                                           const std::string& root_dir,
+                                           uint64_t capacity_in_images,
+                                           uint8_t available_volume_id_count)
         : volume_manager_(volume_size, size_threshold),
           read_task_queue_(new WR_task::WRTaskQueue()),
           zip_task_queue_(new WR_task::WRTaskQueue()),
           burn_task_queue_(new WR_task::WRTaskQueue()),
           task_map_(new WR_task::WRTaskMap()),
           available_volume_ids() {
+        root_dir_ = root_dir;
+        capacity_in_images_ = capacity_in_images;
+        available_volume_id_count_ = available_volume_id_count;
     }
 
     // 把字符串先拷到成员变量再发布指针，避免栈上临时 string 析构导致悬空。
@@ -96,46 +103,57 @@ namespace optical_node_manager {
         return detail;
     }
 
-    bool OpticalNodeManager::Run(const std::string& root_dir,
-                                   uint64_t capacity_in_images,
-                                   uint8_t available_volume_id_count,
-                                   const std::vector<uint64_t>& initial_available_volume_ids){
+    // 占位实现（临时）：仅用于解除链接期的未定义符号，真实业务（按 target_node_id /
+    // target_disk_id 从热数据节点下载文件 → 封装镜像 → 两次上报）尚未落地，
+    // 任何请求都直接返回错误。Step 1 落地时替换本函数。
+    volumemanager::ErrorCode OpticalNodeManager::SendArchiveMetadata(
+        const SendArchiveMetadataRequest& request) {
+        (void)request;
+        return volumemanager::ErrorCode::INVALID_PARAMETER;
+    }
+
+    bool OpticalNodeManager::Run(const std::vector<uint64_t>& initial_available_volume_ids) {
         // 状态机守卫：RUNNING 幂等成功；INITIALIZING / STOPPING 重入拒绝。
         const std::string current_status = GetStatus();
         if (current_status == manager_status::kRunning) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kRunGuard +
-                " subphase=idempotent_already_running status=" + current_status;
+            // 经 SetStatus 发布原因指针；直接改 last_failure_reason_buf_ 会让
+            // 已发布的 last_status_reason_ 指向重新分配前的旧缓冲。
+            SetStatus(manager_status::kRunning,
+                      std::string("phase=") +
+                          start_failure_phase::kRunGuard +
+                          " subphase=idempotent_already_running status=" + current_status);
             return true;
         }
         if (current_status == manager_status::kInitializing ||
             current_status == manager_status::kStopping) {
             std::string status_lower = current_status;
             for (auto& c : status_lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kRunGuard +
-                " subphase=reentry_during_" + status_lower +
-                " status=" + current_status;
+            // 同上：重入拒绝的原因也要经 SetStatus 发布。
+            SetStatus(current_status,
+                      std::string("phase=") +
+                          start_failure_phase::kRunGuard +
+                          " subphase=reentry_during_" + status_lower +
+                          " status=" + current_status);
             return false;
         }
-        SetStatus(manager_status::kInitializing, "Run(root_dir) entered");
+        SetStatus(manager_status::kInitializing, "Run() entered");
 
-        // 容量上限 + 初始 ID 灌入：按 FIFO 顺序取前 N 个元素，超出数量丢弃。
-        available_volume_id_count_ = available_volume_id_count;
+        // 初始 ID 灌入：按 FIFO 顺序取前 available_volume_id_count_ 个元素，超出数量丢弃。
         const size_t push_count = std::min<size_t>(
             initial_available_volume_ids.size(),
-            available_volume_id_count);
+            available_volume_id_count_);
         for (size_t i = 0; i < push_count; ++i) {
             available_volume_ids.push(initial_available_volume_ids[i]);
         }
 
-        if (!InitializeDir(root_dir, capacity_in_images)) {
+        if (!InitializeDir()) {
             // InitializeDir 已写子阶段到 last_failure_reason_buf_，这里拼顶层 phase。
             const std::string detailed = std::string("phase=") +
                 start_failure_phase::kInitializeDir +
                 " subphase=" + last_failure_reason_buf_;
             SetStatus(manager_status::kStartFailed, detailed);
-            // 收尾：切到 STOPPED；StopBackgroundWorkers 对 joinable / cd_manager_ 守门。
+            // 收尾：StopBackgroundWorkers 负责 joinable / cd_manager_ 守门，
+            // 并保持 kStartFailed 与本次失败原因不被覆盖。
             StopBackgroundWorkers();
             return false;
         }
@@ -145,17 +163,17 @@ namespace optical_node_manager {
             StopBackgroundWorkers();
             return false;
         }
-        SetStatus(manager_status::kRunning, "Run(root_dir) succeeded");
+        SetStatus(manager_status::kRunning, "Run() succeeded");
         return true;
     }
 
-    bool OpticalNodeManager::InitializeDir(const std::string& root_dir, uint64_t capacity_in_images) {
-        if (root_dir.empty()) {
+    bool OpticalNodeManager::InitializeDir() {
+        if (root_dir_.empty()) {
+            last_failure_reason_buf_ = "root_dir_empty";
             return false;
         }
 
-        // 规范化 root_dir 并派生五个子目录。
-        root_dir_ = root_dir;
+        // 规范化 root_dir_ 并派生五个子目录。
         if (root_dir_.back() != '/') {
             root_dir_ += '/';
         }
@@ -281,11 +299,11 @@ namespace optical_node_manager {
                 return false;
             }
             const volumemanager::ErrorCode cap_ret =
-                image_dir_manager_->SetCapacityInImages(capacity_in_images);
+                image_dir_manager_->SetCapacityInImages(capacity_in_images_);
             if (cap_ret != volumemanager::ErrorCode::SUCCESS) {
                 last_failure_reason_buf_ = std::string("ImageDirManager_SetCapacity_failed code=")
                     + std::to_string(static_cast<int>(cap_ret))
-                    + " capacity=" + std::to_string(capacity_in_images);
+                    + " capacity=" + std::to_string(capacity_in_images_);
                 image_dir_manager_.reset();
                 rollback_volume_manager();
                 RollbackCreatedDirs(created_dirs);
@@ -414,7 +432,10 @@ namespace optical_node_manager {
         stop_requested_.store(true, std::memory_order_relaxed);
 
         const std::string current_status = GetStatus();
-        if (current_status != manager_status::kStopped) {
+        // 启动失败已通过 SetStatus(kStartFailed, 详细原因) 发布；收尾时保持该状态与原因，
+        // 否则会被 kStopping / kStopped 覆盖，导致上层拿不到失败根因。
+        const bool keep_start_failure = (current_status == manager_status::kStartFailed);
+        if (!keep_start_failure && current_status != manager_status::kStopped) {
             SetStatus(manager_status::kStopping, "StopBackgroundWorkers entered");
         }
 
@@ -452,7 +473,9 @@ namespace optical_node_manager {
             cd_manager_->Stop();
         }
 
-        SetStatus(manager_status::kStopped, "StopBackgroundWorkers completed");
+        if (!keep_start_failure) {
+            SetStatus(manager_status::kStopped, "StopBackgroundWorkers completed");
+        }
     }
 
     OpticalNodeManager::~OpticalNodeManager() {

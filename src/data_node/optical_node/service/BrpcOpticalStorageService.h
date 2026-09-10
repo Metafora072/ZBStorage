@@ -1,13 +1,12 @@
 #pragma once
 
-#include "OpticalStorageServiceImpl.h"
 #include "real_node.pb.h"
 
 namespace zb::optical_node {
 
 class BrpcOpticalStorageService : public zb::rpc::RealNodeService {
 public:
-    explicit BrpcOpticalStorageService(OpticalStorageServiceImpl* service);
+    BrpcOpticalStorageService() = default;
 
     void WriteObject(google::protobuf::RpcController* cntl_base,
                      const zb::rpc::WriteObjectRequest* request,
@@ -68,9 +67,6 @@ public:
                          const zb::rpc::CommitFileWriteRequest* request,
                          zb::rpc::CommitFileWriteReply* response,
                          google::protobuf::Closure* done) override;
-
-private:
-    OpticalStorageServiceImpl* service_{};
 };
 
 } // namespace zb::optical_node

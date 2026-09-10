@@ -1,15 +1,12 @@
 #pragma once
 
-#include <brpc/channel.h>
-
 #include <cstdint>
-#include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 
-#include "../storage/ImageStore.h"
-#include "../../../msg/storage_node_messages.h"
+#include <optical_node_manager.h>
+
+#include "../config/OpticalNodeConfig.h"
 
 namespace zb::optical_node {
 
@@ -30,7 +27,9 @@ struct ReplicationStatusSnapshot {
 
 class OpticalStorageServiceImpl {
 public:
-    explicit OpticalStorageServiceImpl(ImageStore* store);
+    // 构造即完成归档引擎启动：用 config 构造 OpticalNodeManager 并调用 Run
+    // （创建归档目录 + 拉起后台线程）。失败不抛异常，通过 IsArchiveEngineReady() 暴露。
+    explicit OpticalStorageServiceImpl(const OpticalNodeConfig& config);
 
     void ConfigureReplication(const std::string& node_id,
                               const std::string& group_id,
@@ -48,44 +47,27 @@ public:
                                   const std::string& secondary_address);
     ReplicationStatusSnapshot GetReplicationStatus() const;
 
-    zb::msg::WriteObjectReply WriteObject(const zb::msg::WriteObjectRequest& request);
-    zb::msg::ReadObjectReply ReadObject(const zb::msg::ReadObjectRequest& request);
-    zb::msg::ReadArchivedFileReply ReadArchivedFile(const zb::msg::ReadArchivedFileRequest& request);
-    zb::msg::DeleteObjectReply DeleteObject(const zb::msg::DeleteObjectRequest& request);
-    zb::msg::DiskReportReply GetDiskReport() const;
-    zb::msg::Status UpdateArchiveState(const std::string& disk_id,
-                                       const std::string& object_id,
-                                       const std::string& archive_state,
-                                       uint64_t version);
+    // 接收 MDS 下发的一批归档文件（对应 OpticalNodeService.SendArchiveMetadata），
+    // 转发给内部 OpticalNodeManager。当前 OpticalNodeManager::SendArchiveMetadata
+    // 尚未实现，调用会在链接期报未定义符号。
+    volumemanager::ErrorCode SendArchiveMetadata(
+        const optical_node_manager::SendArchiveMetadataRequest& request);
+
+    // 归档引擎是否已成功启动（状态为 RUNNING）。
+    bool IsArchiveEngineReady() const;
+
+    // 归档引擎当前状态 + 最近一次失败原因，仅用于排障 / 日志。
+    std::string GetArchiveStatusDetail() const;
 
 private:
-    struct ArchiveOpCacheEntry {
-        std::string op_id;
-        uint64_t last_seen_ts_ms{0};
-        std::string image_id;
-        uint64_t image_offset{0};
-        uint64_t image_length{0};
-    };
-
-    zb::msg::Status ReplicateWriteToSecondary(const zb::msg::WriteObjectRequest& request, uint64_t epoch);
-    static uint64_t NowMilliseconds();
-    void PruneArchiveOpCacheLocked(uint64_t now_ms);
-
-    ImageStore* store_{};
-
     mutable std::mutex repl_mu_;
     ReplicationStatusSnapshot repl_;
+    // 副本同步超时；当前仅由 ConfigureReplication 写入，后续副本数据同步启用时消费。
     uint32_t replication_timeout_ms_{2000};
 
-    mutable std::mutex channel_mu_;
-    std::unordered_map<std::string, std::unique_ptr<brpc::Channel>> peer_channels_;
-
-    mutable std::mutex archive_op_mu_;
-    std::unordered_map<std::string, ArchiveOpCacheEntry> last_archive_op_by_object_;
-    uint64_t archive_op_cache_touch_{0};
-
-    mutable std::mutex cache_mu_;
-    std::unordered_map<std::string, std::string> cache_objects_;
+    // 本节点的归档引擎：接收 MDS 下发的归档文件、驱动镜像封装与刻录。
+    // 当前仅被本 Impl 持有并初始化，SendArchiveMetadata 业务逻辑尚未落地。
+    optical_node_manager::OpticalNodeManager optical_node_manager_;
 };
 
 } // namespace zb::optical_node

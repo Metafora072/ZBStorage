@@ -1,6 +1,7 @@
 #define FUSE_USE_VERSION 35
 
 #include <fuse3/fuse.h>
+#include <fuse3/fuse_lowlevel.h>
 #include <gflags/gflags.h>
 
 #include <brpc/channel.h>
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstring>
+#include <cstdlib>
 #include <ctime>
 #include <fcntl.h>
 #include <functional>
@@ -26,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "client/metrics/IoLatency.h"
 #include "mds.pb.h"
 #include "real_node.pb.h"
 #include "scheduler.pb.h"
@@ -42,7 +45,21 @@ DEFINE_bool(bootstrap_tier_dirs, true, "Create and configure tier-specific subdi
 DEFINE_string(real_dir_name, "real", "Top-level directory for real-node backed POSIX files");
 DEFINE_string(virtual_dir_name, "virtual", "Top-level directory for virtual-node backed POSIX files");
 
+#ifndef ZBSTORAGE_SOURCE_ROOT
+#define ZBSTORAGE_SOURCE_ROOT "."
+#endif
+DEFINE_bool(io_latency_enabled, false, "Record per-request client I/O latency to CSV");
+DEFINE_string(io_latency_dir, "", "Final CSV directory; empty uses ROOT_PATH/client/metrics from base.conf");
+DEFINE_string(io_latency_base_conf, ZBSTORAGE_SOURCE_ROOT "/config/base.conf", "Base runtime configuration");
+DEFINE_uint32(io_latency_flush_ms, 1000, "CSV sync interval in milliseconds");
+DEFINE_uint32(io_latency_batch_records, 1024, "Records per CSV write batch");
+DEFINE_uint32(io_latency_queue_capacity, 65536, "Maximum queued latency records");
+
 namespace zb::client::fuse_client {
+
+using metrics::IoTraceContext;
+using metrics::RpcLatencyScope;
+using metrics::RpcTarget;
 
 namespace {
 
@@ -439,12 +456,15 @@ public:
         return channel_.Init(endpoint.c_str(), &options) == 0;
     }
 
-    bool Lookup(const char* path, zb::rpc::InodeAttr* attr, zb::rpc::MdsStatus* status) {
+    bool Lookup(const char* path, zb::rpc::InodeAttr* attr, zb::rpc::MdsStatus* status, IoTraceContext* trace = nullptr) {
         zb::rpc::LookupRequest request;
         request.set_path(path);
         zb::rpc::LookupReply reply;
         brpc::Controller cntl;
-        stub_.Lookup(&cntl, &request, &reply, nullptr);
+        {
+            RpcLatencyScope timing(trace, RpcTarget::Mds);
+            stub_.Lookup(&cntl, &request, &reply, nullptr);
+        }
         if (cntl.Failed()) {
             if (status) {
                 status->set_code(zb::rpc::MDS_INTERNAL_ERROR);
@@ -464,12 +484,15 @@ public:
         return true;
     }
 
-    bool Getattr(uint64_t inode_id, zb::rpc::InodeAttr* attr, zb::rpc::MdsStatus* status) {
+    bool Getattr(uint64_t inode_id, zb::rpc::InodeAttr* attr, zb::rpc::MdsStatus* status, IoTraceContext* trace = nullptr) {
         zb::rpc::GetattrRequest request;
         request.set_inode_id(inode_id);
         zb::rpc::GetattrReply reply;
         brpc::Controller cntl;
-        stub_.Getattr(&cntl, &request, &reply, nullptr);
+        {
+            RpcLatencyScope timing(trace, RpcTarget::Mds);
+            stub_.Getattr(&cntl, &request, &reply, nullptr);
+        }
         if (cntl.Failed()) {
             if (status) {
                 status->set_code(zb::rpc::MDS_INTERNAL_ERROR);
@@ -710,12 +733,15 @@ public:
 
     bool GetFileLocationView(uint64_t inode_id,
                           zb::rpc::FileLocationView* location,
-                          zb::rpc::MdsStatus* status) {
+                          zb::rpc::MdsStatus* status, IoTraceContext* trace = nullptr) {
         zb::rpc::GetFileLocationRequest request;
         request.set_inode_id(inode_id);
         zb::rpc::GetFileLocationReply reply;
         brpc::Controller cntl;
-        stub_.GetFileLocation(&cntl, &request, &reply, nullptr);
+        {
+            RpcLatencyScope timing(trace, RpcTarget::Mds);
+            stub_.GetFileLocation(&cntl, &request, &reply, nullptr);
+        }
         if (cntl.Failed()) {
             SetRpcFailureStatus(cntl, status);
             return false;
@@ -757,7 +783,7 @@ public:
                          uint64_t version,
                          uint64_t mtime_sec,
                          zb::rpc::InodeAttr* attr,
-                         zb::rpc::MdsStatus* status) {
+                         zb::rpc::MdsStatus* status, IoTraceContext* trace = nullptr) {
         zb::rpc::UpdateInodeStatRequest request;
         request.set_inode_id(inode_id);
         request.set_file_size(file_size);
@@ -766,7 +792,10 @@ public:
         request.set_mtime(mtime_sec);
         zb::rpc::UpdateInodeStatReply reply;
         brpc::Controller cntl;
-        stub_.UpdateInodeStat(&cntl, &request, &reply, nullptr);
+        {
+            RpcLatencyScope timing(trace, RpcTarget::Mds);
+            stub_.UpdateInodeStat(&cntl, &request, &reply, nullptr);
+        }
         if (cntl.Failed()) {
             SetRpcFailureStatus(cntl, status);
             return false;
@@ -870,7 +899,7 @@ public:
         resolver_ = std::move(resolver);
     }
 
-    bool Write(const zb::rpc::ReplicaLocation& replica, uint64_t offset, const std::string& data, std::string* error) {
+    bool Write(const zb::rpc::ReplicaLocation& replica, uint64_t offset, const std::string& data, std::string* error, IoTraceContext* trace = nullptr) {
         std::vector<std::string> addresses = CollectAddresses(replica, resolver_);
         if (addresses.empty()) {
             if (error) {
@@ -895,7 +924,10 @@ public:
             request.set_epoch(replica.epoch());
             zb::rpc::WriteObjectReply reply;
             brpc::Controller cntl;
-            stub.WriteObject(&cntl, &request, &reply, nullptr);
+            {
+                RpcLatencyScope timing(trace, RpcTarget::DataNode);
+                stub.WriteObject(&cntl, &request, &reply, nullptr);
+            }
             if (cntl.Failed()) {
                 last_error = cntl.ErrorText();
                 continue;
@@ -912,7 +944,7 @@ public:
     }
 
     bool Read(const zb::rpc::ReplicaLocation& replica, uint64_t offset, uint64_t size, std::string* out,
-              std::string* error) {
+              std::string* error, IoTraceContext* trace = nullptr) {
         std::vector<std::string> addresses = CollectAddresses(replica, resolver_);
         if (addresses.empty()) {
             if (error) {
@@ -941,7 +973,10 @@ public:
             }
             zb::rpc::ReadObjectReply reply;
             brpc::Controller cntl;
-            stub.ReadObject(&cntl, &request, &reply, nullptr);
+            {
+                RpcLatencyScope timing(trace, RpcTarget::DataNode);
+                stub.ReadObject(&cntl, &request, &reply, nullptr);
+            }
             if (cntl.Failed()) {
                 last_error = cntl.ErrorText();
                 continue;
@@ -967,7 +1002,7 @@ public:
                          uint64_t object_unit_size_hint,
                          zb::rpc::FileMeta* meta,
                          std::vector<zb::rpc::FileObjectSlice>* slices,
-                         zb::rpc::Status* status) {
+                         zb::rpc::Status* status, IoTraceContext* trace = nullptr) {
         std::vector<std::string> addresses = CollectAddresses(replica, resolver_);
         if (addresses.empty()) {
             if (status) {
@@ -996,7 +1031,10 @@ public:
             request.set_object_unit_size_hint(object_unit_size_hint);
             zb::rpc::ResolveFileReadReply reply;
             brpc::Controller cntl;
-            stub.ResolveFileRead(&cntl, &request, &reply, nullptr);
+            {
+                RpcLatencyScope timing(trace, RpcTarget::DataNode);
+                stub.ResolveFileRead(&cntl, &request, &reply, nullptr);
+            }
             if (cntl.Failed()) {
                 last_status.set_code(zb::rpc::STATUS_INTERNAL_ERROR);
                 last_status.set_message(cntl.ErrorText());
@@ -1030,7 +1068,7 @@ public:
                            zb::rpc::FileMeta* meta,
                            std::string* txid,
                            std::vector<zb::rpc::FileObjectSlice>* slices,
-                           zb::rpc::Status* status) {
+                           zb::rpc::Status* status, IoTraceContext* trace = nullptr) {
         std::vector<std::string> addresses = CollectAddresses(replica, resolver_);
         if (addresses.empty()) {
             if (status) {
@@ -1059,7 +1097,10 @@ public:
             request.set_object_unit_size_hint(object_unit_size_hint);
             zb::rpc::AllocateFileWriteReply reply;
             brpc::Controller cntl;
-            stub.AllocateFileWrite(&cntl, &request, &reply, nullptr);
+            {
+                RpcLatencyScope timing(trace, RpcTarget::DataNode);
+                stub.AllocateFileWrite(&cntl, &request, &reply, nullptr);
+            }
             if (cntl.Failed()) {
                 last_status.set_code(zb::rpc::STATUS_INTERNAL_ERROR);
                 last_status.set_message(cntl.ErrorText());
@@ -1097,7 +1138,7 @@ public:
                          bool allow_create,
                          uint64_t mtime_sec,
                          zb::rpc::FileMeta* meta,
-                         zb::rpc::Status* status) {
+                         zb::rpc::Status* status, IoTraceContext* trace = nullptr) {
         std::vector<std::string> addresses = CollectAddresses(replica, resolver_);
         if (addresses.empty()) {
             if (status) {
@@ -1128,7 +1169,10 @@ public:
             request.set_mtime_sec(mtime_sec);
             zb::rpc::CommitFileWriteReply reply;
             brpc::Controller cntl;
-            stub.CommitFileWrite(&cntl, &request, &reply, nullptr);
+            {
+                RpcLatencyScope timing(trace, RpcTarget::DataNode);
+                stub.CommitFileWrite(&cntl, &request, &reply, nullptr);
+            }
             if (cntl.Failed()) {
                 last_status.set_code(zb::rpc::STATUS_INTERNAL_ERROR);
                 last_status.set_message(cntl.ErrorText());
@@ -1213,6 +1257,8 @@ struct FuseState {
         bool has_anchor{false};
     };
 
+    std::unique_ptr<metrics::LatencyRecorder> latency;
+    bool latency_start_failed{false};
     MdsClient mds;
     SchedulerClient scheduler;
     bool scheduler_enabled{false};
@@ -1955,7 +2001,8 @@ int FuseRename(const char* from, const char* to, unsigned int flags) {
     return 0;
 }
 
-uint64_t ResolveInode(struct fuse_file_info* fi, const char* path, FuseState* state, zb::rpc::MdsStatus* status) {
+uint64_t ResolveInode(struct fuse_file_info* fi, const char* path, FuseState* state,
+                      zb::rpc::MdsStatus* status, IoTraceContext* trace = nullptr) {
     if (fi && fi->fh != 0) {
         std::lock_guard<std::mutex> lock(state->mu);
         auto it = state->handle_to_inode.find(fi->fh);
@@ -1964,29 +2011,29 @@ uint64_t ResolveInode(struct fuse_file_info* fi, const char* path, FuseState* st
         }
     }
     zb::rpc::InodeAttr attr;
-    if (!state->mds.Lookup(path, &attr, status)) {
+    if (!state->mds.Lookup(path, &attr, status, trace)) {
         return 0;
     }
     UpdateInodeAttrCache(state, attr.inode_id(), attr);
     return attr.inode_id();
 }
 
-int FuseRead(const char* path, char* buf, size_t size, off_t offset, struct fuse_file_info* fi) {
+int FuseReadImpl(FuseState* state, const char* path, char* buf, size_t size, off_t offset, struct fuse_file_info* fi, IoTraceContext* trace) {
     if (offset < 0) {
         return -EINVAL;
     }
     if (size == 0) {
         return 0;
     }
-    auto* state = GetState();
     zb::rpc::MdsStatus status;
-    uint64_t inode_id = ResolveInode(fi, path, state, &status);
+    uint64_t inode_id = ResolveInode(fi, path, state, &status, trace);
+    if (trace) trace->record.inode_id = inode_id;
     if (inode_id == 0) {
         return -StatusToErrno(status);
     }
     const uint64_t request_offset = static_cast<uint64_t>(offset);
     zb::rpc::FileLocationView location;
-    if (!state->mds.GetFileLocationView(inode_id, &location, &status)) {
+    if (!state->mds.GetFileLocationView(inode_id, &location, &status, trace)) {
         return -StatusToErrno(status);
     }
     zb::rpc::ReplicaLocation anchor;
@@ -1998,6 +2045,8 @@ int FuseRead(const char* path, char* buf, size_t size, off_t offset, struct fuse
     if (!EnsureReplicaNodeAddress(state, &anchor, &status)) {
         return -StatusToErrno(status);
     }
+    if (trace) trace->record.storage_tier = anchor.storage_tier() == zb::rpc::STORAGE_TIER_OPTICAL
+        ? metrics::StorageTier::Optical : metrics::StorageTier::Disk;
     UpdateInodeAnchorCache(state, inode_id, anchor);
 
     uint64_t hint_object_unit_size = FLAGS_default_object_unit_size;
@@ -2013,7 +2062,7 @@ int FuseRead(const char* path, char* buf, size_t size, off_t offset, struct fuse
         }
         if (hint_file_size == 0) {
             zb::rpc::InodeAttr attr;
-            if (!state->mds.Getattr(inode_id, &attr, &status)) {
+            if (!state->mds.Getattr(inode_id, &attr, &status, trace)) {
                 return -StatusToErrno(status);
             }
             hint_file_size = attr.size();
@@ -2042,7 +2091,7 @@ int FuseRead(const char* path, char* buf, size_t size, off_t offset, struct fuse
             std::string data;
             std::string error;
             zb::rpc::ReplicaLocation replica = BuildObjectReplicaFromAnchor(anchor, slice.object_id());
-            if (!state->data_nodes.Read(replica, slice.object_offset(), slice.length(), &data, &error)) {
+            if (!state->data_nodes.Read(replica, slice.object_offset(), slice.length(), &data, &error, trace)) {
                 return -EIO;
             }
             const size_t copy_len = static_cast<size_t>(std::min<uint64_t>(slice.length(), data.size()));
@@ -2066,7 +2115,7 @@ int FuseRead(const char* path, char* buf, size_t size, off_t offset, struct fuse
                                            hint_object_unit_size,
                                            &resolved_meta,
                                            &slices,
-                                           &data_status)) {
+                                           &data_status, trace)) {
         return -StatusToErrno(data_status);
     }
     const uint64_t object_unit_size = resolved_meta.object_unit_size() > 0
@@ -2091,7 +2140,7 @@ int FuseRead(const char* path, char* buf, size_t size, off_t offset, struct fuse
         std::string data;
         std::string error;
         const zb::rpc::ReplicaLocation replica = BuildObjectReplicaFromAnchor(anchor, slice.object_id());
-        if (!state->data_nodes.Read(replica, slice.object_offset(), read_len, &data, &error)) {
+        if (!state->data_nodes.Read(replica, slice.object_offset(), read_len, &data, &error, trace)) {
             return -EIO;
         }
         const size_t copy_len = static_cast<size_t>(std::min<uint64_t>(read_len, data.size()));
@@ -2106,27 +2155,28 @@ int FuseRead(const char* path, char* buf, size_t size, off_t offset, struct fuse
     return static_cast<int>(output.size());
 }
 
-int FuseWrite(const char* path, const char* buf, size_t size, off_t offset, struct fuse_file_info* fi) {
+int FuseWriteImpl(FuseState* state, const char* path, const char* buf, size_t size, off_t offset, struct fuse_file_info* fi, IoTraceContext* trace) {
     if (offset < 0) {
         return -EINVAL;
     }
     if (size == 0) {
         return 0;
     }
-    auto* state = GetState();
     zb::rpc::MdsStatus status;
-    uint64_t inode_id = ResolveInode(fi, path, state, &status);
+    uint64_t inode_id = ResolveInode(fi, path, state, &status, trace);
+    if (trace) trace->record.inode_id = inode_id;
     if (inode_id == 0) {
         LogMdsFailure("Write.ResolveInode", path, status);
         return -StatusToErrno(status);
     }
 
     zb::rpc::FileLocationView location;
-    if (!state->mds.GetFileLocationView(inode_id, &location, &status)) {
+    if (!state->mds.GetFileLocationView(inode_id, &location, &status, trace)) {
         LogMdsFailure("Write.GetFileLocationView", path, status);
         return -StatusToErrno(status);
     }
     if (IsArchivedReadOnly(location)) {
+        if (trace) trace->record.storage_tier = metrics::StorageTier::Optical;
         return -EROFS;
     }
     zb::rpc::ReplicaLocation anchor;
@@ -2140,6 +2190,8 @@ int FuseWrite(const char* path, const char* buf, size_t size, off_t offset, stru
         LogMdsFailure("Write.ResolveAnchorAddress", path, status);
         return -StatusToErrno(status);
     }
+    if (trace) trace->record.storage_tier = anchor.storage_tier() == zb::rpc::STORAGE_TIER_OPTICAL
+        ? metrics::StorageTier::Optical : metrics::StorageTier::Disk;
     UpdateInodeAnchorCache(state, inode_id, anchor);
 
     uint64_t hint_object_unit_size = FLAGS_default_object_unit_size;
@@ -2164,7 +2216,7 @@ int FuseWrite(const char* path, const char* buf, size_t size, off_t offset, stru
                                              &plan_meta,
                                              &txid,
                                              &slices,
-                                             &data_status)) {
+                                             &data_status, trace)) {
         LogDataFailure("Write.AllocateFileWrite", path, inode_id, anchor, data_status);
         return -StatusToErrno(data_status);
     }
@@ -2186,7 +2238,7 @@ int FuseWrite(const char* path, const char* buf, size_t size, off_t offset, stru
         std::string data(buf + cursor, buf + cursor + write_len);
         const zb::rpc::ReplicaLocation replica = BuildObjectReplicaFromAnchor(anchor, slice.object_id());
         std::string error;
-        if (!state->data_nodes.Write(replica, slice.object_offset(), data, &error)) {
+        if (!state->data_nodes.Write(replica, slice.object_offset(), data, &error, trace)) {
             zb::rpc::Status st;
             st.set_code(zb::rpc::STATUS_IO_ERROR);
             st.set_message(error);
@@ -2210,7 +2262,7 @@ int FuseWrite(const char* path, const char* buf, size_t size, off_t offset, stru
                                            true,
                                            static_cast<uint64_t>(std::time(nullptr)),
                                            &committed_meta,
-                                           &data_status)) {
+                                           &data_status, trace)) {
         LogDataFailure("Write.CommitFileWrite", path, inode_id, anchor, data_status);
         return -StatusToErrno(data_status);
     }
@@ -2228,10 +2280,34 @@ int FuseWrite(const char* path, const char* buf, size_t size, off_t offset, stru
                                    committed_meta.version(),
                                    committed_meta.mtime_sec(),
                                    &updated_attr,
-                                   &update_status)) {
+                                   &update_status, trace)) {
         UpdateInodeAttrCache(state, inode_id, updated_attr);
     }
     return static_cast<int>(size);
+}
+
+// These entry points also let the integration test exercise the actual callback
+// body and recorder without requiring a kernel FUSE mount.
+int ReadRequest(FuseState* state, const char* path, char* buf, size_t size, off_t offset,
+                struct fuse_file_info* fi) {
+    if (!state->latency) return FuseReadImpl(state, path, buf, size, offset, fi, nullptr);
+    metrics::RequestTraceScope request(*state->latency, false, offset, size);
+    return request.Finish(FuseReadImpl(state, path, buf, size, offset, fi, request.Context()));
+}
+
+int WriteRequest(FuseState* state, const char* path, const char* buf, size_t size, off_t offset,
+                 struct fuse_file_info* fi) {
+    if (!state->latency) return FuseWriteImpl(state, path, buf, size, offset, fi, nullptr);
+    metrics::RequestTraceScope request(*state->latency, true, offset, size);
+    return request.Finish(FuseWriteImpl(state, path, buf, size, offset, fi, request.Context()));
+}
+
+int FuseRead(const char* path, char* buf, size_t size, off_t offset, struct fuse_file_info* fi) {
+    return ReadRequest(GetState(), path, buf, size, offset, fi);
+}
+
+int FuseWrite(const char* path, const char* buf, size_t size, off_t offset, struct fuse_file_info* fi) {
+    return WriteRequest(GetState(), path, buf, size, offset, fi);
 }
 
 int FuseTruncate(const char* path, off_t size, struct fuse_file_info* fi) {
@@ -2295,14 +2371,64 @@ int FuseTruncate(const char* path, off_t size, struct fuse_file_info* fi) {
     return 0;
 }
 
+bool PrepareLatency(FuseState* state, int argc, char** argv, std::string* error) {
+    if (!FLAGS_io_latency_enabled) return true;
+    metrics::OutputDirectory output;
+    if (!metrics::ResolveOutputDirectory(FLAGS_io_latency_dir, FLAGS_io_latency_base_conf,
+                                         ZBSTORAGE_SOURCE_ROOT, &output, error)) return false;
+    struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+    struct fuse_cmdline_opts opts = {};
+    const int parsed = fuse_parse_cmdline(&args, &opts);
+    fuse_opt_free_args(&args);
+    std::string mount = opts.mountpoint ? opts.mountpoint : "";
+    std::free(opts.mountpoint);
+    if (parsed != 0 || mount.empty()) {
+        *error = "a valid FUSE mount point is required for latency recording";
+        return false;
+    }
+    auto recorder = std::make_unique<metrics::LatencyRecorder>();
+    metrics::RecorderOptions options;
+    options.flush_ms = FLAGS_io_latency_flush_ms;
+    options.batch_records = FLAGS_io_latency_batch_records;
+    options.queue_capacity = FLAGS_io_latency_queue_capacity;
+    if (!recorder->Prepare(output.path, mount, options, error)) return false;
+    std::fprintf(stderr, "[io_latency] directory=%s source=%s\n", output.path.c_str(), output.source.c_str());
+    state->latency = std::move(recorder);
+    return true;
+}
+
+void* FuseInit(struct fuse_conn_info*, struct fuse_config*) {
+    auto* state = GetState();
+    if (state->latency) {
+        std::string error;
+        if (!state->latency->Start(&error)) {
+            state->latency_start_failed = true;
+            std::fprintf(stderr, "[io_latency] startup failed: %s\n", error.c_str());
+            fuse_exit(fuse_get_context()->fuse);
+        }
+    }
+    return state;
+}
+
+void FuseDestroy(void* data) {
+    auto* state = static_cast<FuseState*>(data);
+    if (state->latency) state->latency->Stop();
+}
+
 } // namespace
 
 } // namespace zb::client::fuse_client
 
+#ifndef ZBSTORAGE_FUSE_CLIENT_NO_MAIN
 int main(int argc, char* argv[]) {
     google::ParseCommandLineFlags(&argc, &argv, true);
 
     zb::client::fuse_client::FuseState state;
+    std::string latency_error;
+    if (!zb::client::fuse_client::PrepareLatency(&state, argc, argv, &latency_error)) {
+        std::fprintf(stderr, "[io_latency] startup failed: %s\n", latency_error.c_str());
+        return 1;
+    }
     if (!state.mds.Init(FLAGS_mds)) {
         std::fprintf(stderr, "Failed to connect to MDS %s\n", FLAGS_mds.c_str());
         return 1;
@@ -2334,6 +2460,8 @@ int main(int argc, char* argv[]) {
     }
 
     static struct fuse_operations ops = {};
+    ops.init = zb::client::fuse_client::FuseInit;
+    ops.destroy = zb::client::fuse_client::FuseDestroy;
     ops.getattr = zb::client::fuse_client::FuseGetattr;
     ops.readdir = zb::client::fuse_client::FuseReaddir;
     ops.open = zb::client::fuse_client::FuseOpen;
@@ -2347,5 +2475,9 @@ int main(int argc, char* argv[]) {
     ops.write = zb::client::fuse_client::FuseWrite;
     ops.truncate = zb::client::fuse_client::FuseTruncate;
 
-    return fuse_main(argc, argv, &ops, &state);
+    const int result = fuse_main(argc, argv, &ops, &state);
+    if (state.latency) state.latency->Stop();
+    return state.latency_start_failed ? 1 : result;
 }
+
+#endif // ZBSTORAGE_FUSE_CLIENT_NO_MAIN

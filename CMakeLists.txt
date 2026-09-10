@@ -845,6 +845,10 @@ if(BRPC_DYNAMIC_LIB)
 endif()
 
 if(UNIX)
+    add_library(zb_client_metrics src/client/metrics/IoLatency.cpp)
+    target_include_directories(zb_client_metrics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(zb_client_metrics PUBLIC Threads::Threads)
+
     add_executable(zb_fuse_client
         src/client/fuse/zb_fuse_client.cpp
     )
@@ -858,9 +862,11 @@ if(UNIX)
     )
     target_compile_options(zb_fuse_client PRIVATE ${FUSE3_CFLAGS_OTHER})
     target_link_directories(zb_fuse_client PRIVATE ${FUSE3_LIBRARY_DIRS})
-    target_compile_definitions(zb_fuse_client PRIVATE FUSE_USE_VERSION=35)
+    target_compile_definitions(zb_fuse_client PRIVATE FUSE_USE_VERSION=35
+        ZBSTORAGE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(zb_fuse_client
         PRIVATE
+            zb_client_metrics
             zb_proto
             brpc-static
             ${GFLAGS_LIBRARY}
@@ -869,5 +875,39 @@ if(UNIX)
     )
     if(BRPC_DYNAMIC_LIB)
         target_link_libraries(zb_fuse_client PRIVATE ${BRPC_DYNAMIC_LIB})
+    endif()
+    if(BUILD_TESTING)
+        add_executable(client_io_latency_test tests/client/client_io_latency_test.cpp)
+        target_link_libraries(client_io_latency_test PRIVATE zb_client_metrics)
+        target_compile_definitions(client_io_latency_test PRIVATE
+            ZBSTORAGE_TEST_RESULTS="${CMAKE_CURRENT_SOURCE_DIR}/tests/client/results")
+        add_test(NAME client_io_latency_test COMMAND client_io_latency_test)
+
+        add_executable(client_io_latency_integration_test tests/client/client_io_latency_integration_test.cpp)
+        target_include_directories(client_io_latency_integration_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
+            ${GFLAGS_INCLUDE_PATH} ${FUSE3_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR})
+        target_compile_options(client_io_latency_integration_test PRIVATE ${FUSE3_CFLAGS_OTHER})
+        target_link_directories(client_io_latency_integration_test PRIVATE ${FUSE3_LIBRARY_DIRS})
+        target_compile_definitions(client_io_latency_integration_test PRIVATE
+            ZBSTORAGE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+            ZBSTORAGE_TEST_RESULTS="${CMAKE_CURRENT_SOURCE_DIR}/tests/client/results")
+        target_link_libraries(client_io_latency_integration_test PRIVATE
+            zb_client_metrics zb_proto brpc-static ${GFLAGS_LIBRARY} ${FUSE3_LIBRARIES})
+        if(BRPC_DYNAMIC_LIB)
+            target_link_libraries(client_io_latency_integration_test PRIVATE ${BRPC_DYNAMIC_LIB})
+        endif()
+        add_test(NAME client_io_latency_integration_test COMMAND client_io_latency_integration_test)
+        set_tests_properties(client_io_latency_test client_io_latency_integration_test PROPERTIES TIMEOUT 60)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME client_io_latency_workflow_test
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/client/client_io_latency_workflow_test.py)
+            set_tests_properties(client_io_latency_workflow_test PROPERTIES TIMEOUT 60)
+            add_test(NAME client_io_latency_mount_test
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/client/client_io_latency_mount_test.py
+                    --client $<TARGET_FILE:zb_fuse_client> --fixture $<TARGET_FILE:client_io_latency_integration_test>)
+            set_tests_properties(client_io_latency_mount_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        endif()
     endif()
 endif()

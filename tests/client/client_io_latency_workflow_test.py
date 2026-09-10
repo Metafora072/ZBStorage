@@ -2,6 +2,7 @@
 """Check real launch/render/stop scripts with isolated files and owned processes."""
 import os
 from pathlib import Path
+import runpy
 import shlex
 import subprocess
 import sys
@@ -11,6 +12,42 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[2]
 RESULTS = REPO / "tests/client/results"
+validate_shutdown = runpy.run_path(str(Path(__file__).with_name("client_io_latency_mount_test.py")))["validate_shutdown"]
+
+
+class MountShutdownTest(unittest.TestCase):
+    summary = "[io_latency] submitted=2 written=2 synced=2 dropped=0 failed=0\n"
+
+    def test_libfuse_sigterm_exit_codes(self):
+        for code in (0, 7, 8):
+            with self.subTest(code=code):
+                validate_shutdown(code, True, self.summary, 2)
+
+    def test_normal_unmount_requires_zero(self):
+        validate_shutdown(0, False, self.summary, 2)
+        for code in (7, 8):
+            with self.subTest(code=code), self.assertRaises(RuntimeError):
+                validate_shutdown(code, False, self.summary, 2)
+
+    def test_crashes_and_startup_failures_still_fail(self):
+        for code in (-15, -9, -11, 1, 3, 4, 6):
+            with self.subTest(code=code), self.assertRaises(RuntimeError):
+                validate_shutdown(code, True, self.summary, 2)
+
+    def test_incomplete_recording_still_fails(self):
+        bad_logs = (
+            "",
+            self.summary.replace("written=2", "written=1"),
+            self.summary.replace("synced=2", "synced=1"),
+            self.summary.replace("submitted=2", "submitted=3"),
+            self.summary.replace("dropped=0", "dropped=1"),
+            self.summary.replace("failed=0", "failed=1"),
+        )
+        for log_text in bad_logs:
+            with self.subTest(log=log_text), self.assertRaises(RuntimeError):
+                validate_shutdown(8, True, log_text, 2)
+        with self.assertRaises(RuntimeError):
+            validate_shutdown(8, True, self.summary, 1)
 
 
 class WorkflowTest(unittest.TestCase):

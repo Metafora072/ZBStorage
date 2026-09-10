@@ -5,6 +5,7 @@ import csv
 import json
 import os
 from pathlib import Path
+import re
 import select
 import shutil
 import subprocess
@@ -25,6 +26,23 @@ def stop(process):
             process.kill()
             process.wait()
             raise RuntimeError("test process failed to shut down normally")
+        return True
+    return False
+
+
+def validate_shutdown(returncode, sigterm_sent, log_text, row_count):
+    # libfuse 3.10 maps a nonzero session-loop result (including SIGTERM)
+    # to fuse_main status 7; 3.14 maps it to 8 (lib/helper.c).
+    # Only tolerate these codes when this test deliberately sent SIGTERM.
+    expected_exit = (0, 7, 8) if sigterm_sent else (0,)
+    if returncode not in expected_exit:
+        raise RuntimeError(f"client failed on shutdown (status={returncode}):\n" + log_text)
+    summaries = re.findall(
+        r"^\[io_latency\] submitted=(\d+) written=(\d+) synced=(\d+) dropped=(\d+) failed=(\d+)$",
+        log_text, re.MULTILINE)
+    expected_summary = (row_count, row_count, row_count, 0, 0)
+    if not summaries or tuple(map(int, summaries[-1])) != expected_summary:
+        raise RuntimeError("client did not persist all CSV rows on shutdown:\n" + log_text)
 
 
 def main():
@@ -82,16 +100,11 @@ finally:
     os.close(fd)
 ''', str(mount / "file")], check=True, timeout=15)
                             if explicit:
-                                stop(client)
-                                # libfuse can translate its signal-terminated
-                                # session loop into fuse_main status 7.
-                                expected_exit = (0, 7)
+                                sigterm_sent = stop(client)
                             else:
                                 subprocess.run(["fusermount3", "-u", str(mount)], check=True, timeout=10)
                                 client.wait(timeout=10)
-                                expected_exit = (0,)
-                            if client.returncode not in expected_exit:
-                                raise RuntimeError(f"client failed on shutdown (status={client.returncode}):\n" + log_path.read_text())
+                                sigterm_sent = False
                             files = list(output.glob("io_latency_*.csv"))
                             assert len(files) == 1, files
                             with files[0].open(newline="") as stream:
@@ -101,7 +114,7 @@ finally:
                                 assert int(row["ret"]) == 8, row
                                 assert float(row["mds_us"]) > 0 and float(row["data_node_us"]) > 0, row
                                 assert float(row["total_us"]) >= float(row["mds_us"]) + float(row["data_node_us"]), row
-                            assert "dropped=0 failed=0" in log_path.read_text(), log_path.read_text()
+                            validate_shutdown(client.returncode, sigterm_sent, log_path.read_text(), len(rows))
                             if explicit:
                                 assert not (output / "client/metrics").exists()
                             print(f"PASS: real FUSE {'explicit' if explicit else 'base.conf'} directory, read/write and shutdown sync ({len(rows)} rows)")

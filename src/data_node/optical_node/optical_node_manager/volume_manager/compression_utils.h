@@ -1,6 +1,7 @@
 #pragma once
 
 #include "error_codes.h"
+#include <cstdint>
 #include <string>
 #include <vector>
 

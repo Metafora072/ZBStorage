@@ -2,6 +2,7 @@
 
 #include "volume_metadata.h"
 #include "error_codes.h"
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>

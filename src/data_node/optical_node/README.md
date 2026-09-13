@@ -9,16 +9,18 @@ images, burns them to optical discs, and reports archive progress to MDS.
 - Simulate optical library scheduling (read / pack / burn) through `cd_manager_sim`. Timing uses
   built-in defaults (e.g. `burn_bandwidth_mbps`), and is not configurable from the node config file.
 - Persist and read volume-image metadata.
-- Serve two brpc services: `RealNodeService` (data plane) and `OpticalNodeService` (archive entry).
+- Serve the brpc service `OpticalNodeService` (archive entry + data-plane read).
 
 ## Implementation status
 - Archive engine is wired in: constructing `OpticalStorageServiceImpl(config)` immediately runs
   `OpticalNodeManager::Run`, which creates `input/temp/image/read/disc_sim` under `ARCHIVE_ROOT`
   and starts the background workers. A failure makes the node exit at startup (fail fast).
-- `OpticalNodeService.SendArchiveMetadata` is currently a **placeholder** that returns an error.
-  The real flow (download from the hot node, pack the image, report to MDS) is not implemented yet.
-- All 12 `RealNodeService` RPCs are **stubs** returning `optical node storage not implemented`.
-  Optical nodes are excluded from normal replica placement, so nothing calls them by default.
+- `OpticalNodeService.SendArchiveMetadata` receives batches and, per file, asynchronously downloads
+  it from the hot node into a WRITE task that feeds the pack/burn pipeline. The two MDS reports
+  (packed-to-image / burned-to-disc) are not implemented yet.
+- The optical node does not register `RealNodeService`; data-plane reads are served by
+  `OpticalNodeService` (`RequestAsyncReadFile` / `ReadObjectByTaskId` / `ReadObjectByInodeId`).
+  Optical nodes are excluded from normal replica placement by default.
 
 ## Config
 `KEY=VALUE` text, parsed by `OpticalNodeConfig::LoadFromFile`. `#` starts a comment.
@@ -41,7 +43,6 @@ images, burns them to optical discs, and reports archive progress to MDS.
 | `SIZE_THRESHOLD` | `0.9` | packing trigger ratio (0.0-1.0) |
 | `CAPACITY_IN_IMAGES` | `10` | max images kept in `image/` |
 | `AVAILABLE_VOLUME_ID_COUNT` | `5` | capacity of the `volume_id` queue |
-| `INITIAL_AVAILABLE_VOLUME_IDS` | `1,2,3,4,5` | volume ids seeded at startup (comma-separated) |
 
 Cluster deployment renders `deploy/multi_host/templates/optical_node.conf.tpl`;
 `config/optical_node.conf` is a ready-to-run local sample.

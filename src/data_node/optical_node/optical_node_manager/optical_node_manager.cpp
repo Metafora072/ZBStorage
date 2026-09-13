@@ -18,6 +18,10 @@
 #include <unistd.h>
 #include <optical_node_manager_structs.h>
 
+#include <brpc/channel.h>
+#include "real_node.pb.h"
+#include "scheduler.pb.h"
+
 namespace optical_node_manager {
     volumemanager::ErrorCode ReadFileToStringMmap(const std::string& file_path,
                                                   std::string* out,
@@ -45,14 +49,65 @@ namespace optical_node_manager {
         return os << "[" << NowLogTimestamp() << "][" << prefix << "] ";
     }
 
+    // 循环写直到写满 size 字节；处理短写与 EINTR。失败返回 false。
+    static bool PwriteAll(int fd, const char* data, size_t size, uint64_t offset) {
+        size_t written = 0;
+        while (written < size) {
+            const ssize_t n = ::pwrite(fd,
+                                       data + written,
+                                       size - written,
+                                       static_cast<off_t>(offset + written));
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return false;
+            }
+            if (n == 0) {
+                return false;
+            }
+            written += static_cast<size_t>(n);
+        }
+        return true;
+    }
+
+    // 从 node_id -> node_address 映射解析地址；支持虚节点 id 的 "<base>-v<index>" 回退。
+    static bool ResolveNodeAddressFromMap(
+        const std::unordered_map<std::string, std::string>& address_map,
+        const std::string& node_id,
+        std::string* out_address) {
+        if (out_address == nullptr) {
+            return false;
+        }
+        auto it = address_map.find(node_id);
+        if (it != address_map.end() && !it->second.empty()) {
+            *out_address = it->second;
+            return true;
+        }
+        // 虚节点回退：形如 "<base>-v<index>"，去掉后缀再查一次。
+        const std::string marker = "-v";
+        const size_t pos = node_id.rfind(marker);
+        if (pos != std::string::npos && pos > 0) {
+            it = address_map.find(node_id.substr(0, pos));
+            if (it != address_map.end() && !it->second.empty()) {
+                *out_address = it->second;
+                return true;
+            }
+        }
+        return false;
+    }
+
     OpticalNodeManager::OpticalNodeManager(uint64_t volume_size,
                                            double size_threshold,
                                            const std::string& root_dir,
                                            uint64_t capacity_in_images,
-                                           uint8_t available_volume_id_count)
+                                           uint8_t available_volume_id_count,
+                                           const std::string& scheduler_addr)
         : volume_manager_(volume_size, size_threshold),
           read_task_queue_(new WR_task::WRTaskQueue()),
           zip_task_queue_(new WR_task::WRTaskQueue()),
+          archive_task_queue_(new ArchiveRequestQueue()),
+          scheduler_addr_(scheduler_addr),
           burn_task_queue_(new WR_task::WRTaskQueue()),
           task_map_(new WR_task::WRTaskMap()),
           available_volume_ids() {
@@ -103,16 +158,46 @@ namespace optical_node_manager {
         return detail;
     }
 
-    // 占位实现（临时）：仅用于解除链接期的未定义符号，真实业务（按 target_node_id /
-    // target_disk_id 从热数据节点下载文件 → 封装镜像 → 两次上报）尚未落地，
-    // 任何请求都直接返回错误。Step 1 落地时替换本函数。
+    // 接收 MDS 下发的归档批次：仅校验并入队 archive_task_queue_，由 archive_task_thread_
+    // 异步消费（下载 → 建 WRITE 任务）。本函数不等待消费结果，入队成功即返回 SUCCESS。
     volumemanager::ErrorCode OpticalNodeManager::SendArchiveMetadata(
         const SendArchiveMetadataRequest& request) {
-        (void)request;
-        return volumemanager::ErrorCode::INVALID_PARAMETER;
+        if (archive_task_queue_ == nullptr) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kSendArchiveMetadata +
+                " subphase=queue_null";
+            return volumemanager::ErrorCode::INVALID_PARAMETER;
+        }
+
+        // 仅 RUNNING 接受归档请求；其它状态下消费线程未运行，入队会无人消费。
+        if (GetStatus() != manager_status::kRunning) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kSendArchiveMetadata +
+                " subphase=not_ready status=" + GetStatus();
+            return volumemanager::ErrorCode::MANAGER_NOT_READY;
+        }
+
+        if (request.files.empty()) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kSendArchiveMetadata +
+                " subphase=empty_files batch_id=" + std::to_string(request.batch_id);
+            return volumemanager::ErrorCode::INVALID_PARAMETER;
+        }
+
+        // 队列已关闭（Stop 进行中）：Push 会被静默丢弃，直接拒绝而不是假装成功。
+        if (archive_task_queue_->IsClosed()) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kSendArchiveMetadata +
+                " subphase=queue_closed batch_id=" + std::to_string(request.batch_id);
+            return volumemanager::ErrorCode::MANAGER_NOT_READY;
+        }
+
+        archive_task_queue_->Push(request);
+        last_failure_reason_buf_.clear();
+        return volumemanager::ErrorCode::SUCCESS;
     }
 
-    bool OpticalNodeManager::Run(const std::vector<uint64_t>& initial_available_volume_ids) {
+    bool OpticalNodeManager::Run() {
         // 状态机守卫：RUNNING 幂等成功；INITIALIZING / STOPPING 重入拒绝。
         const std::string current_status = GetStatus();
         if (current_status == manager_status::kRunning) {
@@ -137,14 +222,6 @@ namespace optical_node_manager {
             return false;
         }
         SetStatus(manager_status::kInitializing, "Run() entered");
-
-        // 初始 ID 灌入：按 FIFO 顺序取前 available_volume_id_count_ 个元素，超出数量丢弃。
-        const size_t push_count = std::min<size_t>(
-            initial_available_volume_ids.size(),
-            available_volume_id_count_);
-        for (size_t i = 0; i < push_count; ++i) {
-            available_volume_ids.push(initial_available_volume_ids[i]);
-        }
 
         if (!InitializeDir()) {
             // InitializeDir 已写子阶段到 last_failure_reason_buf_，这里拼顶层 phase。
@@ -400,6 +477,18 @@ namespace optical_node_manager {
             }
         }
 
+        if (!archive_task_thread_.joinable()) {
+            try {
+                archive_task_thread_ = std::thread(&OpticalNodeManager::ArchiveTaskProcessor, this);
+            } catch (const std::system_error& e) {
+                last_failure_reason_buf_ = std::string("phase=") +
+                    start_failure_phase::kStartWorkers +
+                    " subphase=" + start_failure_phase::kThreadArchive +
+                    " what=" + e.what();
+                return false;
+            }
+        }
+
         if (!burn_task_thread_.joinable()) {
             try {
                 burn_task_thread_ = std::thread(&OpticalNodeManager::BurnTaskProcessor, this);
@@ -437,6 +526,17 @@ namespace optical_node_manager {
         const bool keep_start_failure = (current_status == manager_status::kStartFailed);
         if (!keep_start_failure && current_status != manager_status::kStopped) {
             SetStatus(manager_status::kStopping, "StopBackgroundWorkers entered");
+        }
+
+        // 归档消费线程是 zip_task_queue_ 的生产者，必须先于 zip_task_queue_->Close() 停止并
+        // join：否则正在处理的批次会把 WRITE 任务 Push 进已关闭队列（静默丢弃），
+        // 造成 task_map_ 中残留永不被消费的任务 + 已落盘文件残留。
+        if (archive_task_queue_ != nullptr) {
+            archive_task_queue_->Close();
+        }
+
+        if (archive_task_thread_.joinable()) {
+            archive_task_thread_.join();
         }
 
         if (read_task_queue_ != nullptr) {
@@ -490,12 +590,29 @@ namespace optical_node_manager {
 
         delete read_task_queue_;
         delete zip_task_queue_;
+        delete archive_task_queue_;
         delete burn_task_queue_;
         delete task_map_;
     }
 
     uint64_t OpticalNodeManager::GenerateTaskId() {
         return next_task_id_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // 取用 volume_id 前补齐 available_volume_ids 到 available_volume_id_count_ 个。
+    // 仅 ZipTaskProcessor 调用，单线程访问队列，无需加锁。
+    void OpticalNodeManager::EnsureAvailableVolumeIds() {
+        while (available_volume_ids.size() <
+               static_cast<size_t>(available_volume_id_count_)) {
+            // MDS 未实现前返回 0 占位；仍入队以保证循环终止。
+            available_volume_ids.push(AllocateAvailableImageIdFromMds());
+        }
+    }
+
+    // 向 MDS 申请一个可用 image_id。MDS 侧尚未实现，暂时返回 0 占位。
+    // TODO: 接入 MDS AllocateAvailableImageId 后，返回 MDS 分配的全局唯一 image_id。
+    uint64_t OpticalNodeManager::AllocateAvailableImageIdFromMds() {
+        return 0;
     }
 
     volumemanager::ErrorCode OpticalNodeManager::RequestAsyncReadFile(const std::string& disk_id,
@@ -1119,6 +1236,401 @@ namespace optical_node_manager {
         return volumemanager::ErrorCode::SUCCESS;
     }
 
+    // 向 scheduler 拉取全量节点视图并建立 node_id -> node_address 临时映射。
+    // 仅保留类型为 NODE_REAL 且健康 / 启用的节点；每批次调用一次，避免地址过期。
+    bool OpticalNodeManager::BuildNodeAddressMap(
+        std::unordered_map<std::string, std::string>* out) {
+        if (out == nullptr) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=invalid_parameter out=null";
+            return false;
+        }
+        out->clear();
+
+        if (scheduler_addr_.empty()) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=scheduler_addr_empty";
+            return false;
+        }
+
+        // 懒初始化 channel（仅归档线程访问）；RPC 失败时 reset 供下批重建。
+        if (scheduler_channel_ == nullptr) {
+            auto channel = std::make_unique<brpc::Channel>();
+            brpc::ChannelOptions options;
+            options.protocol = "baidu_std";
+            options.timeout_ms = 3000;
+            options.max_retry = 0;
+            if (channel->Init(scheduler_addr_.c_str(), &options) != 0) {
+                last_failure_reason_buf_ = std::string("phase=") +
+                    start_failure_phase::kArchiveTaskProcessor +
+                    " subphase=scheduler_channel_init_failed addr=" + scheduler_addr_;
+                return false;
+            }
+            scheduler_channel_ = std::move(channel);
+        }
+
+        zb::rpc::SchedulerService_Stub stub(scheduler_channel_.get());
+        zb::rpc::GetClusterViewRequest request;
+        request.set_min_generation(0);  // 0 表示拉取全量节点视图。
+        zb::rpc::GetClusterViewReply response;
+        brpc::Controller cntl;
+        stub.GetClusterView(&cntl, &request, &response, nullptr);
+        if (cntl.Failed()) {
+            scheduler_channel_.reset();
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=GetClusterView_failed error=" + cntl.ErrorText();
+            return false;
+        }
+        if (response.status().code() != zb::rpc::SCHED_OK) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=GetClusterView_status code=" +
+                std::to_string(static_cast<int>(response.status().code()));
+            return false;
+        }
+
+        for (const zb::rpc::NodeView& node : response.nodes()) {
+            if (node.node_type() != zb::rpc::NODE_REAL) {
+                continue;
+            }
+            if (node.health_state() == zb::rpc::NODE_HEALTH_DEAD) {
+                continue;
+            }
+            if (node.admin_state() == zb::rpc::NODE_ADMIN_DISABLED) {
+                continue;
+            }
+            if (node.address().empty()) {
+                continue;
+            }
+            (*out)[node.node_id()] = node.address();
+        }
+
+        last_failure_reason_buf_.clear();
+        return true;
+    }
+
+    // 从 target_node_address 指向的 real_node 下载 file 的全部分片，按绝对偏移直接写入
+    // input_file_dir_/<inode_id>.archive 形成完整文件；成功后返回相对文件名。
+    // 任一步失败都会清理半成品并返回 false。
+    bool OpticalNodeManager::DownloadArchiveFile(const ArchiveFileInfo& file,
+                                                 const std::string& target_node_address,
+                                                 std::string* out_relative_path) {
+        if (out_relative_path == nullptr) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=invalid_parameter out=null inode_id=" + std::to_string(file.inode_id);
+            return false;
+        }
+        out_relative_path->clear();
+
+        if (input_file_dir_.empty()) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=input_dir_empty inode_id=" + std::to_string(file.inode_id);
+            return false;
+        }
+        if (target_node_address.empty()) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=node_address_empty inode_id=" + std::to_string(file.inode_id);
+            return false;
+        }
+
+        // 取 / 懒建到目标节点的出站 channel（仅归档线程访问，无需加锁）。
+        brpc::Channel* channel = nullptr;
+        auto channel_it = data_node_channels_.find(target_node_address);
+        if (channel_it != data_node_channels_.end() && channel_it->second != nullptr) {
+            channel = channel_it->second.get();
+        } else {
+            auto new_channel = std::make_unique<brpc::Channel>();
+            brpc::ChannelOptions options;
+            options.protocol = "baidu_std";
+            options.timeout_ms = 5000;
+            options.max_retry = 0;
+            if (new_channel->Init(target_node_address.c_str(), &options) != 0) {
+                last_failure_reason_buf_ = std::string("phase=") +
+                    start_failure_phase::kArchiveTaskProcessor +
+                    " subphase=data_channel_init_failed address=" + target_node_address +
+                    " inode_id=" + std::to_string(file.inode_id);
+                return false;
+            }
+            channel = new_channel.get();
+            data_node_channels_[target_node_address] = std::move(new_channel);
+        }
+
+        zb::rpc::RealNodeService_Stub stub(channel);
+
+        // 1. 取分片清单。
+        zb::rpc::ResolveFileReadRequest resolve_req;
+        resolve_req.set_inode_id(file.inode_id);
+        resolve_req.set_offset(0);
+        resolve_req.set_size(file.size);
+        resolve_req.set_disk_id(file.target_disk_id);
+        resolve_req.set_object_unit_size_hint(file.object_unit_size);
+        zb::rpc::ResolveFileReadReply resolve_resp;
+        brpc::Controller resolve_cntl;
+        stub.ResolveFileRead(&resolve_cntl, &resolve_req, &resolve_resp, nullptr);
+        if (resolve_cntl.Failed()) {
+            // 连接可能已失效：丢弃缓存 channel，后续文件/批次重建。
+            data_node_channels_.erase(target_node_address);
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=ResolveFileRead_failed inode_id=" + std::to_string(file.inode_id) +
+                " address=" + target_node_address +
+                " error=" + resolve_cntl.ErrorText();
+            return false;
+        }
+        if (resolve_resp.status().code() != zb::rpc::STATUS_OK) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=ResolveFileRead_status inode_id=" + std::to_string(file.inode_id) +
+                " code=" + std::to_string(static_cast<int>(resolve_resp.status().code())) +
+                " message=" + resolve_resp.status().message();
+            return false;
+        }
+
+        // 2. 校验元数据与分片布局（回复里的 object_unit_size 才是权威分片大小）。
+        const zb::rpc::FileMeta& meta = resolve_resp.meta();
+        const uint64_t object_unit_size = meta.object_unit_size();
+        if (meta.file_size() != file.size) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=size_mismatch inode_id=" + std::to_string(file.inode_id) +
+                " expected=" + std::to_string(file.size) +
+                " actual=" + std::to_string(meta.file_size());
+            return false;
+        }
+        if (object_unit_size == 0 && file.size > 0) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=object_unit_size_zero inode_id=" + std::to_string(file.inode_id);
+            return false;
+        }
+
+        uint64_t expected_offset = 0;
+        for (const zb::rpc::FileObjectSlice& slice : resolve_resp.slices()) {
+            const uint64_t slice_offset =
+                static_cast<uint64_t>(slice.object_index()) * object_unit_size +
+                slice.object_offset();
+            if (slice_offset != expected_offset) {
+                last_failure_reason_buf_ = std::string("phase=") +
+                    start_failure_phase::kArchiveTaskProcessor +
+                    " subphase=slice_not_contiguous inode_id=" + std::to_string(file.inode_id) +
+                    " expected_offset=" + std::to_string(expected_offset) +
+                    " slice_offset=" + std::to_string(slice_offset);
+                return false;
+            }
+            expected_offset += slice.length();
+        }
+        if (expected_offset != file.size) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=slice_total_mismatch inode_id=" + std::to_string(file.inode_id) +
+                " expected=" + std::to_string(file.size) +
+                " actual=" + std::to_string(expected_offset);
+            return false;
+        }
+
+        // 3. 分片直接在磁盘重组：按绝对偏移 pwrite，不做内存拼接。
+        const std::string relative_path = std::to_string(file.inode_id) + ".archive";
+        const std::string local_path = input_file_dir_ + relative_path;
+        const int fd = ::open(local_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd < 0) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=open_failed path=" + local_path +
+                " errno=" + std::to_string(errno);
+            return false;
+        }
+
+        for (const zb::rpc::FileObjectSlice& slice : resolve_resp.slices()) {
+            if (stop_requested_.load(std::memory_order_relaxed)) {
+                ::close(fd);
+                ::unlink(local_path.c_str());
+                last_failure_reason_buf_ = std::string("phase=") +
+                    start_failure_phase::kArchiveTaskProcessor +
+                    " subphase=stopped inode_id=" + std::to_string(file.inode_id);
+                return false;
+            }
+
+            zb::rpc::ReadObjectRequest read_req;
+            read_req.set_disk_id(slice.disk_id());
+            read_req.set_object_id(slice.object_id());
+            read_req.set_offset(slice.object_offset());
+            read_req.set_size(slice.length());
+            zb::rpc::ReadObjectReply read_resp;
+            brpc::Controller read_cntl;
+            stub.ReadObject(&read_cntl, &read_req, &read_resp, nullptr);
+            if (read_cntl.Failed()) {
+                ::close(fd);
+                ::unlink(local_path.c_str());
+                data_node_channels_.erase(target_node_address);
+                last_failure_reason_buf_ = std::string("phase=") +
+                    start_failure_phase::kArchiveTaskProcessor +
+                    " subphase=ReadObject_failed inode_id=" + std::to_string(file.inode_id) +
+                    " object_id=" + slice.object_id() +
+                    " error=" + read_cntl.ErrorText();
+                return false;
+            }
+            if (read_resp.status().code() != zb::rpc::STATUS_OK ||
+                static_cast<uint64_t>(read_resp.data().size()) != slice.length()) {
+                ::close(fd);
+                ::unlink(local_path.c_str());
+                last_failure_reason_buf_ = std::string("phase=") +
+                    start_failure_phase::kArchiveTaskProcessor +
+                    " subphase=ReadObject_bad_response inode_id=" + std::to_string(file.inode_id) +
+                    " object_id=" + slice.object_id() +
+                    " expected_len=" + std::to_string(slice.length()) +
+                    " actual_len=" + std::to_string(read_resp.data().size());
+                return false;
+            }
+
+            const uint64_t write_offset =
+                static_cast<uint64_t>(slice.object_index()) * object_unit_size +
+                slice.object_offset();
+            if (!PwriteAll(fd,
+                           read_resp.data().data(),
+                           static_cast<size_t>(read_resp.data().size()),
+                           write_offset)) {
+                ::close(fd);
+                ::unlink(local_path.c_str());
+                last_failure_reason_buf_ = std::string("phase=") +
+                    start_failure_phase::kArchiveTaskProcessor +
+                    " subphase=pwrite_failed inode_id=" + std::to_string(file.inode_id) +
+                    " offset=" + std::to_string(write_offset);
+                return false;
+            }
+        }
+
+        // 4. 最终大小校验：分片连续覆盖 [0, size)，文件大小应恰为 size。
+        struct stat st {};
+        if (::fstat(fd, &st) != 0 || static_cast<uint64_t>(st.st_size) != file.size) {
+            const uint64_t actual_size =
+                (st.st_size > 0) ? static_cast<uint64_t>(st.st_size) : 0;
+            ::close(fd);
+            ::unlink(local_path.c_str());
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=verify_size_failed inode_id=" + std::to_string(file.inode_id) +
+                " expected=" + std::to_string(file.size) +
+                " actual=" + std::to_string(actual_size);
+            return false;
+        }
+        ::close(fd);
+
+        *out_relative_path = relative_path;
+        last_failure_reason_buf_.clear();
+        return true;
+    }
+
+    // 为已落盘的归档文件建 WRITE 任务并入 zip_task_queue_。
+    // file_path 必须为相对文件名：ZipTaskProcessor 以 input_file_dir_ + file_path 定位原文件。
+    bool OpticalNodeManager::SubmitWriteTaskForArchive(uint64_t inode_id,
+                                                       const std::string& relative_path) {
+        if (relative_path.empty()) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=empty_file_path inode_id=" + std::to_string(inode_id);
+            return false;
+        }
+        if (zip_task_queue_ == nullptr || zip_task_queue_->IsClosed()) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=zip_queue_closed inode_id=" + std::to_string(inode_id);
+            return false;
+        }
+        if (stop_requested_.load(std::memory_order_relaxed)) {
+            last_failure_reason_buf_ = std::string("phase=") +
+                start_failure_phase::kArchiveTaskProcessor +
+                " subphase=stopping inode_id=" + std::to_string(inode_id);
+            return false;
+        }
+
+        const uint64_t generated_task_id = GenerateTaskId();
+        WR_task::WRTask task(generated_task_id, WR_task::WRTaskType::WRITE);
+        task.SetWriteTask(std::to_string(inode_id));
+        task.file_path = relative_path;
+        task_map_->Insert(std::move(task));
+        zip_task_queue_->Push(
+            WR_task::WRTaskShort(generated_task_id, WR_task::WRTaskType::WRITE));
+
+        last_failure_reason_buf_.clear();
+        return true;
+    }
+
+    // 归档任务消费线程：从 archive_task_queue_ 取出批次，每批次重建一次节点映射，
+    // 再逐文件下载（real_node 分片重组）并建 WRITE 任务入 zip_task_queue_。
+    void OpticalNodeManager::ArchiveTaskProcessor() {
+        while (!stop_requested_.load(std::memory_order_relaxed)) {
+            auto opt_request = archive_task_queue_->Pop();
+            if (!opt_request.has_value()) {
+                // 队列已 Close：退出消费循环。
+                break;
+            }
+
+            const SendArchiveMetadataRequest& request = *opt_request;
+
+            // 步骤 1：每批次重建一次节点映射，避免地址过期。
+            std::unordered_map<std::string, std::string> node_address_map;
+            if (!BuildNodeAddressMap(&node_address_map)) {
+                LogCerrTime(std::cerr, "Error")
+                          << "ArchiveTaskProcessor BuildNodeAddressMap failed batch_id="
+                          << request.batch_id << " detail=" << last_failure_reason_buf_
+                          << std::endl;
+                continue;
+            }
+
+            // 步骤 2：逐文件下载 + 建 WRITE 任务。
+            for (const ArchiveFileInfo& file : request.files) {
+                if (stop_requested_.load(std::memory_order_relaxed)) {
+                    break;
+                }
+
+                std::string target_node_address;
+                if (!ResolveNodeAddressFromMap(node_address_map,
+                                               file.target_node_id,
+                                               &target_node_address)) {
+                    last_failure_reason_buf_ = std::string("phase=") +
+                        start_failure_phase::kArchiveTaskProcessor +
+                        " subphase=node_not_found target_node_id=" + file.target_node_id +
+                        " inode_id=" + std::to_string(file.inode_id);
+                    LogCerrTime(std::cerr, "Error")
+                              << "ArchiveTaskProcessor resolve node failed batch_id="
+                              << request.batch_id << " detail=" << last_failure_reason_buf_
+                              << std::endl;
+                    continue;
+                }
+
+                std::string relative_path;
+                if (!DownloadArchiveFile(file, target_node_address, &relative_path)) {
+                    LogCerrTime(std::cerr, "Error")
+                              << "ArchiveTaskProcessor download failed batch_id="
+                              << request.batch_id << " detail=" << last_failure_reason_buf_
+                              << std::endl;
+                    continue;
+                }
+
+                if (!SubmitWriteTaskForArchive(file.inode_id, relative_path)) {
+                    // 队列已关闭 / 正在停止：清理已下载文件，避免残留，并退出本批次。
+                    ::unlink((input_file_dir_ + relative_path).c_str());
+                    LogCerrTime(std::cerr, "Error")
+                              << "ArchiveTaskProcessor submit write task failed batch_id="
+                              << request.batch_id << " detail=" << last_failure_reason_buf_
+                              << std::endl;
+                    break;
+                }
+
+                LogCerrTime(std::cerr, "Info")
+                          << "ArchiveTaskProcessor downloaded inode_id=" << file.inode_id
+                          << " node=" << file.target_node_id
+                          << " -> " << relative_path << std::endl;
+            }
+        }
+    }
+
     void OpticalNodeManager::ZipTaskProcessor() {
         do {
             auto opt_task = zip_task_queue_->Pop();
@@ -1411,7 +1923,8 @@ namespace optical_node_manager {
                 }
                 const uint64_t inode_id_num = full_task->inode_id_num;
 
-                // volume_id 由 available_volume_ids 队首分配；空时退回 0。
+                // 取用前先补齐可用 ID 队列（不足时向 MDS 申请）；随后由队首分配，空时退回 0。
+                EnsureAvailableVolumeIds();
                 uint64_t volume_id_num = 0;
                 if (!available_volume_ids.empty()) {
                     volume_id_num = available_volume_ids.front();

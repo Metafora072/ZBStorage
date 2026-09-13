@@ -48,10 +48,29 @@ public:
     ReplicationStatusSnapshot GetReplicationStatus() const;
 
     // 接收 MDS 下发的一批归档文件（对应 OpticalNodeService.SendArchiveMetadata），
-    // 转发给内部 OpticalNodeManager。当前 OpticalNodeManager::SendArchiveMetadata
-    // 尚未实现，调用会在链接期报未定义符号。
+    // 转发给内部 OpticalNodeManager（仅校验入队，立即返回）。
     volumemanager::ErrorCode SendArchiveMetadata(
         const optical_node_manager::SendArchiveMetadataRequest& request);
+
+    // 提交异步读任务，立即返回 task_id。入参 disk_id 形如 "optical-disk-<seq>"、
+    // image_id 形如 "img-<seq>"；本层取出尾部 <seq> 后再转发给
+    // OpticalNodeManager::RequestAsyncReadFile。
+    volumemanager::ErrorCode RequestAsyncReadFile(const std::string& disk_id,
+                                                  const std::string& image_id,
+                                                  const std::string& inode_id,
+                                                  uint64_t* task_id);
+
+    // 按 task_id 读取 [offset, offset+read_size) 区间；转发给 OpticalNodeManager。
+    volumemanager::ErrorCode ReadObjectByTaskId(uint64_t task_id,
+                                                std::string* out,
+                                                uint64_t offset,
+                                                uint64_t read_size);
+
+    // 按 inode_id 读取最近一次 RequestAsyncReadFile 产物的区间；转发给 OpticalNodeManager。
+    volumemanager::ErrorCode ReadObjectByInodeId(const std::string& inode_id,
+                                                 std::string* out,
+                                                 uint64_t offset,
+                                                 uint64_t read_size);
 
     // 归档引擎是否已成功启动（状态为 RUNNING）。
     bool IsArchiveEngineReady() const;
@@ -65,8 +84,8 @@ private:
     // 副本同步超时；当前仅由 ConfigureReplication 写入，后续副本数据同步启用时消费。
     uint32_t replication_timeout_ms_{2000};
 
-    // 本节点的归档引擎：接收 MDS 下发的归档文件、驱动镜像封装与刻录。
-    // 当前仅被本 Impl 持有并初始化，SendArchiveMetadata 业务逻辑尚未落地。
+    // 本节点的归档引擎：接收 MDS 下发的归档文件、驱动镜像封装与刻录，
+    // 并承载数据面异步读（RequestAsyncReadFile / ReadObjectBy*）。
     optical_node_manager::OpticalNodeManager optical_node_manager_;
 };
 

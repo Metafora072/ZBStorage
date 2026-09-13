@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace zb::optical_node {
 
@@ -36,8 +35,6 @@ struct OpticalNodeConfig {
     uint64_t capacity_in_images{10};
     // available_volume_ids 队列容量上限
     uint8_t available_volume_id_count{5};
-    // 首次启动按 FIFO 灌入队列的初始 volume_id 集合
-    std::vector<uint64_t> initial_available_volume_ids{1, 2, 3, 4, 5};
 
     static OpticalNodeConfig LoadFromFile(const std::string& path, std::string* error);
 };

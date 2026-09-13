@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cctype>
 #include <fstream>
-#include <sstream>
 #include <stdexcept>
 
 namespace zb::optical_node {
@@ -18,19 +17,6 @@ std::string Trim(std::string value) {
         return !std::isspace(ch);
     }).base(), value.end());
     return value;
-}
-
-std::vector<std::string> Split(const std::string& input, char delimiter) {
-    std::vector<std::string> parts;
-    std::string token;
-    std::istringstream stream(input);
-    while (std::getline(stream, token, delimiter)) {
-        token = Trim(token);
-        if (!token.empty()) {
-            parts.push_back(token);
-        }
-    }
-    return parts;
 }
 
 bool ParseUint32(const std::string& text, uint32_t* out) {
@@ -200,19 +186,6 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
                 return {};
             }
             cfg.available_volume_id_count = static_cast<uint8_t>(count);
-        } else if (key == "INITIAL_AVAILABLE_VOLUME_IDS") {
-            cfg.initial_available_volume_ids.clear();
-            for (const std::string& token : Split(value, ',')) {
-                uint64_t volume_id = 0;
-                if (!ParseUint64(token, &volume_id)) {
-                    if (error) {
-                        *error = "Invalid INITIAL_AVAILABLE_VOLUME_IDS at line " +
-                                 std::to_string(line_no);
-                    }
-                    return {};
-                }
-                cfg.initial_available_volume_ids.push_back(volume_id);
-            }
         }
     }
 

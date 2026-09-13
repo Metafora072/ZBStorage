@@ -1,16 +1,40 @@
 #include "OpticalStorageServiceImpl.h"
 
+#include <cctype>
 #include <mutex>
 
 namespace zb::optical_node {
+
+namespace {
+
+// 取上层标识的尾部序号：disk_id 形如 "optical-disk-<seq>"、image_id 形如 "img-<seq>"，
+// optical_node_manager 只使用其中的 <seq>（纯十进制数字串）。
+bool ExtractTrailingSeq(const std::string& value, std::string* seq) {
+    if (seq == nullptr || value.empty()) {
+        return false;
+    }
+    size_t end = value.size();
+    size_t begin = end;
+    while (begin > 0 && std::isdigit(static_cast<unsigned char>(value[begin - 1])) != 0) {
+        --begin;
+    }
+    if (begin == end) {
+        return false;
+    }
+    *seq = value.substr(begin, end - begin);
+    return true;
+}
+
+}  // namespace
 
 OpticalStorageServiceImpl::OpticalStorageServiceImpl(const OpticalNodeConfig& config)
     : optical_node_manager_(config.volume_size_bytes,
                             config.size_threshold,
                             config.archive_root,
                             config.capacity_in_images,
-                            config.available_volume_id_count) {
-    optical_node_manager_.Run(config.initial_available_volume_ids);
+                            config.available_volume_id_count,
+                            config.scheduler_addr) {
+    optical_node_manager_.Run();
 }
 
 void OpticalStorageServiceImpl::ConfigureReplication(const std::string& node_id,
@@ -69,6 +93,37 @@ ReplicationStatusSnapshot OpticalStorageServiceImpl::GetReplicationStatus() cons
 volumemanager::ErrorCode OpticalStorageServiceImpl::SendArchiveMetadata(
     const optical_node_manager::SendArchiveMetadataRequest& request) {
     return optical_node_manager_.SendArchiveMetadata(request);
+}
+
+volumemanager::ErrorCode OpticalStorageServiceImpl::RequestAsyncReadFile(
+    const std::string& disk_id,
+    const std::string& image_id,
+    const std::string& inode_id,
+    uint64_t* task_id) {
+    // 上层 disk_id / image_id 带前缀，manager 只用尾部 <seq>。
+    std::string volume_id;
+    if (!ExtractTrailingSeq(image_id, &volume_id)) {
+        return volumemanager::ErrorCode::INVALID_PARAMETER;
+    }
+    std::string disk_seq;
+    if (!disk_id.empty() && !ExtractTrailingSeq(disk_id, &disk_seq)) {
+        return volumemanager::ErrorCode::INVALID_PARAMETER;
+    }
+    return optical_node_manager_.RequestAsyncReadFile(disk_seq, volume_id, inode_id, task_id);
+}
+
+volumemanager::ErrorCode OpticalStorageServiceImpl::ReadObjectByTaskId(uint64_t task_id,
+                                                                      std::string* out,
+                                                                      uint64_t offset,
+                                                                      uint64_t read_size) {
+    return optical_node_manager_.ReadObjectByTaskId(task_id, out, offset, read_size);
+}
+
+volumemanager::ErrorCode OpticalStorageServiceImpl::ReadObjectByInodeId(const std::string& inode_id,
+                                                                       std::string* out,
+                                                                       uint64_t offset,
+                                                                       uint64_t read_size) {
+    return optical_node_manager_.ReadObjectByInodeId(inode_id, out, offset, read_size);
 }
 
 bool OpticalStorageServiceImpl::IsArchiveEngineReady() const {

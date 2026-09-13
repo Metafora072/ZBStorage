@@ -147,17 +147,24 @@ add_library(optical_node_manager STATIC
 target_include_directories(optical_node_manager
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/data_node/optical_node/optical_node_manager
+    PRIVATE
+        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_BINARY_DIR}
 )
 target_link_libraries(optical_node_manager
     PRIVATE
         ZLIB::ZLIB
         ${CMAKE_THREAD_LIBS_INIT}
+        zb_proto
+        brpc-static
 )
+if(BRPC_DYNAMIC_LIB)
+    target_link_libraries(optical_node_manager PRIVATE ${BRPC_DYNAMIC_LIB})
+endif()
 
 add_executable(optical_node_server
     src/data_node/optical_node/config/OpticalNodeConfig.cpp
     src/data_node/optical_node/service/OpticalStorageServiceImpl.cpp
-    src/data_node/optical_node/service/BrpcOpticalStorageService.cpp
     src/data_node/optical_node/service/BrpcOpticalNodeService.cpp
     src/data_node/optical_node/server/optical_node_server.cpp
 )

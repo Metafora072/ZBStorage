@@ -39,7 +39,7 @@ inline constexpr const char* kRunning      = "RUNNING";
 // 已请求停止，等待后台线程退出。
 inline constexpr const char* kStopping     = "STOPPING";
 
-// 停止流程已结束；可再次 Run() 重新初始化。
+// 停止流程已结束；可再次 Run()（任务队列不会重开）。
 inline constexpr const char* kStopped      = "STOPPED";
 
 }  // namespace manager_status
@@ -51,10 +51,11 @@ inline constexpr const char* kRunEntry      = "run_entry";
 inline constexpr const char* kInitializeDir = "InitializeDir";
 inline constexpr const char* kStartWorkers  = "StartBackgroundWorkers";
 
-// 三个后台线程创建失败的细分 phase。
+// 后台线程创建失败的细分 phase。
 inline constexpr const char* kThreadRead    = "StartBackgroundWorkers.thread=read";
 inline constexpr const char* kThreadZip     = "StartBackgroundWorkers.thread=zip";
 inline constexpr const char* kThreadBurn    = "StartBackgroundWorkers.thread=burn";
+inline constexpr const char* kThreadArchive = "StartBackgroundWorkers.thread=archive";
 
 // 运行期链路 phase：上层按字段做 == 比较时使用这些常量。
 inline constexpr const char* kRunGuard          = "RunGuard";
@@ -62,6 +63,8 @@ inline constexpr const char* kReadFile          = "ReadFile";
 inline constexpr const char* kReadObjectByTaskId = "ReadObjectByTaskId";
 inline constexpr const char* kReadObjectByInodeId = "ReadObjectByInodeId";
 inline constexpr const char* kWriteObject       = "WriteObject";
+inline constexpr const char* kSendArchiveMetadata = "SendArchiveMetadata";
+inline constexpr const char* kArchiveTaskProcessor = "ArchiveTaskProcessor";
 inline constexpr const char* kOnCDReadComplete  = "OnCDReadComplete";
 inline constexpr const char* kOnCDBurnComplete  = "OnCDBurnComplete";
 inline constexpr const char* kZipTaskProcessor  = "ZipTaskProcessor";
@@ -651,6 +654,79 @@ struct ArchiveFileInfo {
 struct SendArchiveMetadataRequest {
     uint64_t batch_id{0};
     std::vector<ArchiveFileInfo> files;
+};
+
+// 归档请求队列：多生产者（MDS RPC 线程）/ 单消费者（archive_task_thread_）。
+// 生命周期语义与 WRTaskQueue 一致：Close 后 Push 静默丢弃、Pop 返回空值作为退出信号。
+class ArchiveRequestQueue {
+public:
+    ArchiveRequestQueue() = default;
+
+    ArchiveRequestQueue(const ArchiveRequestQueue&) = delete;
+    ArchiveRequestQueue& operator=(const ArchiveRequestQueue&) = delete;
+
+    // 队尾入队；关闭后静默丢弃。
+    void Push(const SendArchiveMetadataRequest& request) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (closed_) {
+                return;
+            }
+            queue_.push(request);
+        }
+        condition_variable_.notify_one();
+    }
+
+    void Push(SendArchiveMetadataRequest&& request) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (closed_) {
+                return;
+            }
+            queue_.push(std::move(request));
+        }
+        condition_variable_.notify_one();
+    }
+
+    // 阻塞出队；关闭后返回空值作为退出信号。
+    std::optional<SendArchiveMetadataRequest> Pop() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_variable_.wait(lock, [this] {
+            return closed_ || !queue_.empty();
+        });
+
+        if (queue_.empty()) {
+            return std::nullopt;
+        }
+
+        SendArchiveMetadataRequest request = std::move(queue_.front());
+        queue_.pop();
+        return request;
+    }
+
+    void Close() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            closed_ = true;
+        }
+        condition_variable_.notify_all();
+    }
+
+    bool IsClosed() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return closed_;
+    }
+
+    std::size_t Size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable condition_variable_;
+    std::queue<SendArchiveMetadataRequest> queue_;
+    bool closed_ = false;
 };
 
 }  // namespace optical_node_manager

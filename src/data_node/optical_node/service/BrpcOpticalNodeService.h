@@ -5,9 +5,8 @@
 
 namespace zb::optical_node {
 
-// OpticalNodeService 的 brpc 协议适配层：把 MDS 下发的 protobuf 请求转换为领域对象，
+// OpticalNodeService 的 brpc 协议适配层：把 protobuf 请求转换为领域对象/参数，
 // 再交给 OpticalStorageServiceImpl 处理。
-// 当前 SendArchiveMetadata 业务逻辑尚未落地，处理函数仅返回未实现错误。
 class BrpcOpticalNodeService : public zb::rpc::OpticalNodeService {
 public:
     explicit BrpcOpticalNodeService(OpticalStorageServiceImpl* service);
@@ -15,6 +14,21 @@ public:
     void SendArchiveMetadata(google::protobuf::RpcController* cntl_base,
                              const zb::rpc::SendArchiveMetadataRequest* request,
                              zb::rpc::ArchiveReply* response,
+                             google::protobuf::Closure* done) override;
+
+    void RequestAsyncReadFile(google::protobuf::RpcController* cntl_base,
+                              const zb::rpc::RequestAsyncReadFileRequest* request,
+                              zb::rpc::RequestAsyncReadFileReply* response,
+                              google::protobuf::Closure* done) override;
+
+    void ReadObjectByTaskId(google::protobuf::RpcController* cntl_base,
+                            const zb::rpc::ReadObjectByTaskIdRequest* request,
+                            zb::rpc::ReadObjectByTaskIdReply* response,
+                            google::protobuf::Closure* done) override;
+
+    void ReadObjectByInodeId(google::protobuf::RpcController* cntl_base,
+                             const zb::rpc::ReadObjectByInodeIdRequest* request,
+                             zb::rpc::ReadObjectByInodeIdReply* response,
                              google::protobuf::Closure* done) override;
 
 private:

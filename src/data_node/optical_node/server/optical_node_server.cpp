@@ -13,7 +13,6 @@
 
 #include "../config/OpticalNodeConfig.h"
 #include "../service/BrpcOpticalNodeService.h"
-#include "../service/BrpcOpticalStorageService.h"
 #include "../service/OpticalStorageServiceImpl.h"
 #include "scheduler.pb.h"
 
@@ -174,14 +173,9 @@ int main(int argc, char* argv[]) {
                   << storage_service.GetArchiveStatusDetail() << std::endl;
         return 1;
     }
-    zb::optical_node::BrpcOpticalStorageService brpc_service;
     zb::optical_node::BrpcOpticalNodeService brpc_optical_node_service(&storage_service);
 
     brpc::Server server;
-    if (server.AddService(&brpc_service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
-        std::cerr << "Failed to add brpc service" << std::endl;
-        return 1;
-    }
     if (server.AddService(&brpc_optical_node_service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
         std::cerr << "Failed to add brpc optical node service" << std::endl;
         return 1;

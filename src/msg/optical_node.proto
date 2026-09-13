@@ -25,7 +25,54 @@ message ArchiveReply {
   MdsStatus status = 1;
 }
 
-// 光盘库节点对外提供的归档入口服务：MDS 向节点下发待归档文件信息。
+// 客户端向光盘库节点提交异步读任务：立即返回 task_id，随后用 ReadObjectByTaskId 取分片。
+// disk_id 形如 "optical-disk-<seq>"、image_id 形如 "img-<seq>"，节点在服务层取出尾部 <seq>
+// 换算成本地 disk_id / volume_id。
+message RequestAsyncReadFileRequest {
+  string disk_id = 1;
+  string image_id = 2;
+  uint64 inode_id = 3;
+}
+
+message RequestAsyncReadFileReply {
+  MdsStatus status = 1;   // MDS_OK 表示任务已受理，task_id 有效
+  uint64 task_id = 2;
+}
+
+// 按 task_id 读取 [offset, offset+read_size) 区间；末片读成功后服务端释放读产物。
+message ReadObjectByTaskIdRequest {
+  uint64 task_id = 1;
+  uint64 offset = 2;
+  uint64 read_size = 3;
+}
+
+message ReadObjectByTaskIdReply {
+  MdsStatus status = 1;
+  bytes data = 2;
+}
+
+// 按 inode_id 读取最近一次 RequestAsyncReadFile(inode_id) 产物的区间。
+message ReadObjectByInodeIdRequest {
+  uint64 inode_id = 1;
+  uint64 offset = 2;
+  uint64 read_size = 3;
+}
+
+message ReadObjectByInodeIdReply {
+  MdsStatus status = 1;
+  bytes data = 2;
+}
+
+// 光盘库节点对外提供的服务：归档入口（MDS 下发文件信息）+ 数据面异步读。
 service OpticalNodeService {
   rpc SendArchiveMetadata(SendArchiveMetadataRequest) returns (ArchiveReply);
+
+  rpc RequestAsyncReadFile(RequestAsyncReadFileRequest)
+      returns (RequestAsyncReadFileReply);
+
+  rpc ReadObjectByTaskId(ReadObjectByTaskIdRequest)
+      returns (ReadObjectByTaskIdReply);
+
+  rpc ReadObjectByInodeId(ReadObjectByInodeIdRequest)
+      returns (ReadObjectByInodeIdReply);
 }

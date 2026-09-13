@@ -17,19 +17,24 @@
 #include <space_manager/image_dir_manager.h>
 #include <volume_manager/volume_manager.h>
 
+// 仅用于 scheduler 出站 channel 的不透明持有，避免在头文件引入 brpc 依赖。
+namespace brpc { class Channel; }
+
 namespace optical_node_manager {
 
-// 顶层读写管理：协调 volume_manager 缓存、cd_manager 异步光盘调度与三个后台线程。
+// 顶层读写管理：协调 volume_manager 缓存、cd_manager 异步光盘调度与后台工作线程。
 class OpticalNodeManager {
 public:
     // volume_size / size_threshold 透传给 volume_manager；同时构建 cd_manager 调度组件。
     // root_dir / capacity_in_images / available_volume_id_count 为启动所需的工作目录、
     // image_dir 镜像数上限与 volume_id 队列容量上限。
+    // scheduler_addr 为 scheduler 服务地址，供归档线程查询全量节点视图（node_id→address）。
     OpticalNodeManager(uint64_t volume_size,
                        double size_threshold,
                        const std::string& root_dir,
                        uint64_t capacity_in_images,
-                       uint8_t available_volume_id_count);
+                       uint8_t available_volume_id_count,
+                       const std::string& scheduler_addr);
     ~OpticalNodeManager();
 
     OpticalNodeManager(const OpticalNodeManager&) = delete;
@@ -41,7 +46,7 @@ public:
                                                   const std::string& inode_id,
                                                   uint64_t* task_id);
 
-    // 按 task_id 读取已 FINISH 读任务的 [offset, offset+read_size) 区间到 *out 末尾；
+    // 按 task_id 读取已就绪（READY）读任务的 [offset, offset+read_size) 区间到 *out 末尾；
     // 服务端按 offset+read_size>=file_size 自动判定末片，末片读成功后 unlink 读产物并置 FINISH。
     // 客户端按固定 read_size 顺序调用即可，无需感知末片。
     // FAILED 返回细分错误码。
@@ -70,16 +75,14 @@ public:
                                          uint64_t total_size);
 
     // 接收 MDS 下发的一批归档文件信息（对应 OpticalNodeService.SendArchiveMetadata）。
-    // 仅校验入队，立即返回；光盘节点之后逐个按 target_node_id/target_disk_id 从热数据节点
-    // 下载文件并封装到镜像，封装/刻录结果通过两次上报（ReportFilesPackedToImage /
-    // ReportImagesBurnedToDisc）异步通知 MDS，本接口不等待这些阶段完成。
-    // 注意：当前为占位实现，直接返回错误，真实逻辑尚未落地。
+    // 仅校验并入队 archive_task_queue_，立即返回；由 archive_task_thread_ 异步逐个按
+    // target_node_id/target_disk_id 从热数据节点下载文件并封装到镜像，封装/刻录结果通过
+    // 两次上报（ReportFilesPackedToImage / ReportImagesBurnedToDisc）异步通知 MDS，
+    // 本接口不等待这些阶段完成。
     volumemanager::ErrorCode SendArchiveMetadata(const SendArchiveMetadataRequest& request);
 
     // 初始化目录、构造底层组件并启动后台线程；成功后状态切到 RUNNING。
-    // 按 FIFO 顺序灌入 initial_available_volume_ids 前 available_volume_id_count 个元素，
-    // 超出数量丢弃；
-    bool Run(const std::vector<uint64_t>& initial_available_volume_ids);
+    bool Run();
 
     // 当前运行状态字符串（manager_status::k*）。
     std::string GetStatus() const;
@@ -94,7 +97,14 @@ private:
     // 分配单调递增的 task_id。
     uint64_t GenerateTaskId();
 
-    // 启动 cd_manager 与三个后台线程；任一失败回滚并返回 false。
+    // 取用 volume_id 前补齐 available_volume_ids：元素数少于 available_volume_id_count_ 时，
+    // 循环向 MDS 申请（AllocateAvailableImageIdFromMds），直到达到该数量。
+    void EnsureAvailableVolumeIds();
+
+    // 向 MDS 申请一个可用 image_id；MDS 侧尚未实现，暂时返回 0 占位。
+    uint64_t AllocateAvailableImageIdFromMds();
+
+    // 启动 cd_manager 与后台工作线程；任一失败回滚并返回 false。
     bool StartBackgroundWorkers();
 
     // 规范化 root_dir_，派生五个子目录并下发到 volume_manager；
@@ -125,6 +135,26 @@ private:
     // 消费 zip_task_queue_：READ 走缓存 / MountVolume / 异步等待；WRITE 走压缩封装。
     void ZipTaskProcessor();
 
+    // 消费 archive_task_queue_：每批次重建节点映射，逐文件从 real_node 下载并重组为
+    // input_file_dir_/<inode_id>.archive，再建 WRITE 任务入 zip_task_queue_。
+    void ArchiveTaskProcessor();
+
+    // 向 scheduler 拉取全量节点视图（GetClusterView, min_generation=0）并建立
+    // node_id -> node_address 临时映射；仅保留 NODE_REAL 且健康/启用的节点。
+    // 成功返回 true；失败返回 false 并写 last_failure_reason_buf_。
+    bool BuildNodeAddressMap(std::unordered_map<std::string, std::string>* out);
+
+    // 从 target_node_address 指向的 real_node 下载 file 的全部分片，按绝对偏移直接写入
+    // input_file_dir_/<inode_id>.archive 形成完整文件；成功后把相对文件名写入 *out_relative_path。
+    // 任一步失败都会清理半成品并返回 false。
+    bool DownloadArchiveFile(const ArchiveFileInfo& file,
+                             const std::string& target_node_address,
+                             std::string* out_relative_path);
+
+    // 为已落盘的归档文件建 WRITE 任务并入 zip_task_queue_；
+    // 队列已关闭 / 正在停止时返回 false（调用方负责清理已下载文件）。
+    bool SubmitWriteTaskForArchive(uint64_t inode_id, const std::string& relative_path);
+
     // 封装触发后调用：扫描 temp_dir_ 剩余 temp_*.compressed，与待打包集合 diff，
     // cerr 输出本次打包的 volume_id 与 inode_id 列表，并从集合移除已打包项。
     void ReportPackedInodes(const std::string& volume_id);
@@ -152,12 +182,20 @@ private:
     WR_task::WRTaskQueue* read_task_queue_;
     // 等待压缩 / 缓存查询的任务队列。
     WR_task::WRTaskQueue* zip_task_queue_;
+    // 等待归档消费线程处理的任务队列（MDS 下发的批次）。
+    ArchiveRequestQueue* archive_task_queue_;
+    // scheduler 服务地址，构造注入；供归档线程查询节点视图。
+    std::string scheduler_addr_;
+    // 出站 scheduler channel：仅归档线程访问，懒初始化；RPC 失败时 reset 以便下批重建。
+    std::unique_ptr<brpc::Channel> scheduler_channel_;
+    // real_node 出站 channel 缓存（key = node_address）：仅归档线程访问，懒初始化。
+    std::unordered_map<std::string, std::unique_ptr<brpc::Channel>> data_node_channels_;
     // 等待刻录的任务队列。
     WR_task::WRTaskQueue* burn_task_queue_;
     // 任务元数据索引（按 task_id）。
     WR_task::WRTaskMap* task_map_;
 
-    // 可用 volume_id 的 FIFO 池；容量由构造函数的 available_volume_id_count 决定。
+    // 可用 volume_id 的 FIFO 池；容量为 available_volume_id_count_，取用时按需向 MDS 补齐。
     std::queue<uint64_t> available_volume_ids;
     uint8_t available_volume_id_count_{0};
 
@@ -171,10 +209,11 @@ private:
     // 卷镜像目录的容量管理 + LRU 淘汰；InitializeDir 阶段构造。
     std::unique_ptr<space_manager::ImageDirManager> image_dir_manager_;
 
-    // 三个后台工作线程。
+    // 后台工作线程：读 / 压缩 / 刻录 / 归档。
     std::thread read_task_thread_;
     std::thread zip_task_thread_;
     std::thread burn_task_thread_;
+    std::thread archive_task_thread_;
     // 清理线程：周期性移除 task_map_ 中的 FINISH 终态任务。
     std::thread cleanup_thread_;
 

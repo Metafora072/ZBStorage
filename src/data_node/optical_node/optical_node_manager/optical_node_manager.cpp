@@ -2,11 +2,9 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
-#include <cstdio>
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
-#include <iostream>
 #include <memory>
 #include <queue>
 #include <string>
@@ -28,26 +26,6 @@ namespace optical_node_manager {
                                                   uint64_t offset,
                                                   uint64_t read_size,
                                                   bool* out_is_last);
-
-    // 返回 "[YYYY-MM-DD HH:MM:SS.mmm]" 形式的本地时间字符串，用作日志前缀。
-    static std::string NowLogTimestamp() {
-        using namespace std::chrono;
-        const auto now = system_clock::now();
-        const auto now_t = system_clock::to_time_t(now);
-        const auto ms_part = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
-        std::tm tm_buf{};
-        localtime_r(&now_t, &tm_buf);
-        char time_buf[32];
-        std::strftime(time_buf, sizeof(time_buf), "%F %T", &tm_buf);
-        char out[40];
-        std::snprintf(out, sizeof(out), "%s.%03ld", time_buf, static_cast<long>(ms_part.count()));
-        return std::string(out);
-    }
-
-    // 输出 "[ts][prefix]" 前缀到 ostream，便于统一在 std::cerr 行首附带时间戳。
-    static std::ostream& LogCerrTime(std::ostream& os, const char* prefix) {
-        return os << "[" << NowLogTimestamp() << "][" << prefix << "] ";
-    }
 
     // 循环写直到写满 size 字节；处理短写与 EINTR。失败返回 false。
     static bool PwriteAll(int fd, const char* data, size_t size, uint64_t offset) {
@@ -250,7 +228,7 @@ namespace optical_node_manager {
             return false;
         }
 
-        // 规范化 root_dir_ 并派生五个子目录。
+        // 规范化 root_dir_ 并派生七个子目录。
         if (root_dir_.back() != '/') {
             root_dir_ += '/';
         }
@@ -260,6 +238,8 @@ namespace optical_node_manager {
         image_dir_      = root_dir_ + "image/";
         read_dir_       = root_dir_ + "read/";
         disc_sim_dir_   = root_dir_ + "disc_sim/";
+        meta_dir_       = root_dir_ + "meta/";
+        log_dir_        = root_dir_ + "log/";
 
         const std::string dirs[] = {
             root_dir_,
@@ -268,6 +248,8 @@ namespace optical_node_manager {
             image_dir_,
             read_dir_,
             disc_sim_dir_,
+            meta_dir_,
+            log_dir_,
         };
 
         // 记录本次新创建的目录，失败回滚时只删这些。
@@ -1094,16 +1076,10 @@ namespace optical_node_manager {
             return false;
         }
 
-        const WR_task::WRTaskState prev_state = current->state;
         current->state = new_state;
         if (!task_map_->Update(std::move(*current))) {
             return false;
         }
-        // 仅在真正发生变迁时打印日志。
-        LogCerrTime(std::cerr, "Info")
-                  << "MarkTaskState task_id=" << task_id
-                  << " state=" << WR_task::WRTaskStateToString(prev_state)
-                  << "->" << WR_task::WRTaskStateToString(new_state) << std::endl;
         return true;
     }
 
@@ -1144,8 +1120,6 @@ namespace optical_node_manager {
             detail_buf.append(" detail=").append(detail);
         }
         last_failure_reason_buf_ = std::move(detail_buf);
-        LogCerrTime(std::cerr, "Error")
-                  << "MarkTaskFailed " << last_failure_reason_buf_ << std::endl;
         return true;
     }
 
@@ -1576,10 +1550,6 @@ namespace optical_node_manager {
             // 步骤 1：每批次重建一次节点映射，避免地址过期。
             std::unordered_map<std::string, std::string> node_address_map;
             if (!BuildNodeAddressMap(&node_address_map)) {
-                LogCerrTime(std::cerr, "Error")
-                          << "ArchiveTaskProcessor BuildNodeAddressMap failed batch_id="
-                          << request.batch_id << " detail=" << last_failure_reason_buf_
-                          << std::endl;
                 continue;
             }
 
@@ -1597,36 +1567,19 @@ namespace optical_node_manager {
                         start_failure_phase::kArchiveTaskProcessor +
                         " subphase=node_not_found target_node_id=" + file.target_node_id +
                         " inode_id=" + std::to_string(file.inode_id);
-                    LogCerrTime(std::cerr, "Error")
-                              << "ArchiveTaskProcessor resolve node failed batch_id="
-                              << request.batch_id << " detail=" << last_failure_reason_buf_
-                              << std::endl;
                     continue;
                 }
 
                 std::string relative_path;
                 if (!DownloadArchiveFile(file, target_node_address, &relative_path)) {
-                    LogCerrTime(std::cerr, "Error")
-                              << "ArchiveTaskProcessor download failed batch_id="
-                              << request.batch_id << " detail=" << last_failure_reason_buf_
-                              << std::endl;
                     continue;
                 }
 
                 if (!SubmitWriteTaskForArchive(file.inode_id, relative_path)) {
                     // 队列已关闭 / 正在停止：清理已下载文件，避免残留，并退出本批次。
                     ::unlink((input_file_dir_ + relative_path).c_str());
-                    LogCerrTime(std::cerr, "Error")
-                              << "ArchiveTaskProcessor submit write task failed batch_id="
-                              << request.batch_id << " detail=" << last_failure_reason_buf_
-                              << std::endl;
                     break;
                 }
-
-                LogCerrTime(std::cerr, "Info")
-                          << "ArchiveTaskProcessor downloaded inode_id=" << file.inode_id
-                          << " node=" << file.target_node_id
-                          << " -> " << relative_path << std::endl;
             }
         }
     }
@@ -2102,15 +2055,8 @@ namespace optical_node_manager {
             }
         }
 
-        // cerr 输出：先 volume_id，再本次打包的 inode_id 列表。
-        std::cerr << "[pack] volume_id=" << volume_id << " packed_inode_ids=[";
-        for (size_t i = 0; i < packed_inodes.size(); ++i) {
-            if (i > 0) {
-                std::cerr << ",";
-            }
-            std::cerr << packed_inodes[i];
-        }
-        std::cerr << "]" << std::endl;
+        // volume_id 预留给后续上报 MDS 使用。
+        (void)volume_id;
     }
 
     void OpticalNodeManager::OnCDBurnComplete(const cd_manager_sim::BurnCompleteEvent& event) {
@@ -2262,11 +2208,6 @@ namespace optical_node_manager {
                     }
                 }
                 task_map_->Erase(finish_id);
-            }
-            if (!finish_ids.empty()) {
-                LogCerrTime(std::cerr, "Info")
-                          << "CleanupTaskProcessor removed " << finish_ids.size()
-                          << " FINISH task(s), remaining=" << task_map_->Size() << std::endl;
             }
         }
     }

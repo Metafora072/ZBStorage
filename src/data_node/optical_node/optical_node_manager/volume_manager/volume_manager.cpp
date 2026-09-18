@@ -7,7 +7,6 @@
 #include <random>
 #include <chrono>
 #include <cstring>
-#include <iostream>
 
 namespace volumemanager {
 
@@ -452,7 +451,6 @@ ErrorCode VolumeManager::MountVolume(const std::string& volume_id) {
 
         // 缓存文件元数据
         file_metadata_cache_[file_meta.inode_id] = file_meta;
-        std::cout << "挂载过程恢复元数据成功:" << file_meta.inode_id << std::endl;
     }
 
     file.close();

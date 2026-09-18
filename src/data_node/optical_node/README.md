@@ -13,8 +13,10 @@ images, burns them to optical discs, and reports archive progress to MDS.
 
 ## Implementation status
 - Archive engine is wired in: constructing `OpticalStorageServiceImpl(config)` immediately runs
-  `OpticalNodeManager::Run`, which creates `input/temp/image/read/disc_sim` under `ARCHIVE_ROOT`
-  and starts the background workers. A failure makes the node exit at startup (fail fast).
+  `OpticalNodeManager::Run`, which creates `input/temp/image/read/disc_sim/meta/log` under
+  `ARCHIVE_ROOT` and starts the background workers. A failure makes the node exit at startup
+  (fail fast). `meta/` is reserved for node information that must survive restarts; `log/` is
+  reserved for task records (completed / in-flight).
 - `OpticalNodeService.SendArchiveMetadata` receives batches and, per file, asynchronously downloads
   it from the hot node into a WRITE task that feeds the pack/burn pipeline. The two MDS reports
   (packed-to-image / burned-to-disc) are not implemented yet.

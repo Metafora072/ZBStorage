@@ -107,7 +107,7 @@ private:
     // 启动 cd_manager 与后台工作线程；任一失败回滚并返回 false。
     bool StartBackgroundWorkers();
 
-    // 规范化 root_dir_，派生五个子目录并下发到 volume_manager；
+    // 规范化 root_dir_，派生七个子目录并下发到 volume_manager；
     // 构造 cd_manager_ / image_dir_manager_；失败回滚已建目录与路径下发。
     bool InitializeDir();
 
@@ -156,7 +156,7 @@ private:
     bool SubmitWriteTaskForArchive(uint64_t inode_id, const std::string& relative_path);
 
     // 封装触发后调用：扫描 temp_dir_ 剩余 temp_*.compressed，与待打包集合 diff，
-    // cerr 输出本次打包的 volume_id 与 inode_id 列表，并从集合移除已打包项。
+    // 并从集合移除本次已打包的 inode_id。
     void ReportPackedInodes(const std::string& volume_id);
 
     // 消费 burn_task_queue_，将刻录任务提交给 cd_manager。
@@ -243,13 +243,17 @@ private:
     std::unordered_set<uint64_t> pending_pack_inode_ids_;
     std::mutex pending_pack_inode_ids_mutex_;
 
-    // InitializeDir 派生的五个子目录路径。
+    // InitializeDir 派生的七个子目录路径。
     std::string root_dir_;
     std::string input_file_dir_;
     std::string temp_dir_;
     std::string image_dir_;
     std::string read_dir_;
     std::string disc_sim_dir_;
+    // 持久化元数据目录：用于存放本节点需要跨重启保留的信息。
+    std::string meta_dir_;
+    // 任务日志目录：用于存放已完成 / 进行中任务等信息。
+    std::string log_dir_;
 
     // 构造函数给出的 image_dir 镜像数上限，InitializeDir 时下发给 image_dir_manager_。
     uint64_t capacity_in_images_{0};

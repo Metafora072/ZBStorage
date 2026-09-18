@@ -1,7 +1,6 @@
 #include "serializer.h"
 #include <cstring>
 #include <stdexcept>
-#include <iostream>
 
 namespace volumemanager {
 

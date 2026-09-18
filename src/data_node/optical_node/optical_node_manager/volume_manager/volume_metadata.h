@@ -13,12 +13,16 @@ namespace volumemanager {
 
 // 魔数标识 "VIMG"
 constexpr uint64_t MAGIC_NUMBER = 0x56494D47ULL;
-// 当前卷镜像格式版本号
-constexpr uint32_t CURRENT_VERSION = 1;
+// 当前卷镜像格式版本号（v2：卷内偏移/大小字段由 32 位扩宽为 64 位）
+constexpr uint32_t CURRENT_VERSION = 2;
 // 非法卷镜像ID
 constexpr uint64_t INVALID_VOLUME_ID = 0ULL;
 // 非法inode ID
 constexpr uint64_t INVALID_INODE_ID = 0ULL;
+// 卷镜像头固定大小（字节），须与 SerializeVolumeMetadata 的写入顺序一致
+constexpr uint32_t VOLUME_METADATA_SIZE = 8 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4;
+// 文件元数据固定部分大小（字节），即两个字符串之前的定长字段
+constexpr uint32_t FILE_METADATA_FIXED_SIZE = 8 + 8 + 8 + 8 + 8 + 4 + sizeof(time_t) + 1 + 1;
 
 /**
  * @brief 卷镜像元数据结构
@@ -28,12 +32,12 @@ struct VolumeMetadata {
     uint32_t version;              // 卷镜像格式版本号
     uint64_t volume_id;           // 全局唯一的卷镜像ID
     uint64_t volume_size;         // 卷镜像总大小
-    uint32_t metadata_offset;     // 元数据区偏移
-    uint32_t metadata_size;        // 元数据区大小
-    uint32_t directory_offset;     // 目录数据区偏移
-    uint32_t directory_size;       // 目录数据区大小
-    uint32_t user_data_offset;     // 用户数据区偏移
-    uint32_t user_data_size;       // 用户数据区大小
+    uint64_t metadata_offset;     // 元数据区偏移
+    uint64_t metadata_size;        // 元数据区大小
+    uint64_t directory_offset;     // 目录数据区偏移
+    uint64_t directory_size;       // 目录数据区大小
+    uint64_t user_data_offset;     // 用户数据区偏移
+    uint64_t user_data_size;       // 用户数据区大小
     uint32_t file_count;           // 文件数量
 
     /**
@@ -61,7 +65,7 @@ struct FileMetadata {
     uint64_t file_size;              // 原始文件大小
     uint64_t compressed_size;         // 压缩后文件大小
     uint64_t volume_id;               // 所属的卷镜像ID，未封装时为非法值
-    uint32_t offset_in_volume;       // 在卷镜像中的偏移量，未封装时无意义
+    uint64_t offset_in_volume;       // 在卷镜像中的偏移量，未封装时无意义
     std::string file_name;           // 原始文件名（不含路径）
     std::string compressed_file_name;  // 压缩文件名
     uint32_t file_mode;              // 文件权限和类型信息（st_mode）

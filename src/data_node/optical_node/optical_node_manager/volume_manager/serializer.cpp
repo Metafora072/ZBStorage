@@ -4,9 +4,6 @@
 
 namespace volumemanager {
 
-// 卷镜像元数据固定大小：56字节
-constexpr uint32_t VOLUME_METADATA_SIZE = 56;
-
 ErrorCode Serializer::SerializeVolumeMetadata(const VolumeMetadata& metadata,
                                                 std::vector<uint8_t>& output) {
     output.resize(VOLUME_METADATA_SIZE);
@@ -29,29 +26,29 @@ ErrorCode Serializer::SerializeVolumeMetadata(const VolumeMetadata& metadata,
     std::memcpy(ptr, &metadata.volume_size, sizeof(uint64_t));
     ptr += sizeof(uint64_t);
 
-    // 写入元数据区偏移（4字节）
-    std::memcpy(ptr, &metadata.metadata_offset, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
+    // 写入元数据区偏移（8字节）
+    std::memcpy(ptr, &metadata.metadata_offset, sizeof(uint64_t));
+    ptr += sizeof(uint64_t);
 
-    // 写入元数据区大小（4字节）
-    std::memcpy(ptr, &metadata.metadata_size, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
+    // 写入元数据区大小（8字节）
+    std::memcpy(ptr, &metadata.metadata_size, sizeof(uint64_t));
+    ptr += sizeof(uint64_t);
 
-    // 写入目录数据区偏移（4字节）
-    std::memcpy(ptr, &metadata.directory_offset, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
+    // 写入目录数据区偏移（8字节）
+    std::memcpy(ptr, &metadata.directory_offset, sizeof(uint64_t));
+    ptr += sizeof(uint64_t);
 
-    // 写入目录数据区大小（4字节）
-    std::memcpy(ptr, &metadata.directory_size, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
+    // 写入目录数据区大小（8字节）
+    std::memcpy(ptr, &metadata.directory_size, sizeof(uint64_t));
+    ptr += sizeof(uint64_t);
 
-    // 写入用户数据区偏移（4字节）
-    std::memcpy(ptr, &metadata.user_data_offset, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
+    // 写入用户数据区偏移（8字节）
+    std::memcpy(ptr, &metadata.user_data_offset, sizeof(uint64_t));
+    ptr += sizeof(uint64_t);
 
-    // 写入用户数据区大小（4字节）
-    std::memcpy(ptr, &metadata.user_data_size, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
+    // 写入用户数据区大小（8字节）
+    std::memcpy(ptr, &metadata.user_data_size, sizeof(uint64_t));
+    ptr += sizeof(uint64_t);
 
     // 写入文件数量（4字节）
     std::memcpy(ptr, &metadata.file_count, sizeof(uint32_t));
@@ -83,29 +80,29 @@ ErrorCode Serializer::DeserializeVolumeMetadata(const std::vector<uint8_t>& inpu
     std::memcpy(&metadata.volume_size, ptr, sizeof(uint64_t));
     ptr += sizeof(uint64_t);
 
-    // 读取元数据区偏移（4字节）
-    std::memcpy(&metadata.metadata_offset, ptr, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
+    // 读取元数据区偏移（8字节）
+    std::memcpy(&metadata.metadata_offset, ptr, sizeof(uint64_t));
+    ptr += sizeof(uint64_t);
 
-    // 读取元数据区大小（4字节）
-    std::memcpy(&metadata.metadata_size, ptr, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
+    // 读取元数据区大小（8字节）
+    std::memcpy(&metadata.metadata_size, ptr, sizeof(uint64_t));
+    ptr += sizeof(uint64_t);
 
-    // 读取目录数据区偏移（4字节）
-    std::memcpy(&metadata.directory_offset, ptr, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
+    // 读取目录数据区偏移（8字节）
+    std::memcpy(&metadata.directory_offset, ptr, sizeof(uint64_t));
+    ptr += sizeof(uint64_t);
 
-    // 读取目录数据区大小（4字节）
-    std::memcpy(&metadata.directory_size, ptr, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
+    // 读取目录数据区大小（8字节）
+    std::memcpy(&metadata.directory_size, ptr, sizeof(uint64_t));
+    ptr += sizeof(uint64_t);
 
-    // 读取用户数据区偏移（4字节）
-    std::memcpy(&metadata.user_data_offset, ptr, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
+    // 读取用户数据区偏移（8字节）
+    std::memcpy(&metadata.user_data_offset, ptr, sizeof(uint64_t));
+    ptr += sizeof(uint64_t);
 
-    // 读取用户数据区大小（4字节）
-    std::memcpy(&metadata.user_data_size, ptr, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
+    // 读取用户数据区大小（8字节）
+    std::memcpy(&metadata.user_data_size, ptr, sizeof(uint64_t));
+    ptr += sizeof(uint64_t);
 
     // 读取文件数量（4字节）
     std::memcpy(&metadata.file_count, ptr, sizeof(uint32_t));
@@ -153,9 +150,9 @@ ErrorCode Serializer::ReadString(const std::vector<uint8_t>& input,
 ErrorCode Serializer::SerializeFileMetadata(const FileMetadata& metadata,
                                               std::vector<uint8_t>& output) {
     // 固定部分：inode_id(8) + file_size(8) + compressed_size(8) + volume_id(8) +
-    //                     offset_in_volume(4) + file_mode(4) + last_modified(8) +
-    //           is_directory(1) + is_compressed(1) = 50字节
-    uint32_t fixed_size = 8 + 8 + 8 + 8 + 4 + 4 + 8 + 1 + 1;
+    //                     offset_in_volume(8) + file_mode(4) + last_modified(8) +
+    //           is_directory(1) + is_compressed(1)
+    const uint32_t fixed_size = FILE_METADATA_FIXED_SIZE;
     output.reserve(fixed_size);
     output.clear();
 
@@ -176,9 +173,9 @@ ErrorCode Serializer::SerializeFileMetadata(const FileMetadata& metadata,
     // std::cout << "序列化的volume_id" << metadata.volume_id << std::endl;
     output.insert(output.end(), ptr, ptr + sizeof(uint64_t));
 
-    // 写入offset_in_volume（4字节）
+    // 写入offset_in_volume（8字节）
     ptr = reinterpret_cast<const uint8_t*>(&metadata.offset_in_volume);
-    output.insert(output.end(), ptr, ptr + sizeof(uint32_t));
+    output.insert(output.end(), ptr, ptr + sizeof(uint64_t));
 
     // 写入file_mode（4字节）
     ptr = reinterpret_cast<const uint8_t*>(&metadata.file_mode);
@@ -205,9 +202,8 @@ ErrorCode Serializer::SerializeFileMetadata(const FileMetadata& metadata,
 
 ErrorCode Serializer::DeserializeFileMetadata(const std::vector<uint8_t>& input,
                                               FileMetadata& metadata) {
-    // 固定部分：50字节
-    uint32_t fixed_size = 8 + 8 + 8 + 8 + 4 + 4 + 8 + 1 + 1;
-    if (input.size() < fixed_size) {
+    // 固定部分：见 FILE_METADATA_FIXED_SIZE 定义
+    if (input.size() < FILE_METADATA_FIXED_SIZE) {
         return ErrorCode::SERIALIZATION_ERROR;
     }
 
@@ -235,10 +231,10 @@ ErrorCode Serializer::DeserializeFileMetadata(const std::vector<uint8_t>& input,
     ptr += sizeof(uint64_t);
     offset += sizeof(uint64_t);
 
-    // 读取offset_in_volume（4字节）
-    std::memcpy(&metadata.offset_in_volume, ptr, sizeof(uint32_t));
-    ptr += sizeof(uint32_t);
-    offset += sizeof(uint32_t);
+    // 读取offset_in_volume（8字节）
+    std::memcpy(&metadata.offset_in_volume, ptr, sizeof(uint64_t));
+    ptr += sizeof(uint64_t);
+    offset += sizeof(uint64_t);
 
     // 读取file_mode（4字节）
     std::memcpy(&metadata.file_mode, ptr, sizeof(uint32_t));
@@ -286,26 +282,28 @@ bool Serializer::ValidateVolumeMetadata(const VolumeMetadata& metadata) {
     }
 
     // 验证各区域偏移和大小的合法性
-    // 元数据区偏移应该大于等于56（卷镜像头大小）
+    // 元数据区偏移应该大于等于卷镜像头大小
     if (metadata.metadata_offset < VOLUME_METADATA_SIZE) {
         return false;
     }
 
     // 目录区偏移应该大于元数据区结束位置
-    uint32_t metadata_end = metadata.metadata_offset + metadata.metadata_size;
+    const uint64_t metadata_end = metadata.metadata_offset + metadata.metadata_size;
     if (metadata.directory_offset < metadata_end) {
         return false;
     }
 
     // 用户数据区偏移应该大于目录区结束位置
-    uint32_t directory_end = metadata.directory_offset + metadata.directory_size;
+    const uint64_t directory_end = metadata.directory_offset + metadata.directory_size;
     if (metadata.user_data_offset < directory_end) {
         return false;
     }
 
-    // 用户数据区结束位置应该不超过卷镜像总大小
-    uint64_t user_data_end = static_cast<uint64_t>(metadata.user_data_offset) + metadata.user_data_size;
-    if (user_data_end > metadata.volume_size) {
+    // 用户数据区结束位置应该不超过卷镜像总大小；先比较偏移再比较剩余空间，避免相加溢出
+    if (metadata.user_data_offset > metadata.volume_size) {
+        return false;
+    }
+    if (metadata.user_data_size > metadata.volume_size - metadata.user_data_offset) {
         return false;
     }
 

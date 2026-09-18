@@ -244,27 +244,27 @@ ErrorCode VolumeManager::PackVolume(std::string& output_path, uint64_t volume_id
     volume_meta.volume_size = volume_size_;
     volume_meta.file_count = static_cast<uint32_t>(pending_files_.size());
 
-    // 计算各数据区大小
-    uint32_t metadata_offset = 56; // 卷镜像头固定大小56字节
-    uint32_t metadata_size = 0;
+    // 计算各数据区大小（偏移/大小统一用 64 位，避免卷镜像超过 4GiB 时回绕）
+    uint64_t metadata_offset = VOLUME_METADATA_SIZE; // 卷镜像头固定大小
+    uint64_t metadata_size = 0;
 
     // 计算元数据区大小
     for (auto& file_meta : pending_files_) {
         std::vector<uint8_t> serialized;
         file_meta.volume_id = volume_meta.volume_id;
         Serializer::SerializeFileMetadata(file_meta, serialized);
-        metadata_size += static_cast<uint32_t>(serialized.size());
+        metadata_size += static_cast<uint64_t>(serialized.size());
     }
 
-    uint32_t directory_offset = metadata_offset + metadata_size;
-    uint32_t directory_size = 0; // 暂不处理目录数据
-    uint32_t user_data_offset = directory_offset + directory_size;
-    uint32_t user_data_size = 0;
+    uint64_t directory_offset = metadata_offset + metadata_size;
+    uint64_t directory_size = 0; // 暂不处理目录数据
+    uint64_t user_data_offset = directory_offset + directory_size;
+    uint64_t user_data_size = 0;
 
     // 计算用户数据区大小并设置偏移（使用压缩后大小）
     for (auto& file_meta : pending_files_) {
         file_meta.offset_in_volume = user_data_offset + user_data_size;
-        user_data_size += static_cast<uint32_t>(file_meta.compressed_size);
+        user_data_size += file_meta.compressed_size;
     }
 
     // 设置卷镜像元数据
@@ -352,8 +352,8 @@ ErrorCode VolumeManager::MountVolume(const std::string& volume_id) {
     }
 
     // 读取卷镜像头
-    std::vector<uint8_t> header_data(56);
-    file.read(reinterpret_cast<char*>(header_data.data()), 56);
+    std::vector<uint8_t> header_data(VOLUME_METADATA_SIZE);
+    file.read(reinterpret_cast<char*>(header_data.data()), VOLUME_METADATA_SIZE);
 
     if (!file.good()) {
         file.close();
@@ -381,12 +381,12 @@ ErrorCode VolumeManager::MountVolume(const std::string& volume_id) {
     }
 
     // 读取文件元数据区
-    file.seekg(volume_meta.metadata_offset);
+    file.seekg(static_cast<std::streamoff>(volume_meta.metadata_offset));
     for (uint32_t i = 0; i < volume_meta.file_count; ++i) {
-        // 读取文件元数据：固定部分50字节 + 两个字符串
-        // 先读取固定部分：50字节
-        std::vector<uint8_t> temp_data(50);
-        file.read(reinterpret_cast<char*>(temp_data.data()), 50);
+        // 读取文件元数据：固定部分 + 两个字符串
+        // 先读取固定部分
+        std::vector<uint8_t> temp_data(FILE_METADATA_FIXED_SIZE);
+        file.read(reinterpret_cast<char*>(temp_data.data()), FILE_METADATA_FIXED_SIZE);
 
         if (!file.good()) {
             file.close();
@@ -518,7 +518,7 @@ ErrorCode VolumeManager::ReadFile(uint64_t inode_id, std::string& output_path) {
     }
 
     // 定位到文件数据位置
-    file.seekg(file_meta.offset_in_volume);
+    file.seekg(static_cast<std::streamoff>(file_meta.offset_in_volume));
 
     // 读取压缩文件内容
     std::vector<uint8_t> compressed_content(file_meta.compressed_size);

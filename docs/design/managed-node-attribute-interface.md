@@ -334,7 +334,7 @@ for (const ManagedNodeRuntime& node : manager.ListNodes(filter)) {
 
 ## 9. 验证位置
 
-核心回归测试位于 `tests/scheduler_node_model_test.cpp`，覆盖：
+以下细粒度回归用例仅保留在开发机，不随本次代码交付，也不作为默认构建依赖。既有验证覆盖：
 
 - 三类默认容量、带宽和延迟；
 - 读写非对称带宽和功率—性能线性缩放；
@@ -347,9 +347,10 @@ for (const ManagedNodeRuntime& node : manager.ListNodes(filter)) {
 - 源端二次枚举后才允许完成排空退休；
 - 长时间步进跨越多个功耗阈值时的精确分段能耗。
 
-推荐验证命令：
+交付给使用者的测试入口见 [Scheduler 测试说明](../../tests/scheduler/README.md)，可直接运行批量负载、仿真及模拟电表闭环：
 
 ```bash
-cmake --build build --target scheduler_node_model_test scheduler_snapshot_test scheduler_managed_service_test scheduler_drain_migration_test -j2
-ctest --test-dir build -R 'scheduler_(node_model|snapshot|managed_service|drain_migration)_test' --output-on-failure
+python3 tests/scheduler/run.py local --files 12
+python3 tests/scheduler/run.py simulation
+python3 tests/scheduler/run.py meter-closure --files 12
 ```

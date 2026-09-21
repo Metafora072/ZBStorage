@@ -1,7 +1,7 @@
 #include "DrainMigrationCoordinator.h"
 
 #include <algorithm>
-#include <limits>
+#include <charconv>
 #include <map>
 
 namespace zb::scheduler {
@@ -121,16 +121,19 @@ bool DrainMigrationCoordinator::ParseStableObjectId(const std::string& object_id
     if (!inode_id || !object_index || object_id.rfind("obj-", 0) != 0) return false;
     const size_t split = object_id.find('-', 4);
     if (split == std::string::npos || split + 1 == object_id.size()) return false;
-    try {
-        const uint64_t inode = std::stoull(object_id.substr(4, split - 4));
-        const unsigned long index = std::stoul(object_id.substr(split + 1));
-        if (inode == 0 || index > std::numeric_limits<uint32_t>::max()) return false;
-        *inode_id = inode;
-        *object_index = static_cast<uint32_t>(index);
-        return true;
-    } catch (...) {
+    uint64_t inode = 0;
+    uint32_t index = 0;
+    const char* begin = object_id.data();
+    const char* end = begin + object_id.size();
+    const auto inode_result = std::from_chars(begin + 4, begin + split, inode);
+    const auto index_result = std::from_chars(begin + split + 1, end, index);
+    if (inode_result.ec != std::errc{} || inode_result.ptr != begin + split || inode == 0 ||
+        index_result.ec != std::errc{} || index_result.ptr != end) {
         return false;
     }
+    *inode_id = inode;
+    *object_index = index;
+    return true;
 }
 
 bool DrainMigrationCoordinator::EnumerateLocked(InternalTask* task, uint64_t now_ms) {

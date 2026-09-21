@@ -250,10 +250,15 @@ bool ManagedNodeProfileFromProto(const zb::rpc::ManagedNodeSpec& input,
         }
         return false;
     }
-    if (input.kind() == zb::rpc::MANAGED_KIND_UNKNOWN) {
+    if (!zb::rpc::ManagedNodeKind_IsValid(input.kind()) ||
+        input.kind() == zb::rpc::MANAGED_KIND_UNKNOWN) {
         if (error) {
-            *error = "managed node kind is required";
+            *error = "managed node kind must be a known non-UNKNOWN value";
         }
+        return false;
+    }
+    if (!zb::rpc::ManagedExecutionMode_IsValid(input.execution_mode())) {
+        if (error) *error = "invalid managed execution mode";
         return false;
     }
 
@@ -283,6 +288,10 @@ bool ManagedNodeProfileFromProto(const zb::rpc::ManagedNodeSpec& input,
     if (input.device_groups_size() > 0) {
         profile.device_groups.clear();
         for (const auto& item : input.device_groups()) {
+            if (!zb::rpc::ManagedDeviceKind_IsValid(item.kind())) {
+                if (error) *error = "invalid managed device kind";
+                return false;
+            }
             profile.device_groups.push_back({item.name(),
                                              DeviceKindFromProto(item.kind()),
                                              item.device_capacity_bytes(),
@@ -300,6 +309,10 @@ bool ManagedNodeProfileFromProto(const zb::rpc::ManagedNodeSpec& input,
                          input.power().off_milliwatts()};
     }
     if (input.has_reliability()) {
+        if (!zb::rpc::ManagedReliabilityProfile::Model_IsValid(input.reliability().model())) {
+            if (error) *error = "invalid managed reliability model";
+            return false;
+        }
         profile.reliability.mean_lifetime_ms = input.reliability().mean_lifetime_ms();
         profile.reliability.lifetime_stddev_ms = input.reliability().lifetime_stddev_ms();
         profile.reliability.minimum_lifetime_ms = input.reliability().minimum_lifetime_ms();
@@ -347,6 +360,11 @@ bool ManagedNodeFilterFromProto(const zb::rpc::ListManagedNodesRequest& input,
     }
     ManagedNodeFilter filter;
     filter.include_retired = input.include_retired();
+    if (!zb::rpc::ManagedNodeKind_IsValid(input.kind()) ||
+        !zb::rpc::ManagedExecutionMode_IsValid(input.execution_mode())) {
+        if (error) *error = "invalid node kind or execution mode filter";
+        return false;
+    }
     if (input.kind() != zb::rpc::MANAGED_KIND_UNKNOWN) {
         filter.kind = NodeKindFromProto(input.kind());
     }

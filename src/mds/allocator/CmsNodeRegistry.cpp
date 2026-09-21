@@ -145,40 +145,20 @@ NodeInfo CmsNodeRegistry::BuildNodeInfo(const zb::rpc::CmsNodeCatalogEntry& entr
     return out;
 }
 
-uint32_t CmsNodeRegistry::AllocateCompactIdLocked(zb::rpc::ManagedNodeKind kind,
-                                                   std::string* error) {
-    uint32_t* next = kind == zb::rpc::MANAGED_KIND_OPTICAL_LIBRARY
-                         ? &next_optical_compact_id_ : &next_storage_compact_id_;
-    const uint32_t maximum = kind == zb::rpc::MANAGED_KIND_OPTICAL_LIBRARY
-                                 ? 0x00ffffffU : 0x0000ffffU;
-    std::unordered_set<uint32_t> used;
-    for (const auto& item : nodes_) {
-        const bool item_optical = item.second.managed_view().spec().kind() ==
-                                  zb::rpc::MANAGED_KIND_OPTICAL_LIBRARY;
-        const bool requested_optical = kind == zb::rpc::MANAGED_KIND_OPTICAL_LIBRARY;
-        if (item_optical == requested_optical)
-            used.insert(static_cast<uint32_t>(item.second.managed_view().compact_id()));
-    }
-    while (*next <= maximum && used.count(*next) != 0) ++*next;
-    if (*next == 0 || *next > maximum) {
-        if (error) *error = "CMS compact identifier space exhausted";
-        return 0;
-    }
-    return (*next)++;
-}
-
 bool CmsNodeRegistry::PersistLocked(
     const std::map<std::string, zb::rpc::CmsNodeCatalogEntry>& nodes,
     uint64_t cms_generation,
     uint64_t scheduler_generation,
+    uint32_t next_storage_compact_id,
+    uint32_t next_optical_compact_id,
     std::string* error) const {
     if (!store_) return true;
     zb::rpc::CmsNodeCatalogSnapshot snapshot;
     snapshot.set_format_version(1);
     snapshot.set_cms_generation(cms_generation);
     snapshot.set_scheduler_generation(scheduler_generation);
-    snapshot.set_next_storage_compact_id(next_storage_compact_id_);
-    snapshot.set_next_optical_compact_id(next_optical_compact_id_);
+    snapshot.set_next_storage_compact_id(next_storage_compact_id);
+    snapshot.set_next_optical_compact_id(next_optical_compact_id);
     for (const auto& item : nodes) *snapshot.add_nodes() = item.second;
     std::string payload;
     if (!snapshot.SerializeToString(&payload)) {
@@ -224,6 +204,8 @@ bool CmsNodeRegistry::Restore(std::string* error) {
     std::map<std::string, zb::rpc::CmsNodeCatalogEntry> restored;
     std::unordered_set<uint32_t> storage_ids;
     std::unordered_set<uint32_t> optical_ids;
+    uint32_t next_storage = std::max<uint32_t>(1, snapshot.next_storage_compact_id());
+    uint32_t next_optical = std::max<uint32_t>(1, snapshot.next_optical_compact_id());
     for (const auto& entry : snapshot.nodes()) {
         if (!entry.has_managed_view() || !entry.managed_view().has_spec()) {
             if (error) *error = "CMS snapshot entry lacks managed identity";
@@ -231,7 +213,7 @@ bool CmsNodeRegistry::Restore(std::string* error) {
         }
         const auto& node = entry.managed_view();
         const std::string& node_id = node.spec().node_id();
-        const uint32_t compact_id = static_cast<uint32_t>(node.compact_id());
+        const uint64_t compact_id = node.compact_id();
         const bool optical = node.spec().kind() == zb::rpc::MANAGED_KIND_OPTICAL_LIBRARY;
         const uint32_t maximum = optical ? 0x00ffffffU : 0x0000ffffU;
         auto& ids = optical ? optical_ids : storage_ids;
@@ -240,13 +222,15 @@ bool CmsNodeRegistry::Restore(std::string* error) {
             if (error) *error = "CMS snapshot contains an invalid or duplicate identity";
             return false;
         }
+        auto& next = optical ? next_optical : next_storage;
+        next = std::max(next, static_cast<uint32_t>(compact_id) + 1);
     }
     std::lock_guard<std::mutex> lock(mu_);
     nodes_ = std::move(restored);
     cms_generation_ = snapshot.cms_generation();
     scheduler_generation_ = snapshot.scheduler_generation();
-    next_storage_compact_id_ = std::max<uint32_t>(1, snapshot.next_storage_compact_id());
-    next_optical_compact_id_ = std::max<uint32_t>(1, snapshot.next_optical_compact_id());
+    next_storage_compact_id_ = next_storage;
+    next_optical_compact_id_ = next_optical;
     PublishPlacementLocked();
     return true;
 }
@@ -268,6 +252,10 @@ bool CmsNodeRegistry::Commit(
     }
     if (scheduler_generation > scheduler_generation_) {
         std::map<std::string, zb::rpc::CmsNodeCatalogEntry> next_nodes;
+        // Candidate counters belong to the proposal, just like candidate nodes.
+        // Failed validation or persistence must not consume authoritative IDs.
+        uint32_t next_storage = next_storage_compact_id_;
+        uint32_t next_optical = next_optical_compact_id_;
         for (const auto& entry : proposed) {
             if (!entry.has_managed_view() || !entry.managed_view().has_spec() ||
                 entry.managed_view().spec().node_id().empty()) {
@@ -288,14 +276,25 @@ bool CmsNodeRegistry::Commit(
             auto existing = nodes_.find(node_id);
             uint32_t compact_id = 0;
             if (existing != nodes_.end()) {
+                if (existing->second.managed_view().spec().kind() !=
+                    entry.managed_view().spec().kind()) {
+                    if (error) *error = "CMS node kind cannot change: " + node_id;
+                    return false;
+                }
                 compact_id = static_cast<uint32_t>(existing->second.managed_view().compact_id());
                 if (IsRetired(existing->second.managed_view()) && !IsRetired(entry.managed_view())) {
                     if (error) *error = "retired CMS node cannot rejoin: " + node_id;
                     return false;
                 }
             } else {
-                compact_id = AllocateCompactIdLocked(entry.managed_view().spec().kind(), error);
-                if (compact_id == 0) return false;
+                const bool optical = entry.managed_view().spec().kind() ==
+                                     zb::rpc::MANAGED_KIND_OPTICAL_LIBRARY;
+                auto& next = optical ? next_optical : next_storage;
+                if (next > (optical ? 0x00ffffffU : 0x0000ffffU)) {
+                    if (error) *error = "CMS compact identifier space exhausted";
+                    return false;
+                }
+                compact_id = next++;
             }
             committed.mutable_managed_view()->set_compact_id(compact_id);
             next_nodes.emplace(node_id, std::move(committed));
@@ -307,10 +306,13 @@ bool CmsNodeRegistry::Commit(
             }
         }
         const uint64_t next_cms_generation = cms_generation_ + 1;
-        if (!PersistLocked(next_nodes, next_cms_generation, scheduler_generation, error)) {
+        if (!PersistLocked(next_nodes, next_cms_generation, scheduler_generation,
+                           next_storage, next_optical, error)) {
             return false;
         }
         nodes_ = std::move(next_nodes);
+        next_storage_compact_id_ = next_storage;
+        next_optical_compact_id_ = next_optical;
         scheduler_generation_ = scheduler_generation;
         cms_generation_ = next_cms_generation;
         PublishPlacementLocked();

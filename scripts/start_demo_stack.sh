@@ -33,7 +33,6 @@ SECOND_REAL_DISK_CAPACITY_BYTES="${SECOND_REAL_DISK_CAPACITY_BYTES:-${ONLINE_DIS
 MDS_STRICT_TIER_BYPASS_PG="${MDS_STRICT_TIER_BYPASS_PG:-true}"
 START_OPTICAL="${START_OPTICAL:-false}"
 START_SECOND_REAL="${START_SECOND_REAL:-false}"
-OPTICAL_DISC_COUNT="${OPTICAL_DISC_COUNT:-4}"
 
 MODE="${1:-start}"
 
@@ -69,19 +68,6 @@ build_virtual_disk_list() {
       result+=","
     fi
     result+="disk${i}"
-  done
-  echo "${result}"
-}
-
-build_optical_disc_list() {
-  local count="$1"
-  local result=""
-  local i
-  for ((i=0; i<count; ++i)); do
-    if [[ -n "${result}" ]]; then
-      result+=","
-    fi
-    result+="odisk${i}"
   done
   echo "${result}"
 }
@@ -237,10 +223,8 @@ render_configs() {
     "${DATA_DIR}/scheduler"
   local real_disks
   local virtual_disks
-  local optical_discs
   real_disks="$(build_real_disk_list "${REAL_DISK_COUNT}")"
   virtual_disks="$(build_virtual_disk_list "${VIRTUAL_DISK_COUNT}")"
-  optical_discs="$(build_optical_disc_list "${OPTICAL_DISC_COUNT}")"
 
   cat > "${CFG_DIR}/scheduler.conf" <<EOF
 SUSPECT_TIMEOUT_MS=6000
@@ -333,18 +317,11 @@ NODE_WEIGHT=1
 VIRTUAL_NODE_COUNT=1
 SCHEDULER_ADDR=127.0.0.1:${SCHEDULER_PORT}
 HEARTBEAT_INTERVAL_MS=2000
-DISKS=${optical_discs}
 ARCHIVE_ROOT=${DATA_DIR}/optical/archive
-CACHE_ROOT=${DATA_DIR}/optical/cache
-SIMULATE_IO=false
-OPTICAL_READ_BYTES_PER_SEC=104857600
-OPTICAL_WRITE_BYTES_PER_SEC=52428800
-CACHE_READ_BYTES_PER_SEC=419430400
-CACHE_DISC_SLOTS=4
-MAX_IMAGE_SIZE_BYTES=1073741824
-DISK_CAPACITY_BYTES=10000000000000
-MOUNT_POINT_PREFIX=${DATA_DIR}/optical/mount
-STARTUP_SCAN_MODE=fast
+VOLUME_SIZE_BYTES=10737418240
+SIZE_THRESHOLD=0.9
+CAPACITY_IN_IMAGES=10
+AVAILABLE_VOLUME_ID_COUNT=5
 EOF
 
   local mds_nodes="${REAL_NODE_ID}@127.0.0.1:${REAL_PORT},type=REAL,weight=1;${VIRTUAL_NODE_ID}@127.0.0.1:${VIRTUAL_PORT},type=VIRTUAL,weight=8,virtual_node_count=${VIRTUAL_NODE_COUNT}"

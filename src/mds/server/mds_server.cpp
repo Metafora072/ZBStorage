@@ -186,7 +186,6 @@ int main(int argc, char* argv[]) {
                                                              now_ms,
                                                              &metrics_error)) {
                         std::cerr << "MDS metrics report failed: " << metrics_error << std::endl;
-                        metadata_registered = false;
                     }
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(refresh_ms));

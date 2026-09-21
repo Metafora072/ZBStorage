@@ -38,6 +38,7 @@ python3 tools/workload_trace/generate_trace.py \
 - `--initial-state=populated`：假定全部目录和文件在 trace 开始前已经存在，适合已有测试数据集。
 - 生成过程中维护目录和文件状态，不会读取不存在的文件、越界读取或删除非空目录。
 - 操作权重是目标分布；如果某个操作在当前状态下不可执行，会在其他当前合法操作中按权重重新选择。
+- 权重为零的操作不会作为兜底执行。若当前状态下所有正权重操作均不可执行，工具明确报错；例如空文件集不能生成纯读取负载，应改用预置文件集，而不是偷偷插入创建/写入操作。速率和权重拒绝 NaN/Infinity。
 
 ## 负载特征
 
@@ -49,11 +50,16 @@ python3 tools/workload_trace/generate_trace.py \
 
 生成的大 trace、日志和实验输出应放在运行根目录，不提交仓库。仓库中只保留工具、说明和必要的小型测试样例。
 
-## 自测
+## 快速试用
 
 ```bash
-python3 -m unittest tools/workload_trace/tests/test_generate_trace.py
+trace_demo_dir=$(mktemp -d /tmp/zb-trace-demo.XXXXXX)
+python3 tools/workload_trace/generate_trace.py \
+  --num-file-ops 100 --num-dir-ops 20 --seed 123 \
+  --output "$trace_demo_dir/example.trace"
 ```
+
+生成器会在输出前校验操作序列。内部单元测试仅保留开发机，不随工具交付。
 
 ## 回放到 Scheduler
 

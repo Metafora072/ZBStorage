@@ -1202,22 +1202,26 @@ std::string StorageServiceImpl::BuildStableObjectId(uint64_t inode_id, uint32_t 
     return "obj-" + std::to_string(inode_id) + "-" + std::to_string(object_index);
 }
 
-std::vector<ArchiveObjectMeta> StorageServiceImpl::ListTrackedObjects() const {
+zb::msg::Status StorageServiceImpl::ListTrackedObjects(std::vector<ArchiveObjectMeta>* objects) const {
     namespace fs = std::filesystem;
+    if (!objects) return zb::msg::Status::InvalidArgument("object listing output is null");
+    objects->clear();
+    if (!disk_manager_) return zb::msg::Status::InternalError("disk manager is unavailable");
     const auto tracked = archive_meta_store_.SnapshotMetas();
     std::unordered_map<std::string, ArchiveObjectMeta> tracked_by_key;
     for (const auto& meta : tracked) {
         tracked_by_key[meta.disk_id + "|" + meta.object_id] = meta;
     }
     std::vector<ArchiveObjectMeta> out;
-    if (!disk_manager_) return out;
     for (const auto& disk : disk_manager_->GetReport()) {
         const fs::path root(disk.mount_point);
         std::error_code ec;
-        fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+        fs::recursive_directory_iterator it(root, ec);
         const fs::recursive_directory_iterator end;
         for (; !ec && it != end; it.increment(ec)) {
-            if (!it->is_regular_file(ec) || ec) continue;
+            const bool regular = it->is_regular_file(ec);
+            if (ec) break;
+            if (!regular) continue;
             const fs::path relative = fs::relative(it->path(), root, ec);
             if (ec) break;
             size_t components = 0;
@@ -1240,8 +1244,13 @@ std::vector<ArchiveObjectMeta> StorageServiceImpl::ListTrackedObjects() const {
             }
             out.push_back(std::move(meta));
         }
+        if (ec) {
+            return zb::msg::Status::IoError("cannot inventory disk " + disk.id +
+                                             " at " + root.string() + ": " + ec.message());
+        }
     }
-    return out;
+    *objects = std::move(out);
+    return zb::msg::Status::Ok();
 }
 
 bool StorageServiceImpl::ParseStableObjectId(const std::string& object_id,

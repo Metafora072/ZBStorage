@@ -1,6 +1,7 @@
 #include "BrpcStorageService.h"
 
 #include <brpc/controller.h>
+#include <charconv>
 #include <algorithm>
 #include <iostream>
 
@@ -206,16 +207,21 @@ void BrpcStorageService::ListObjects(google::protobuf::RpcController* cntl_base,
         return;
     }
     uint64_t offset = 0;
-    try {
-        if (!request->page_token().empty()) {
-            offset = std::stoull(request->page_token());
+    const auto& token = request->page_token();
+    if (!token.empty()) {
+        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), offset);
+        if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size()) {
+            response->mutable_status()->set_code(zb::rpc::STATUS_INVALID_ARGUMENT);
+            response->mutable_status()->set_message("invalid page_token");
+            return;
         }
-    } catch (...) {
-        response->mutable_status()->set_code(zb::rpc::STATUS_INVALID_ARGUMENT);
-        response->mutable_status()->set_message("invalid page_token");
+    }
+    std::vector<ArchiveObjectMeta> objects;
+    const auto status = service_->ListTrackedObjects(&objects);
+    if (!status.ok()) {
+        FillStatus(status, response->mutable_status());
         return;
     }
-    auto objects = service_->ListTrackedObjects();
     std::sort(objects.begin(), objects.end(), [](const auto& lhs, const auto& rhs) {
         return lhs.disk_id == rhs.disk_id ? lhs.object_id < rhs.object_id : lhs.disk_id < rhs.disk_id;
     });
@@ -227,8 +233,9 @@ void BrpcStorageService::ListObjects(google::protobuf::RpcController* cntl_base,
     response->set_total_bytes(total_bytes);
     const uint64_t limit = std::min<uint64_t>(
         request->max_objects() == 0 ? 1000 : request->max_objects(), 10000);
-    const uint64_t end = std::min<uint64_t>(objects.size(), offset + limit);
-    for (uint64_t i = std::min<uint64_t>(offset, objects.size()); i < end; ++i) {
+    offset = std::min<uint64_t>(offset, objects.size());
+    const uint64_t end = offset + std::min<uint64_t>(limit, objects.size() - offset);
+    for (uint64_t i = offset; i < end; ++i) {
         auto* out = response->add_objects();
         out->set_disk_id(objects[i].disk_id);
         out->set_object_id(objects[i].object_id);

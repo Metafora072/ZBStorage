@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
+#include <cmath>
 #include <fstream>
 #include <stdexcept>
 
@@ -23,12 +25,14 @@ bool ParseUint64(const std::string& text, uint64_t* out) {
     if (!out || text.empty()) {
         return false;
     }
-    try {
-        *out = std::stoull(text);
-        return true;
-    } catch (const std::exception&) {
+    uint64_t value = 0;
+    const char* end = text.data() + text.size();
+    const auto result = std::from_chars(text.data(), end, value);
+    if (result.ec != std::errc{} || result.ptr != end) {
         return false;
     }
+    *out = value;
+    return true;
 }
 
 bool ParseDouble(const std::string& text, double* out) {
@@ -38,7 +42,7 @@ bool ParseDouble(const std::string& text, double* out) {
     try {
         size_t consumed = 0;
         const double value = std::stod(text, &consumed);
-        if (consumed != text.size()) {
+        if (consumed != text.size() || !std::isfinite(value)) {
             return false;
         }
         *out = value;

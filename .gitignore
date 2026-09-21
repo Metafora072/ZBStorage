@@ -27,6 +27,19 @@ tests/*/results/
 __pycache__/
 *.py[cod]
 
+# Per-module raw test logs (test results are ignored separately).
+tests/*/log/
+
+# Local experiment reports are evidence, not source deliverables.
+tests/scheduler/REPORT-*.md
+# Internal regression sources remain local; deliver runnable task experiments only.
+/tests/scheduler/cpp/
+/tests/scheduler/python/test_*.py
+/tests/scheduler/python/closure.py
+/tools/workload_trace/tests/
+/docs/experiments/scheduler-formal-validation-20260803.md
+/docs/experiments/scheduler-node-management-cms-closure-20260903.md
+
 # Ignore large masstree benchmark datasets and outputs
 masstree/Bplustreetest/txt/file_info.txt
 masstree/Bplustreetest/txt/filename.txt

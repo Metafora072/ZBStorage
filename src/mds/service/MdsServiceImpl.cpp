@@ -1972,8 +1972,14 @@ void MdsServiceImpl::VerifyNodeReferences(
     const std::string prefix = "I/";
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
         UnifiedInodeRecord inode;
-        if (!MetaCodec::DecodeUnifiedInodeRecord(it->value().ToString(), &inode, nullptr) ||
-            inode.inode_type != static_cast<uint8_t>(zb::rpc::INODE_FILE)) {
+        std::string decode_error;
+        if (!MetaCodec::DecodeUnifiedInodeRecord(it->value().ToString(), &inode, &decode_error)) {
+            FillStatus(response->mutable_status(), zb::rpc::MDS_INTERNAL_ERROR,
+                       "cannot verify node references: invalid inode " +
+                           it->key().ToString() + ": " + decode_error);
+            return;
+        }
+        if (inode.inode_type != static_cast<uint8_t>(zb::rpc::INODE_FILE)) {
             continue;
         }
         zb::rpc::DiskFileLocation disk;

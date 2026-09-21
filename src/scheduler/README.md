@@ -32,7 +32,11 @@
 
 原有节点首次心跳仍可自动注册，以保持部署兼容。退休节点保留 tombstone，同 ID 的旧进程心跳会被拒绝。
 
-Real、Virtual、Optical 节点会在服务入口聚合 I/O 指标，并在心跳成功后上报。MDS 会注册为 metadata managed node，并上报主要文件系统 RPC 指标。窗口使用 reporter epoch 和 sequence 幂等去重，网络响应丢失不会造成窗口重复计数。
+Real、Virtual 节点会在服务入口聚合 I/O 指标，并在心跳成功后上报。MDS 会注册为 metadata managed node，并上报主要文件系统 RPC 指标。窗口使用 reporter epoch 和 sequence 幂等去重，网络响应丢失不会造成窗口重复计数。
+
+2026-09-14 光盘引擎适配：OpticalNodeManager 目前没有对外导出实际盘片库存和异步下载/打包/刻录任务统计。光盘节点保留身份和引擎就绪心跳，但不再上报旧 ImageStore 的虚构零队列/库存，缺少 inventory 的节点保持 JOINING，CMS 不准入。后续由光盘模块提供实际清单、后台任务与设备指标，再接入公共 NodeInventorySnapshot、OpticalLibraryStatus 和 ReportNodeMetrics。当前不能将光盘 RPC 返回视为后台 IO 完成。
+
+T03 测试入口及新版适配说明见 `tests/scheduler/README.md`。其中真实 IO、Scheduler 模型能耗、功耗仪实测使用独立的数据来源标签。
 
 功耗等级为 `PEAK/MEDIUM/STANDBY/OFF`，与原有 `ON/OFF/STARTING/STOPPING` 启停状态分开。策略等级/模型能耗和物理已执行等级/执行能耗分别记录；物理执行默认关闭，启用后失败会保留错误并按间隔重试，实验不会把未执行的关机误计成真实节能。
 

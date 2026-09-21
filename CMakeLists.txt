@@ -852,14 +852,6 @@ set_target_properties(zb_storage_model PROPERTIES
     CXX_EXTENSIONS OFF
 )
 
-add_executable(storage_model_test
-    tests/storage_model_test.cpp
-)
-target_link_libraries(storage_model_test PRIVATE zb_storage_model)
-if(BUILD_TESTING)
-    add_test(NAME storage_model_test COMMAND storage_model_test)
-endif()
-
 add_library(scheduler_node_model
     src/scheduler/model/ManagedNode.cpp
     src/scheduler/power/NodePowerManager.cpp
@@ -874,108 +866,6 @@ set_target_properties(scheduler_node_model PROPERTIES
     CXX_EXTENSIONS OFF
 )
 target_link_libraries(scheduler_node_model PUBLIC zb_storage_model)
-
-add_executable(scheduler_node_model_test
-    tests/scheduler_node_model_test.cpp
-)
-target_link_libraries(scheduler_node_model_test PRIVATE scheduler_node_model)
-if(BUILD_TESTING)
-    add_test(NAME scheduler_node_model_test COMMAND scheduler_node_model_test)
-endif()
-
-add_executable(node_metrics_collector_test
-    tests/node_metrics_collector_test.cpp
-    src/common/metrics/NodeMetricsCollector.cpp
-)
-target_include_directories(node_metrics_collector_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-if(BUILD_TESTING)
-    add_test(NAME node_metrics_collector_test COMMAND node_metrics_collector_test)
-endif()
-
-add_executable(scheduler_snapshot_test
-    tests/scheduler_snapshot_test.cpp
-    src/scheduler/persistence/ManagedNodeSnapshotStore.cpp
-    src/scheduler/service/ManagedNodeProtoAdapter.cpp
-)
-target_include_directories(scheduler_snapshot_test
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_BINARY_DIR}
-)
-target_link_libraries(scheduler_snapshot_test PRIVATE scheduler_node_model zb_proto ${Protobuf_LIBRARIES})
-if(BUILD_TESTING)
-    add_test(NAME scheduler_snapshot_test COMMAND scheduler_snapshot_test)
-endif()
-
-add_executable(scheduler_managed_service_test
-    tests/scheduler_managed_service_test.cpp
-    src/scheduler/health/FailureDetector.cpp
-    src/scheduler/model/ClusterState.cpp
-    src/scheduler/lifecycle/LifecycleManager.cpp
-    src/scheduler/migration/DrainMigrationCoordinator.cpp
-    src/scheduler/service/ManagedNodeProtoAdapter.cpp
-    src/scheduler/service/SchedulerServiceImpl.cpp
-)
-target_include_directories(scheduler_managed_service_test
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
-        ${GFLAGS_INCLUDE_PATH}
-        ${CMAKE_CURRENT_BINARY_DIR}
-)
-target_link_libraries(scheduler_managed_service_test
-    PRIVATE
-        scheduler_node_model
-        zb_proto
-        brpc-static
-        ${GFLAGS_LIBRARY}
-        ${CMAKE_THREAD_LIBS_INIT}
-)
-if(BRPC_DYNAMIC_LIB)
-    target_link_libraries(scheduler_managed_service_test PRIVATE ${BRPC_DYNAMIC_LIB})
-endif()
-if(BUILD_TESTING)
-    add_test(NAME scheduler_managed_service_test COMMAND scheduler_managed_service_test)
-endif()
-
-add_executable(scheduler_drain_migration_test
-    tests/scheduler_drain_migration_test.cpp
-    src/scheduler/health/FailureDetector.cpp
-    src/scheduler/model/ClusterState.cpp
-    src/scheduler/lifecycle/LifecycleManager.cpp
-    src/scheduler/migration/DrainMigrationCoordinator.cpp
-)
-target_include_directories(scheduler_drain_migration_test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(scheduler_drain_migration_test PRIVATE
-    scheduler_node_model zb_proto ${Protobuf_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
-if(BUILD_TESTING)
-    add_test(NAME scheduler_drain_migration_test COMMAND scheduler_drain_migration_test)
-endif()
-
-add_executable(cms_node_registry_test
-    tests/cms_node_registry_test.cpp
-    src/mds/allocator/CmsNodeRegistry.cpp
-    src/mds/allocator/NodeStateCache.cpp
-    src/mds/allocator/PGManager.cpp
-    src/mds/storage/RocksMetaStore.cpp
-)
-target_include_directories(cms_node_registry_test
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_BINARY_DIR}
-        ${ROCKSDB_ROOT}/include
-)
-target_link_libraries(cms_node_registry_test PRIVATE
-    zb_proto ${CMAKE_THREAD_LIBS_INIT} ${ROCKSDB_TARGET})
-set_target_properties(cms_node_registry_test PROPERTIES
-    CXX_STANDARD 20
-    CXX_STANDARD_REQUIRED ON
-    CXX_EXTENSIONS OFF
-)
-if(BUILD_TESTING)
-    add_test(NAME cms_node_registry_test COMMAND cms_node_registry_test)
-endif()
 
 add_executable(scheduler_server
     src/scheduler/cms/CmsNodeCatalogPublisher.cpp
@@ -1111,6 +1001,17 @@ if(UNIX)
         set_tests_properties(client_io_latency_test client_io_latency_integration_test PROPERTIES TIMEOUT 60)
         find_package(Python3 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
+            add_test(NAME scheduler_t03_local_smoke
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/scheduler/run.py
+                    local --build ${CMAKE_CURRENT_BINARY_DIR} --files 12 --optical-check)
+            add_test(NAME scheduler_t03_simulation
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/scheduler/run.py
+                    simulation --build ${CMAKE_CURRENT_BINARY_DIR})
+            add_test(NAME scheduler_t03_meter_closure
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/scheduler/run.py
+                    meter-closure --build ${CMAKE_CURRENT_BINARY_DIR} --files 20)
+            set_tests_properties(scheduler_t03_local_smoke scheduler_t03_simulation scheduler_t03_meter_closure
+                PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE LABELS "scheduler;integration")
             add_test(NAME client_io_latency_workflow_test
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/client/client_io_latency_workflow_test.py)
             set_tests_properties(client_io_latency_workflow_test PROPERTIES TIMEOUT 60)

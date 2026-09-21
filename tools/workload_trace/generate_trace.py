@@ -161,12 +161,10 @@ class WorkloadGenerator:
         return {"d_c": creatable, "d_l": listable, "d_d": deletable}
 
     def _weighted_operation(self, targets: Dict[str, List[str]], weights: Dict[str, float]) -> Tuple[str, str]:
-        available = [op for op, candidates in targets.items() if candidates]
+        available = [op for op, candidates in targets.items() if candidates and weights[op] > 0]
         if not available:
-            raise ValueError("no valid operation is available for the current namespace state")
+            raise ValueError("no positive-weight operation is valid for the current namespace state")
         available_weights = [weights[op] for op in available]
-        if sum(available_weights) <= 0:
-            available_weights = [1.0] * len(available)
         op = self.rng.choices(available, weights=available_weights, k=1)[0]
         candidates = targets[op]
         path = self._choose_file(candidates) if op in FILE_OPS else self.rng.choice(candidates)
@@ -311,8 +309,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    if args.rate <= 0:
-        raise ValueError("--rate must be greater than zero")
+    if not math.isfinite(args.rate) or args.rate <= 0:
+        raise ValueError("--rate must be finite and greater than zero")
     if args.max_io_size > args.max_file_size:
         raise ValueError("--max-io-size cannot exceed --max-file-size")
 
@@ -327,8 +325,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "d_l": args.dir_l_weight,
         "d_d": args.dir_d_weight,
     }
-    if any(weight < 0 for weight in (*file_weights.values(), *directory_weights.values())):
-        raise ValueError("operation weights must be non-negative")
+    if any(not math.isfinite(weight) or weight < 0
+           for weight in (*file_weights.values(), *directory_weights.values())):
+        raise ValueError("operation weights must be finite and non-negative")
     if args.num_file_ops and sum(file_weights.values()) <= 0:
         raise ValueError("at least one file operation weight must be positive")
     if args.num_dir_ops and sum(directory_weights.values()) <= 0:

@@ -674,4 +674,4 @@ CMS零引用验证目前扫描现行 `I/` UnifiedInodeRecord，并同时检查�
 | 排空迁移 | [`src/scheduler/migration/DrainMigrationCoordinator.cpp`](../../src/scheduler/migration/DrainMigrationCoordinator.cpp) |
 | CMS权威目录 | [`src/mds/allocator/CmsNodeRegistry.cpp`](../../src/mds/allocator/CmsNodeRegistry.cpp) |
 | MDS放置与退役事务门禁 | [`src/mds/service/MdsServiceImpl.cpp`](../../src/mds/service/MdsServiceImpl.cpp) |
-| 正式闭环实验 | [`docs/experiments/scheduler-node-management-cms-closure-20260903.md`](../experiments/scheduler-node-management-cms-closure-20260903.md) |
+| 闭环测试代码与复现说明（结果留本地） | [`tests/scheduler/README.md`](../../tests/scheduler/README.md) |

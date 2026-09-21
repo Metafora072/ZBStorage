@@ -206,8 +206,8 @@ private:
 };
 
 // Public validation entry point for configuration loaders and future users of
-// this header. NodePowerManager falls back to defaults for an invalid policy to
-// retain the existing constructor contract.
+// this header. NodePowerManager rejects invalid policies with std::invalid_argument
+// rather than silently running a different policy.
 bool ValidatePowerPolicy(const PowerPolicy& policy, std::string* error);
 
 } // namespace zb::scheduler

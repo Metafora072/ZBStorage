@@ -46,9 +46,10 @@ private:
     bool PersistLocked(const std::map<std::string, zb::rpc::CmsNodeCatalogEntry>& nodes,
                        uint64_t cms_generation,
                        uint64_t scheduler_generation,
+                       uint32_t next_storage_compact_id,
+                       uint32_t next_optical_compact_id,
                        std::string* error) const;
     void PublishPlacementLocked();
-    uint32_t AllocateCompactIdLocked(zb::rpc::ManagedNodeKind kind, std::string* error);
 
     NodeStateCache* cache_{};
     PGManager* pg_manager_{};

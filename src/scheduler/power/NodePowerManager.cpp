@@ -5,6 +5,7 @@
 #include <limits>
 #include <cmath>
 #include <random>
+#include <stdexcept>
 
 namespace zb::scheduler {
 
@@ -31,7 +32,7 @@ void SortByNodeId(std::vector<ManagedNodeRuntime>* nodes) {
 NodePowerManager::NodePowerManager(PowerPolicy policy) : policy_(policy) {
     std::string error;
     if (!ValidatePowerPolicy(policy_, &error)) {
-        policy_ = PowerPolicy{};
+        throw std::invalid_argument("invalid power policy: " + error);
     }
 }
 
@@ -1152,7 +1153,8 @@ bool NodePowerManager::Restore(const NodePowerManagerSnapshot& snapshot, std::st
 }
 
 bool ValidatePowerPolicy(const PowerPolicy& policy, std::string* error) {
-    if (policy.peak_utilization < 0.0 || policy.peak_utilization > 1.0) {
+    if (!std::isfinite(policy.peak_utilization) ||
+        policy.peak_utilization < 0.0 || policy.peak_utilization > 1.0) {
         if (error) {
             *error = "peak_utilization must be in [0, 1]";
         }

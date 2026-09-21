@@ -2116,7 +2116,24 @@ int FuseReadImpl(FuseState* state, const char* path, char* buf, size_t size, off
                                            &resolved_meta,
                                            &slices,
                                            &data_status, trace)) {
-        return -StatusToErrno(data_status);
+        // Drain migration transfers objects before switching the authoritative
+        // MDS location. The destination may have no file-meta acceleration entry.
+        // Only recover that specific absence; never mask transport/storage errors.
+        if (data_status.code() != zb::rpc::STATUS_NOT_FOUND) {
+            return -StatusToErrno(data_status);
+        }
+        const auto& attr = location.attr();
+        if (attr.object_unit_size() == 0) return -EIO;
+        resolved_meta.set_inode_id(inode_id);
+        resolved_meta.set_file_size(attr.size());
+        resolved_meta.set_object_unit_size(attr.object_unit_size());
+        resolved_meta.set_version(attr.version());
+        const uint64_t remaining = request_offset < attr.size()
+                                       ? attr.size() - request_offset : 0;
+        slices.clear();
+        BuildObjectSlices(inode_id, request_offset,
+                          std::min<uint64_t>(size, remaining),
+                          attr.object_unit_size(), anchor.disk_id(), &slices);
     }
     const uint64_t object_unit_size = resolved_meta.object_unit_size() > 0
                                           ? resolved_meta.object_unit_size()

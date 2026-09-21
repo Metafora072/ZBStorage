@@ -7,17 +7,12 @@
 #include <vector>
 
 #include "../health/FailureDetector.h"
+#include "../power/NodePowerManager.h"
 #include "scheduler.pb.h"
 
 namespace zb::scheduler {
 
-struct DiskState {
-    std::string disk_id;
-    uint64_t capacity_bytes{0};
-    uint64_t free_bytes{0};
-    bool is_healthy{true};
-    uint64_t last_update_ms{0};
-};
+using DiskState = zb::storage_model::DeviceInventory;
 
 struct NodeState {
     std::string node_id;
@@ -40,15 +35,10 @@ struct NodeState {
     zb::rpc::NodePowerState desired_power_state{zb::rpc::NODE_POWER_ON};
 
     uint64_t last_heartbeat_ms{0};
+    uint64_t resident_data_bytes{0};
+    bool optical_inventory_observed{false};
+    uint32_t optical_local_disc_count{0};
     std::unordered_map<std::string, DiskState> disks;
-};
-
-struct GroupState {
-    std::string group_id;
-    std::string primary_node_id;
-    std::string secondary_node_id;
-    uint64_t epoch{1};
-    bool sync_ready{false};
 };
 
 struct NodeOperationState {
@@ -62,6 +52,8 @@ struct NodeOperationState {
 };
 
 struct HeartbeatAssignment {
+    bool success{true};
+    std::string error;
     uint64_t generation{0};
     std::string group_id;
     zb::rpc::NodeRole assigned_role{zb::rpc::NODE_ROLE_UNKNOWN};
@@ -74,7 +66,7 @@ struct HeartbeatAssignment {
 
 class ClusterState {
 public:
-    explicit ClusterState(FailureDetector detector);
+    ClusterState(FailureDetector detector, NodePowerManager* nodes);
 
     HeartbeatAssignment ReportHeartbeat(const zb::rpc::HeartbeatRequest& request);
     uint64_t TickHealth();
@@ -106,20 +98,15 @@ public:
     bool GetOperation(const std::string& operation_id, NodeOperationState* out) const;
 
 private:
-    bool IsNodeEligibleAsPrimaryLocked(const NodeState& node) const;
-    bool IsNodeEligibleAsSecondaryLocked(const NodeState& node) const;
-    void EnsureGroupLocked(const std::string& group_id);
-    void ReconcileGroupLocked(const std::string& group_id, bool* changed);
-    void MaybeFailoverGroupLocked(const std::string& group_id, bool* changed);
-    HeartbeatAssignment BuildAssignmentLocked(const NodeState& node) const;
+    static NodeState BuildNodeState(const ManagedNodeRuntime& node);
+    static HeartbeatAssignment BuildAssignment(const ManagedNodeRuntime& node,
+                                               uint64_t generation);
     static uint64_t NowMs();
 
     mutable std::mutex mu_;
     FailureDetector detector_;
-    uint64_t generation_{1};
+    NodePowerManager* nodes_{nullptr};
     uint64_t next_operation_id_{1};
-    std::unordered_map<std::string, NodeState> nodes_;
-    std::unordered_map<std::string, GroupState> groups_;
     std::unordered_map<std::string, NodeOperationState> operations_;
 };
 

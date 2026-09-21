@@ -1,0 +1,5 @@
+request_id,timestamp_us,inter_arrival_us,operation_type,logical_path,offset,size_bytes
+1,0,0,write,/real/group/f1,0,32
+2,1000,1000,read,/real/group/f1,7,19
+3,2000,1000,write,/real/group/f2,17,15
+4,3000,1000,read,/real/group/f2,0,32

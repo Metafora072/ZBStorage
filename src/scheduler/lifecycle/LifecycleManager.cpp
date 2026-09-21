@@ -47,6 +47,15 @@ bool LifecycleManager::RunOperation(const std::string& node_id,
         }
         return false;
     }
+    if (type == zb::rpc::NODE_OP_STOP && !force &&
+        (node.resident_data_bytes != 0 || node.optical_local_disc_count != 0)) {
+        if (error) {
+            *error = node.optical_local_disc_count != 0
+                         ? "safe stop rejected: optical library still has local discs"
+                         : "safe stop rejected: node still has resident data";
+        }
+        return false;
+    }
 
     NodeOperationState operation;
     if (!state_->CreateOperation(node_id, type, reason, &operation, error)) {
@@ -79,6 +88,9 @@ bool LifecycleManager::RunOperation(const std::string& node_id,
     }
 
     if (!result.success) {
+        state_->SetDesiredPowerState(node_id, node.desired_power_state, nullptr);
+        state_->SetCurrentPowerState(node_id, node.power_state, nullptr);
+        state_->SetNodeAdminState(node_id, node.admin_state, nullptr);
         state_->UpdateOperation(operation.operation_id, zb::rpc::NODE_OP_FAILED, result.message, nullptr);
         if (op) {
             state_->GetOperation(operation.operation_id, op);

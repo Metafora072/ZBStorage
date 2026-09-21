@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -800,6 +801,12 @@ bool VirtualStorageServiceImpl::LoadFileMetaStoreLocked(std::string* error) cons
     }
     std::ifstream in(file_meta_store_path_, std::ios::in | std::ios::binary);
     if (!in.is_open()) {
+        std::error_code ec;
+        const bool exists = fs::exists(file_meta_store_path_, ec);
+        if (ec || exists) {
+            if (error) *error = "cannot open file meta store: " + file_meta_store_path_;
+            return false;
+        }
         file_meta_by_inode_.clear();
         preloaded_file_objects_.clear();
         last_commit_txid_by_inode_.clear();
@@ -810,37 +817,33 @@ bool VirtualStorageServiceImpl::LoadFileMetaStoreLocked(std::string* error) cons
     std::unordered_map<uint64_t, PreloadedFileObjectInfo> loaded_preload;
     std::unordered_map<uint64_t, std::string> loaded_txids;
     std::string line;
+    size_t line_number = 0;
     while (std::getline(in, line)) {
+        ++line_number;
         if (line.empty()) {
             continue;
         }
         std::istringstream iss(line);
         std::string token;
         zb::msg::FileMeta meta;
-        if (!std::getline(iss, token, '\t')) {
-            continue;
+        const auto invalid_row = [&]() {
+            if (error) *error = "invalid file meta row " + std::to_string(line_number) +
+                                " in " + file_meta_store_path_;
+            return false;
+        };
+        const auto parse_number = [](const std::string& field, uint64_t* value) {
+            const auto parsed = std::from_chars(field.data(), field.data() + field.size(), *value);
+            return parsed.ec == std::errc{} && parsed.ptr == field.data() + field.size();
+        };
+        const auto read_number = [&](uint64_t* value) {
+            return bool(std::getline(iss, token, '\t')) && parse_number(token, value);
+        };
+        if (!read_number(&meta.inode_id) || !read_number(&meta.file_size) ||
+            !read_number(&meta.object_unit_size) || !read_number(&meta.version) ||
+            !read_number(&meta.mtime_sec) || !read_number(&meta.update_ts_ms) ||
+            meta.inode_id == 0 || meta.object_unit_size == 0 || loaded.count(meta.inode_id)) {
+            return invalid_row();
         }
-        meta.inode_id = static_cast<uint64_t>(std::strtoull(token.c_str(), nullptr, 10));
-        if (meta.inode_id == 0 || !std::getline(iss, token, '\t')) {
-            continue;
-        }
-        meta.file_size = static_cast<uint64_t>(std::strtoull(token.c_str(), nullptr, 10));
-        if (!std::getline(iss, token, '\t')) {
-            continue;
-        }
-        meta.object_unit_size = static_cast<uint64_t>(std::strtoull(token.c_str(), nullptr, 10));
-        if (!std::getline(iss, token, '\t')) {
-            continue;
-        }
-        meta.version = static_cast<uint64_t>(std::strtoull(token.c_str(), nullptr, 10));
-        if (!std::getline(iss, token, '\t')) {
-            continue;
-        }
-        meta.mtime_sec = static_cast<uint64_t>(std::strtoull(token.c_str(), nullptr, 10));
-        if (!std::getline(iss, token, '\t')) {
-            continue;
-        }
-        meta.update_ts_ms = static_cast<uint64_t>(std::strtoull(token.c_str(), nullptr, 10));
         if (std::getline(iss, token, '\t') && !token.empty()) {
             loaded_txids[meta.inode_id] = token;
         }
@@ -851,13 +854,16 @@ bool VirtualStorageServiceImpl::LoadFileMetaStoreLocked(std::string* error) cons
             has_preload = true;
         }
         if (std::getline(iss, token, '\t') && !token.empty()) {
-            preload.seed = static_cast<uint64_t>(std::strtoull(token.c_str(), nullptr, 10));
-            has_preload = true;
+            if (!has_preload || !parse_number(token, &preload.seed)) return invalid_row();
         }
         if (has_preload) {
             loaded_preload[meta.inode_id] = std::move(preload);
         }
         loaded[meta.inode_id] = meta;
+    }
+    if (in.bad() || !in.eof()) {
+        if (error) *error = "cannot read file meta store: " + file_meta_store_path_;
+        return false;
     }
     file_meta_by_inode_.swap(loaded);
     preloaded_file_objects_.swap(loaded_preload);
@@ -1329,6 +1335,58 @@ void VirtualStorageServiceImpl::ReplicationRepairLoop() {
 
 std::string VirtualStorageServiceImpl::BuildStableObjectId(uint64_t inode_id, uint32_t object_index) {
     return "obj-" + std::to_string(inode_id) + "-" + std::to_string(object_index);
+}
+
+zb::msg::Status VirtualStorageServiceImpl::ListTrackedObjects(
+    std::vector<real_node::ArchiveObjectMeta>* objects) const {
+    if (!objects) return zb::msg::Status::InvalidArgument("object listing output is null");
+    objects->clear();
+    const auto tracked = archive_meta_store_.SnapshotMetas();
+    std::unordered_map<std::string, real_node::ArchiveObjectMeta> tracked_by_key;
+    for (const auto& meta : tracked) tracked_by_key[BuildObjectKey(meta.disk_id, meta.object_id)] = meta;
+    std::vector<real_node::ArchiveObjectMeta> out;
+    std::lock_guard<std::mutex> lock(object_mu_);
+    if (!file_meta_loaded_) {
+        std::string error;
+        if (!LoadFileMetaStoreLocked(&error)) return zb::msg::Status::IoError(error);
+    }
+    out.reserve(object_sizes_.size() + preloaded_file_objects_.size());
+    std::unordered_set<std::string> emitted;
+    for (const auto& entry : object_sizes_) {
+        const size_t split = entry.first.find('|');
+        if (split == std::string::npos || split == 0 || split + 1 == entry.first.size()) continue;
+        real_node::ArchiveObjectMeta meta;
+        meta.disk_id = entry.first.substr(0, split);
+        meta.object_id = entry.first.substr(split + 1);
+        meta.size_bytes = entry.second;
+        auto tracked_it = tracked_by_key.find(entry.first);
+        if (tracked_it != tracked_by_key.end()) {
+            meta.checksum = tracked_it->second.checksum;
+            meta.last_access_ts_ms = tracked_it->second.last_access_ts_ms;
+        }
+        out.push_back(std::move(meta));
+        emitted.insert(entry.first);
+    }
+    for (const auto& preload : preloaded_file_objects_) {
+        auto file_it = file_meta_by_inode_.find(preload.first);
+        if (file_it == file_meta_by_inode_.end() || file_it->second.object_unit_size == 0) continue;
+        const uint64_t count = file_it->second.file_size == 0 ? 0 :
+            (file_it->second.file_size + file_it->second.object_unit_size - 1) /
+            file_it->second.object_unit_size;
+        for (uint64_t index = 0; index < count && index <= UINT32_MAX; ++index) {
+            real_node::ArchiveObjectMeta meta;
+            meta.disk_id = preload.second.home_disk_id;
+            meta.object_id = BuildStableObjectId(preload.first, static_cast<uint32_t>(index));
+            const std::string key = BuildObjectKey(meta.disk_id, meta.object_id);
+            if (!emitted.insert(key).second) continue;
+            const uint64_t offset = index * file_it->second.object_unit_size;
+            meta.size_bytes = std::min<uint64_t>(file_it->second.object_unit_size,
+                                                 file_it->second.file_size - offset);
+            out.push_back(std::move(meta));
+        }
+    }
+    *objects = std::move(out);
+    return zb::msg::Status::Ok();
 }
 
 bool VirtualStorageServiceImpl::ParseStableObjectId(const std::string& object_id,

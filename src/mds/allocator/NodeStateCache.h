@@ -28,6 +28,9 @@ public:
     void ReplaceNodes(std::vector<NodeInfo> nodes);
     bool ResolveNodeAddress(const std::string& node_id, std::string* address) const;
     bool ResolveDiskId(const std::string& node_id, uint32_t numeric_disk_id, std::string* disk_id) const;
+    // Tests the current CMS-committed admission view, including virtual node
+    // identifiers derived from a catalog member ("<node>-vN").
+    bool IsWriteAdmitted(const std::string& node_id) const;
     std::vector<NodeSelection> PickNodes(uint32_t count);
     std::vector<NodeSelection> PickNodesByType(uint32_t count, NodeType type);
 

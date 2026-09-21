@@ -81,6 +81,7 @@ bool RocksMetaStore::Open(const std::string& path, std::string* error) {
 }
 
 bool RocksMetaStore::Put(const std::string& key, const std::string& value, std::string* error) {
+    std::lock_guard<std::mutex> lock(write_mu_);
     if (!db_) {
         if (error) {
             *error = "DB not opened";
@@ -123,6 +124,7 @@ bool RocksMetaStore::Exists(const std::string& key, std::string* error) const {
 }
 
 bool RocksMetaStore::WriteBatch(rocksdb::WriteBatch* batch, std::string* error) {
+    std::lock_guard<std::mutex> lock(write_mu_);
     if (!db_) {
         if (error) {
             *error = "DB not opened";
@@ -142,6 +144,33 @@ bool RocksMetaStore::WriteBatch(rocksdb::WriteBatch* batch, std::string* error) 
         }
         return false;
     }
+    return true;
+}
+
+bool RocksMetaStore::WriteBatchIfValueEquals(const std::string& key,
+                                             const std::string& expected_value,
+                                             rocksdb::WriteBatch* batch,
+                                             bool* matched,
+                                             std::string* error) {
+    if (matched) *matched = false;
+    std::lock_guard<std::mutex> lock(write_mu_);
+    if (!db_ || !batch) {
+        if (error) *error = !db_ ? "DB not opened" : "WriteBatch is null";
+        return false;
+    }
+    std::string current;
+    const rocksdb::Status read_status = db_->Get(rocksdb::ReadOptions(), key, &current);
+    if (!read_status.ok()) {
+        if (error) *error = read_status.ToString();
+        return false;
+    }
+    if (current != expected_value) return true;
+    const rocksdb::Status write_status = db_->Write(rocksdb::WriteOptions(), batch);
+    if (!write_status.ok()) {
+        if (error) *error = write_status.ToString();
+        return false;
+    }
+    if (matched) *matched = true;
     return true;
 }
 

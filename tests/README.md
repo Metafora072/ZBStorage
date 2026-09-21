@@ -23,7 +23,9 @@ tests/
     └── results/
 ```
 
-目前暂定的目录结构。当前仓库中的 `tests/` 还只有本说明文件，各负责人开始实现测试时再创建对应模块目录和 `results/`。
+当前客户端测试位于 `tests/client/`；T03 的公共结构、Scheduler、节点管理、CMS、迁移和能耗测试位于 `tests/scheduler/`，运行方法见各模块 README。新增测试及结果继续按此结构组织。
+
+`tests/scheduler/` 只交付说明、两个公开入口、`python/` 下必需的支撑模块及 `fixtures/` 下的固定输入。内部开发回归用例不提交、不参与默认构建；运行结果和历史报告放在不提交的 `results/`。跨模块已知缺陷记录在 `docs/issues/`。
 
 | 目录 | 暂定内容 |
 | --- | --- |

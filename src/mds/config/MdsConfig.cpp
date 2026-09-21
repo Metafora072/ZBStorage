@@ -248,6 +248,8 @@ MdsConfig MdsConfig::LoadFromFile(const std::string& path, std::string* error) {
             cfg.scheduler_address = value;
         } else if (key == "SCHEDULER_REFRESH_MS") {
             cfg.scheduler_refresh_ms = static_cast<uint32_t>(std::stoul(value));
+        } else if (key == "MANAGED_NODE_ID") {
+            cfg.managed_node_id = value;
         } else if (key == "PG_VIEW_EPOCH") {
             cfg.pg_view_epoch = static_cast<uint64_t>(std::stoull(value));
         } else if (key == "PG_COUNT") {

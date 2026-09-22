@@ -117,20 +117,31 @@ private:
     // 请求后台线程退出并完成资源回收。
     void StopBackgroundWorkers();
 
-    // 消费 read_task_queue_，将任务提交给 cd_manager。
-    void ReadTaskProcessor();
+    // 消费 cd_read_task_queue_，把 CD_READ 任务提交给 cd_manager。
+    void CDReadTaskProcessor();
 
-    // cd_manager 读完成回调：镜像转移 + 触发按卷批量读。
+    // 构造一个 CD_READ 任务（光盘库读请求）并登记入 task_map_ / cd_read_task_queue_；
+    // 仅 ZipTaskProcessor 调用（单线程），无需加锁。
+    void EnqueueCDReadTask(const std::string& disk_id, const std::string& volume_id);
+
+    // image_dir_ 下卷镜像的绝对路径：image_dir_ + "volume_<volume_id>.vimg"。
+    std::string VolumeImagePath(const std::string& volume_id) const;
+
+    // 把 volume_id 对应读镜像的 LRU 访问时间推前（命中后推迟淘汰）。
+    // 解析失败 / 未登记时静默跳过（best-effort）；调用方需已持有 image_dir_manager_ 的读锁。
+    void TouchVolume(const std::string& volume_id);
+
+    // cd_manager 读完成回调（对应 CD_READ 任务）：镜像转移 + 触发按卷批量读。
     void OnCDReadComplete(const cd_manager_sim::ReadCompleteEvent& event);
 
     // cd_manager 刻录完成回调：释放对应写镜像。
     void OnCDBurnComplete(const cd_manager_sim::BurnCompleteEvent& event);
 
-    // 把 WRTask 包装为 cd_manager 的 ReadRequest 并提交。
-    bool SubmitTaskToCDManager(const WR_task::WRTask& task);
+    // 把 CD_READ 任务包装为 cd_manager 的 ReadRequest 并提交。
+    bool SubmitCDReadTaskToCDManager(const WR_task::WRTask& task);
 
     // 把 WRTask 包装为 cd_manager 的 BurnRequest 并提交（含真实文件大小）。
-    bool SubmitBurnTaskToCDManager(const WR_task::WRTask& task);
+    bool SubmitCDBurnTaskToCDManager(const WR_task::WRTask& task);
 
     // 消费 zip_task_queue_：READ 走缓存 / MountVolume / 异步等待；WRITE 走压缩封装。
     void ZipTaskProcessor();
@@ -159,11 +170,15 @@ private:
     // 并从集合移除本次已打包的 inode_id。
     void ReportPackedInodes(const std::string& volume_id);
 
-    // 消费 burn_task_queue_，将刻录任务提交给 cd_manager。
-    void BurnTaskProcessor();
+    // 消费 cd_burn_task_queue_，将刻录任务提交给 cd_manager。
+    void CDBurnTaskProcessor();
 
     // 清理线程主体：周期性扫描 task_map_，移除 FINISH 终态任务（含 inode 索引清理）。
     void CleanupTaskProcessor();
+
+    // 把即将被清理的终态任务摘要追加写入 log_dir_/task_done_<yyyymmdd>.log；
+    // 同一天追加，文件不存在时新建。写入失败仅记录 sidecar 原因，不影响清理主流程。
+    void AppendTaskDoneLog(const WR_task::WRTask& task);
 
     // 更新任务状态；终态保护（FINISH/FAILED 不再回退中间态）。
     bool MarkTaskState(uint64_t task_id, WR_task::WRTaskState new_state);
@@ -178,8 +193,8 @@ private:
 
 private:
     volumemanager::VolumeManager volume_manager_;
-    // 等待提交 cd_manager 的读任务队列。
-    WR_task::WRTaskQueue* read_task_queue_;
+    // 等待提交 cd_manager 的光盘库读（镜像加载）任务队列，仅承载 CD_READ。
+    WR_task::WRTaskQueue* cd_read_task_queue_;
     // 等待压缩 / 缓存查询的任务队列。
     WR_task::WRTaskQueue* zip_task_queue_;
     // 等待归档消费线程处理的任务队列（MDS 下发的批次）。
@@ -190,8 +205,8 @@ private:
     std::unique_ptr<brpc::Channel> scheduler_channel_;
     // real_node 出站 channel 缓存（key = node_address）：仅归档线程访问，懒初始化。
     std::unordered_map<std::string, std::unique_ptr<brpc::Channel>> data_node_channels_;
-    // 等待刻录的任务队列。
-    WR_task::WRTaskQueue* burn_task_queue_;
+    // 等待提交 cd_manager 的刻录任务队列，仅承载 CD_BURN。
+    WR_task::WRTaskQueue* cd_burn_task_queue_;
     // 任务元数据索引（按 task_id）。
     WR_task::WRTaskMap* task_map_;
 
@@ -209,10 +224,10 @@ private:
     // 卷镜像目录的容量管理 + LRU 淘汰；InitializeDir 阶段构造。
     std::unique_ptr<space_manager::ImageDirManager> image_dir_manager_;
 
-    // 后台工作线程：读 / 压缩 / 刻录 / 归档。
-    std::thread read_task_thread_;
+    // 后台工作线程：光盘库读 / 压缩 / 刻录 / 归档。
+    std::thread cd_read_task_thread_;
     std::thread zip_task_thread_;
-    std::thread burn_task_thread_;
+    std::thread cd_burn_task_thread_;
     std::thread archive_task_thread_;
     // 清理线程：周期性移除 task_map_ 中的 FINISH 终态任务。
     std::thread cleanup_thread_;

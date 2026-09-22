@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -68,6 +69,9 @@ inline constexpr const char* kArchiveTaskProcessor = "ArchiveTaskProcessor";
 inline constexpr const char* kOnCDReadComplete  = "OnCDReadComplete";
 inline constexpr const char* kOnCDBurnComplete  = "OnCDBurnComplete";
 inline constexpr const char* kZipTaskProcessor  = "ZipTaskProcessor";
+inline constexpr const char* kCDReadTaskProcessor = "CDReadTaskProcessor";
+inline constexpr const char* kCDBurnTaskProcessor = "CDBurnTaskProcessor";
+inline constexpr const char* kCleanupTaskProcessor = "CleanupTaskProcessor";
 
 }  // namespace start_failure_phase
 
@@ -79,30 +83,52 @@ inline constexpr const char* kZipTaskProcessor  = "ZipTaskProcessor";
 
 namespace WR_task {
 
-// 任务生命周期状态：START 等待 zip；WAITING 等底层调度；LOADING 已下发 cd_manager；
-// LOADED 镜像就绪；READY 读产物已解压可读（仅 READ）；ZIPPED 压缩完成；BURNING 刻录中；
-// FINISH 已消费完毕（READ 读完 / WRITE 压缩完 / BURN 烧完 / batch 处理完）；FAILED 终态。
+// 任务生命周期状态：START 等待 zip；WAITING 等底层调度；LOADING 已下发 cd_manager（仅 CD_READ）；
+// READY 读产物已解压可读（仅 READ）；ZIPPED 压缩完成；CD_BURNING 刻录中（仅 CD_BURN）；
+// FINISH 已消费完毕（READ 读完 / WRITE 压缩完 / CD_BURN 烧完 / batch 处理完 / CD_READ 加载完）；FAILED 终态。
 // FINISH / FAILED 为终态，由清理线程周期性从 task_map_ 移除 FINISH 任务。
-enum class WRTaskState { START, WAITING, LOADING, LOADED, READY, ZIPPED, BURNING, FINISH, FAILED };
+enum class WRTaskState { START, WAITING, LOADING, READY, ZIPPED, CD_BURNING, FINISH, FAILED };
 
 inline const char* WRTaskStateToString(WRTaskState state) {
     switch (state) {
         case WRTaskState::START:   return "START";
         case WRTaskState::WAITING: return "WAITING";
         case WRTaskState::LOADING: return "LOADING";
-        case WRTaskState::LOADED:  return "LOADED";
         case WRTaskState::READY:   return "READY";
         case WRTaskState::ZIPPED:  return "ZIPPED";
-        case WRTaskState::BURNING: return "BURNING";
+        case WRTaskState::CD_BURNING: return "CD_BURNING";
         case WRTaskState::FINISH:  return "FINISH";
         case WRTaskState::FAILED:  return "FAILED";
     }
     return "UNKNOWN";
 }
 
-// 任务类型：READ 读；WRITE 写；BURN 刻录；READ_BATCH_BY_VOLUME 仅 volume_id 有效，
-// 触发该卷下挂起读任务的批量推进。
-enum class WRTaskType { READ, WRITE, BURN, READ_BATCH_BY_VOLUME };
+// 任务类型：
+//   READ                 数据面读任务（客户端 RequestAsyncReadFile 发起，产物为解压后的读文件）
+//   WRITE                写任务（压缩并封装进卷镜像）
+//   CD_BURN              刻录任务
+//   READ_BATCH_BY_VOLUME 仅 volume_id 有效，镜像就绪后批量推进该卷下挂起的 READ 任务
+//   CD_READ              光盘库读请求：让光盘库把某卷镜像加载回 image_dir_（不产出用户数据）
+enum class WRTaskType { READ, WRITE, CD_BURN, READ_BATCH_BY_VOLUME, CD_READ };
+
+inline const char* WRTaskTypeToString(WRTaskType type) {
+    switch (type) {
+        case WRTaskType::READ:                 return "READ";
+        case WRTaskType::WRITE:                return "WRITE";
+        case WRTaskType::CD_BURN:              return "CD_BURN";
+        case WRTaskType::READ_BATCH_BY_VOLUME: return "READ_BATCH_BY_VOLUME";
+        case WRTaskType::CD_READ:              return "CD_READ";
+    }
+    return "UNKNOWN";
+}
+
+// 当前毫秒级时间戳（自 epoch 起的毫秒数）；只存 uint64_t，落日志时再转可读串。
+inline uint64_t NowMs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
 
 // 任务元数据：含 task_id、类型、disk/volume/inode 定位信息、状态与失败上下文。
 class WRTask {
@@ -115,6 +141,9 @@ public:
     std::string inode_id;
     uint64_t inode_id_num;
     WRTaskState state;
+    // 最近一次状态变更时刻（epoch 毫秒；构造 / MarkTaskState / MarkTaskFailed 时写入）；
+    // 与 state 同批赋值，落审计日志时再转成可读时间串。
+    uint64_t state_changed_at_ms;
     std::string file_path;
 
     // 仅当 state==FAILED 时有意义；task_map_->Get(id) 可读到具体失败码与上下文。
@@ -127,13 +156,16 @@ public:
     // 与 state==FAILED 同步的冗余标志，便于快照直接读出终态。
     bool is_failed_terminal;
 
-    WRTask() = default;
+    // 默认构造（随后由调用方 SetXxxTask 填充载荷）：新建任务即记录状态时间戳，
+    // 其余字段保持既有语义（不在此初始化）。
+    WRTask() : state_changed_at_ms(NowMs()) {}
 
     explicit WRTask(uint64_t task_id, WRTaskType type)
         : task_id(task_id),
           type(type),
           inode_id_num(INVALID_INODE_ID),
           state(WRTaskState::START),
+          state_changed_at_ms(NowMs()),
           file_path("none"),
           last_error_code(volumemanager::ErrorCode::SUCCESS),
           last_error_detail(),
@@ -144,17 +176,19 @@ public:
     // 置为失败终态并记录错误码 / 上下文；调用方负责同步写回 task_map_。
     void SetFailed(volumemanager::ErrorCode code, const std::string& detail = std::string()) {
         state = WRTaskState::FAILED;
+        state_changed_at_ms = NowMs();
         last_error_code = code;
         last_error_detail = detail;
         is_failed_terminal = true;
     }
 
-    // 把任务从 WAITING 回退到 START 并自增 attempt_count；终态任务会被静默忽略。
-    void ResetForRetry() {
+    // 自增一次重试计数；终态任务会被静默忽略。
+    // 只改 attempt_count，不改 state——任务状态一律由 OpticalNodeManager::MarkTaskState /
+    // MarkTaskFailed 统一写入，避免绕过终态保护。
+    void IncrementAttemptCount() {
         if (is_failed_terminal) {
             return;
         }
-        state = WRTaskState::START;
         attempt_count++;
     }
 
@@ -168,6 +202,7 @@ public:
         this->inode_id_num = ParseInodeId(inode_id);
         this->type = WRTaskType::READ;
         state = WRTaskState::START;
+        state_changed_at_ms = NowMs();
     }
 
     // 设置写任务载荷；disk_id/volume_id 留空，由 ZipTaskProcessor 分配。
@@ -178,10 +213,11 @@ public:
         this->inode_id_num = ParseInodeId(inode_id);
         this->type = WRTaskType::WRITE;
         state = WRTaskState::START;
+        state_changed_at_ms = NowMs();
     }
 
     // 设置刻录任务载荷；不含 inode_id。
-    void SetBurnTask(const std::string& disk_id,
+    void SetCDBurnTask(const std::string& disk_id,
                      const std::string& volume_id,
                      const std::string& file_path) {
         this->disk_id = disk_id;
@@ -189,8 +225,9 @@ public:
         this->file_path = file_path;
         this->inode_id.clear();
         this->inode_id_num = INVALID_INODE_ID;
-        this->type = WRTaskType::BURN;
+        this->type = WRTaskType::CD_BURN;
         state = WRTaskState::START;
+        state_changed_at_ms = NowMs();
     }
 
     // 设置按镜像批量读请求载荷；仅 volume_id 有效。
@@ -202,9 +239,23 @@ public:
         this->file_path.clear();
         this->type = WRTaskType::READ_BATCH_BY_VOLUME;
         state = WRTaskState::START;
+        state_changed_at_ms = NowMs();
     }
 
-    // 任务是否已到达 FINISH 终态（通用语义：READ 读完 / WRITE 压缩完 / BURN 刻录完 / batch 处理完）。
+    // 设置光盘库读请求载荷：仅 disk_id / volume_id 有效，不携带 inode。
+    void SetCDReadTask(const std::string& disk_id,
+                       const std::string& volume_id) {
+        this->disk_id = disk_id;
+        this->volume_id = volume_id;
+        this->inode_id.clear();
+        this->inode_id_num = INVALID_INODE_ID;
+        this->file_path.clear();
+        this->type = WRTaskType::CD_READ;
+        state = WRTaskState::START;
+        state_changed_at_ms = NowMs();
+    }
+
+    // 任务是否已到达 FINISH 终态（通用语义：READ 读完 / WRITE 压缩完 / CD_BURN 刻录完 / batch 处理完）。
     bool isTaskFinish() const {
         return (this->state == WRTaskState::FINISH);
     }

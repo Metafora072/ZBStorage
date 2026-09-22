@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <ctime>
 #include <dirent.h>
 #include <fstream>
 #include <memory>
@@ -49,6 +50,38 @@ namespace optical_node_manager {
         return true;
     }
 
+    // 把 epoch 毫秒时间戳格式化为本地时间字符串；localtime_r / strftime 失败时返回空串。
+    static std::string FormatLocalTimeMs(uint64_t epoch_ms, const char* fmt) {
+        const std::time_t t = static_cast<std::time_t>(epoch_ms / 1000);
+        std::tm tm_buf{};
+        if (::localtime_r(&t, &tm_buf) == nullptr) {
+            return std::string();
+        }
+        char buf[32] = {0};
+        if (std::strftime(buf, sizeof(buf), fmt, &tm_buf) == 0) {
+            return std::string();
+        }
+        return std::string(buf);
+    }
+
+    // 统一的排障详情串："phase=<phase> subphase=<subphase>"，extra 非空时追加 " <extra>"。
+    // 约定 extra 由调用方拼成 "k=v k2=v2" 形式，避免各处自行拼 "phase= ... subphase= ..."
+    // 造成格式漂移（last_failure_reason_buf_ / last_sidecar_failure_reason_buf_ /
+    // MarkTaskFailed 的 detail 都走这里）。
+    static std::string FormatFailureDetail(const char* phase,
+                                  const std::string& subphase,
+                                  const std::string& extra = std::string()) {
+        std::string detail;
+        detail.reserve(64 + extra.size());
+        detail.append("phase=").append(phase);
+        detail.append(" subphase=").append(subphase);
+        if (!extra.empty()) {
+            detail.push_back(' ');
+            detail.append(extra);
+        }
+        return detail;
+    }
+
     // 从 node_id -> node_address 映射解析地址；支持虚节点 id 的 "<base>-v<index>" 回退。
     static bool ResolveNodeAddressFromMap(
         const std::unordered_map<std::string, std::string>& address_map,
@@ -82,11 +115,11 @@ namespace optical_node_manager {
                                            uint8_t available_volume_id_count,
                                            const std::string& scheduler_addr)
         : volume_manager_(volume_size, size_threshold),
-          read_task_queue_(new WR_task::WRTaskQueue()),
+          cd_read_task_queue_(new WR_task::WRTaskQueue()),
           zip_task_queue_(new WR_task::WRTaskQueue()),
           archive_task_queue_(new ArchiveRequestQueue()),
           scheduler_addr_(scheduler_addr),
-          burn_task_queue_(new WR_task::WRTaskQueue()),
+          cd_burn_task_queue_(new WR_task::WRTaskQueue()),
           task_map_(new WR_task::WRTaskMap()),
           available_volume_ids() {
         root_dir_ = root_dir;
@@ -141,32 +174,27 @@ namespace optical_node_manager {
     volumemanager::ErrorCode OpticalNodeManager::SendArchiveMetadata(
         const SendArchiveMetadataRequest& request) {
         if (archive_task_queue_ == nullptr) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kSendArchiveMetadata +
-                " subphase=queue_null";
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kSendArchiveMetadata, "queue_null");
             return volumemanager::ErrorCode::INVALID_PARAMETER;
         }
 
         // 仅 RUNNING 接受归档请求；其它状态下消费线程未运行，入队会无人消费。
         if (GetStatus() != manager_status::kRunning) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kSendArchiveMetadata +
-                " subphase=not_ready status=" + GetStatus();
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kSendArchiveMetadata, "not_ready",
+                "status=" + GetStatus());
             return volumemanager::ErrorCode::MANAGER_NOT_READY;
         }
 
         if (request.files.empty()) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kSendArchiveMetadata +
-                " subphase=empty_files batch_id=" + std::to_string(request.batch_id);
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kSendArchiveMetadata, "empty_files",
+                "batch_id=" + std::to_string(request.batch_id));
             return volumemanager::ErrorCode::INVALID_PARAMETER;
         }
 
         // 队列已关闭（Stop 进行中）：Push 会被静默丢弃，直接拒绝而不是假装成功。
         if (archive_task_queue_->IsClosed()) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kSendArchiveMetadata +
-                " subphase=queue_closed batch_id=" + std::to_string(request.batch_id);
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kSendArchiveMetadata, "queue_closed",
+                "batch_id=" + std::to_string(request.batch_id));
             return volumemanager::ErrorCode::MANAGER_NOT_READY;
         }
 
@@ -182,9 +210,8 @@ namespace optical_node_manager {
             // 经 SetStatus 发布原因指针；直接改 last_failure_reason_buf_ 会让
             // 已发布的 last_status_reason_ 指向重新分配前的旧缓冲。
             SetStatus(manager_status::kRunning,
-                      std::string("phase=") +
-                          start_failure_phase::kRunGuard +
-                          " subphase=idempotent_already_running status=" + current_status);
+                      FormatFailureDetail(start_failure_phase::kRunGuard, "idempotent_already_running",
+                          "status=" + current_status));
             return true;
         }
         if (current_status == manager_status::kInitializing ||
@@ -193,19 +220,15 @@ namespace optical_node_manager {
             for (auto& c : status_lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             // 同上：重入拒绝的原因也要经 SetStatus 发布。
             SetStatus(current_status,
-                      std::string("phase=") +
-                          start_failure_phase::kRunGuard +
-                          " subphase=reentry_during_" + status_lower +
-                          " status=" + current_status);
+                      FormatFailureDetail(start_failure_phase::kRunGuard, "reentry_during_" + status_lower,
+                          "status=" + current_status));
             return false;
         }
         SetStatus(manager_status::kInitializing, "Run() entered");
 
         if (!InitializeDir()) {
             // InitializeDir 已写子阶段到 last_failure_reason_buf_，这里拼顶层 phase。
-            const std::string detailed = std::string("phase=") +
-                start_failure_phase::kInitializeDir +
-                " subphase=" + last_failure_reason_buf_;
+            const std::string detailed = FormatFailureDetail(start_failure_phase::kInitializeDir, last_failure_reason_buf_);
             SetStatus(manager_status::kStartFailed, detailed);
             // 收尾：StopBackgroundWorkers 负责 joinable / cd_manager_ 守门，
             // 并保持 kStartFailed 与本次失败原因不被覆盖。
@@ -414,9 +437,7 @@ namespace optical_node_manager {
         if (cd_manager_ == nullptr) {
             // 防御性兜底：InitializeDir 实际未成功但 Run() 仍走到这里。
             // 收尾由 Run() 统一调 StopBackgroundWorkers() 完成。
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kStartWorkers +
-                " subphase=cd_manager_null";
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kStartWorkers, "cd_manager_null");
             return false;
         }
 
@@ -435,14 +456,12 @@ namespace optical_node_manager {
         // cd_manager_->Start() 在所有 thread 创建之前调用；失败路径收尾由 Run() 统一 Stop。
         cd_manager_->Start();
 
-        if (!read_task_thread_.joinable()) {
+        if (!cd_read_task_thread_.joinable()) {
             try {
-                read_task_thread_ = std::thread(&OpticalNodeManager::ReadTaskProcessor, this);
+                cd_read_task_thread_ = std::thread(&OpticalNodeManager::CDReadTaskProcessor, this);
             } catch (const std::system_error& e) {
-                last_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kStartWorkers +
-                    " subphase=" + start_failure_phase::kThreadRead +
-                    " what=" + e.what();
+                last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kStartWorkers, start_failure_phase::kThreadRead,
+                    std::string("what=") + e.what());
                 return false;
             }
         }
@@ -451,10 +470,8 @@ namespace optical_node_manager {
             try {
                 zip_task_thread_ = std::thread(&OpticalNodeManager::ZipTaskProcessor, this);
             } catch (const std::system_error& e) {
-                last_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kStartWorkers +
-                    " subphase=" + start_failure_phase::kThreadZip +
-                    " what=" + e.what();
+                last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kStartWorkers, start_failure_phase::kThreadZip,
+                    std::string("what=") + e.what());
                 return false;
             }
         }
@@ -463,22 +480,18 @@ namespace optical_node_manager {
             try {
                 archive_task_thread_ = std::thread(&OpticalNodeManager::ArchiveTaskProcessor, this);
             } catch (const std::system_error& e) {
-                last_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kStartWorkers +
-                    " subphase=" + start_failure_phase::kThreadArchive +
-                    " what=" + e.what();
+                last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kStartWorkers, start_failure_phase::kThreadArchive,
+                    std::string("what=") + e.what());
                 return false;
             }
         }
 
-        if (!burn_task_thread_.joinable()) {
+        if (!cd_burn_task_thread_.joinable()) {
             try {
-                burn_task_thread_ = std::thread(&OpticalNodeManager::BurnTaskProcessor, this);
+                cd_burn_task_thread_ = std::thread(&OpticalNodeManager::CDBurnTaskProcessor, this);
             } catch (const std::system_error& e) {
-                last_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kStartWorkers +
-                    " subphase=" + start_failure_phase::kThreadBurn +
-                    " what=" + e.what();
+                last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kStartWorkers, start_failure_phase::kThreadBurn,
+                    std::string("what=") + e.what());
                 return false;
             }
         }
@@ -487,10 +500,8 @@ namespace optical_node_manager {
             try {
                 cleanup_thread_ = std::thread(&OpticalNodeManager::CleanupTaskProcessor, this);
             } catch (const std::system_error& e) {
-                last_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kStartWorkers +
-                    " subphase=StartBackgroundWorkers.thread=cleanup" +
-                    " what=" + e.what();
+                last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kStartWorkers, "StartBackgroundWorkers.thread=cleanup",
+                    std::string("what=") + e.what());
                 return false;
             }
         }
@@ -521,12 +532,12 @@ namespace optical_node_manager {
             archive_task_thread_.join();
         }
 
-        if (read_task_queue_ != nullptr) {
-            read_task_queue_->Close();
+        if (cd_read_task_queue_ != nullptr) {
+            cd_read_task_queue_->Close();
         }
 
-        if (read_task_thread_.joinable()) {
-            read_task_thread_.join();
+        if (cd_read_task_thread_.joinable()) {
+            cd_read_task_thread_.join();
         }
 
         // 必须在 cd_manager_->Stop() 之前关闭 zip_task_queue_，OnCDReadComplete 仍在写入。
@@ -538,12 +549,12 @@ namespace optical_node_manager {
             zip_task_thread_.join();
         }
 
-        if (burn_task_queue_ != nullptr) {
-            burn_task_queue_->Close();
+        if (cd_burn_task_queue_ != nullptr) {
+            cd_burn_task_queue_->Close();
         }
 
-        if (burn_task_thread_.joinable()) {
-            burn_task_thread_.join();
+        if (cd_burn_task_thread_.joinable()) {
+            cd_burn_task_thread_.join();
         }
 
         // 清理线程仅依赖 stop_requested_ 退出，不访问队列 / cd_manager。
@@ -570,10 +581,10 @@ namespace optical_node_manager {
         // 清理 volume_read_index_ 残留 mapping，避免外部观察到指向已 Stop task 的引用。
         volume_read_index_.Clear();
 
-        delete read_task_queue_;
+        delete cd_read_task_queue_;
         delete zip_task_queue_;
         delete archive_task_queue_;
-        delete burn_task_queue_;
+        delete cd_burn_task_queue_;
         delete task_map_;
     }
 
@@ -607,9 +618,8 @@ namespace optical_node_manager {
 
         // 仅 RUNNING 接受读任务；其它状态返回 NOT_READY。
         if (GetStatus() != manager_status::kRunning) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kReadFile +
-                " subphase=not_ready status=" + GetStatus();
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReadFile, "not_ready",
+                "status=" + GetStatus());
             return volumemanager::ErrorCode::MANAGER_NOT_READY;
         }
 
@@ -637,55 +647,51 @@ namespace optical_node_manager {
                                                     uint64_t offset,
                                                     uint64_t read_size){
         if(!out){
-            const std::string detail = std::string("phase=") +
-                start_failure_phase::kReadObjectByTaskId +
-                " subphase=invalid_parameter out=null task_id=" +
-                std::to_string(task_id);
+            const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "invalid_parameter",
+                "out=null task_id=" + std::to_string(task_id));
             last_failure_reason_buf_ = detail;
             return volumemanager::ErrorCode::INVALID_PARAMETER;
         }
 
         // 仅 RUNNING 接受重读；其它状态拒绝。
         if (GetStatus() != manager_status::kRunning) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kReadObjectByTaskId +
-                " subphase=not_ready status=" + GetStatus();
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "not_ready",
+                "status=" + GetStatus());
             return volumemanager::ErrorCode::MANAGER_NOT_READY;
         }
 
         auto task_opt = task_map_->Get(task_id);
         if (!task_opt.has_value()) {
             // 任务不存在：可能已被 Erase（消费过一次）或 task_id 传错。
-            const std::string detail = std::string("phase=") +
-                start_failure_phase::kReadObjectByTaskId +
-                " subphase=task_not_found task_id=" +
-                std::to_string(task_id);
+            const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "task_not_found",
+                "task_id=" + std::to_string(task_id));
             last_failure_reason_buf_ = detail;
             return volumemanager::ErrorCode::TASK_NOT_FOUND;
         }
         const WR_task::WRTask& task = *task_opt;
         if (task.type != WR_task::WRTaskType::READ) {
             // type 不匹配：把 WRITE 任务的 task_id 传给了 ReadObjectByTaskId。
-            const std::string detail = std::string("phase=") +
-                start_failure_phase::kReadObjectByTaskId +
-                " subphase=invalid_type task_id=" +
-                std::to_string(task_id) +
-                " type=" + std::to_string(static_cast<int>(task.type));
+            const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "invalid_type",
+                "task_id=" + std::to_string(task_id) + " type=" + std::to_string(static_cast<int>(task.type)));
             last_failure_reason_buf_ = detail;
             return volumemanager::ErrorCode::INVALID_PARAMETER;
         }
         // FAILED → 返回细分错误码；FINISH（已读完）→ TASK_ALREADY_FINISH；
         // READY 前的中间态 → TASK_NOT_FINISH；READY → 走 mmap 分片读取，末片置 FINISH。
         if (task.state == WR_task::WRTaskState::FAILED) {
-            const std::string detail = std::string("phase=") +
-                start_failure_phase::kReadObjectByTaskId +
-                " subphase=task_failed task_id=" +
+            const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "task_failed",
+                "task_id=" +
                 std::to_string(task_id) +
-                " code=" + volumemanager::GetErrorMessage(task.last_error_code) +
-                " code_int=" + std::to_string(static_cast<int>(task.last_error_code)) +
-                " attempt=" + std::to_string(task.attempt_count) +
-                "/" + std::to_string(attempt_count_max_) +
-                " detail=" + task.last_error_detail;
+                " code=" +
+                volumemanager::GetErrorMessage(task.last_error_code) +
+                " code_int=" +
+                std::to_string(static_cast<int>(task.last_error_code)) +
+                " attempt=" +
+                std::to_string(task.attempt_count) +
+                "/" +
+                std::to_string(attempt_count_max_) +
+                " detail=" +
+                task.last_error_detail);
             last_failure_reason_buf_ = detail;
             return task.last_error_code == volumemanager::ErrorCode::SUCCESS
                 ? volumemanager::ErrorCode::READ_FAILED
@@ -693,19 +699,14 @@ namespace optical_node_manager {
         }
         if (task.state == WR_task::WRTaskState::FINISH) {
             // 任务已读完（读产物已 unlink），不可再读。
-            const std::string detail = std::string("phase=") +
-                start_failure_phase::kReadObjectByTaskId +
-                " subphase=task_already_finish task_id=" +
-                std::to_string(task_id);
+            const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "task_already_finish",
+                "task_id=" + std::to_string(task_id));
             last_failure_reason_buf_ = detail;
             return volumemanager::ErrorCode::TASK_ALREADY_FINISH;
         }
         if (!task.isReadTaskReady()) {
-            const std::string detail = std::string("phase=") +
-                start_failure_phase::kReadObjectByTaskId +
-                " subphase=task_not_finish task_id=" +
-                std::to_string(task_id) +
-                " state=" + std::to_string(static_cast<int>(task.state));
+            const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "task_not_finish",
+                "task_id=" + std::to_string(task_id) + " state=" + std::to_string(static_cast<int>(task.state)));
             last_failure_reason_buf_ = detail;
             return volumemanager::ErrorCode::TASK_NOT_FINISH;
         }
@@ -714,13 +715,15 @@ namespace optical_node_manager {
         volumemanager::ErrorCode ret = ReadFileToStringMmap(task.file_path, out, offset, read_size, &is_last);
         // mmap 阶段失败：不改 task_map_，FINISH 任务的 IO 失败由调用方决定下一步。
         if (ret != volumemanager::ErrorCode::SUCCESS) {
-            const std::string detail = std::string("phase=") +
-                start_failure_phase::kReadObjectByTaskId +
-                " subphase=mmap_failed task_id=" +
+            const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "mmap_failed",
+                "task_id=" +
                 std::to_string(task_id) +
-                " code=" + volumemanager::GetErrorMessage(ret) +
-                " code_int=" + std::to_string(static_cast<int>(ret)) +
-                " file_path=" + task.file_path;
+                " code=" +
+                volumemanager::GetErrorMessage(ret) +
+                " code_int=" +
+                std::to_string(static_cast<int>(ret)) +
+                " file_path=" +
+                task.file_path);
             last_failure_reason_buf_ = detail;
             return ret;
         }
@@ -728,14 +731,17 @@ namespace optical_node_manager {
         // 非末片保留文件供后续分片继续读。
         if (is_last) {
             if (::unlink(task.file_path.c_str()) != 0 && errno != ENOENT) {
-                last_sidecar_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kReadObjectByTaskId +
-                    " subphase=post_success_unlink_failed code=" +
+                last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "post_success_unlink_failed",
+                    std::string("code=") +
                     volumemanager::GetErrorMessage(volumemanager::ErrorCode::IO_ERROR) +
-                    " code_int=" + std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
-                    " task_id=" + std::to_string(task_id) +
-                    " file_path=" + task.file_path +
-                    " errno=" + std::to_string(errno);
+                    " code_int=" +
+                    std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
+                    " task_id=" +
+                    std::to_string(task_id) +
+                    " file_path=" +
+                    task.file_path +
+                    " errno=" +
+                    std::to_string(errno));
             }
             // 读产物已消费：置 FINISH 终态，交由清理线程从 task_map_ 移除。
             MarkTaskState(task_id, WR_task::WRTaskState::FINISH);
@@ -759,9 +765,8 @@ namespace optical_node_manager {
             std::lock_guard<std::mutex> lock(inode_to_read_task_id_mutex_);
             auto idx_it = inode_to_read_task_id_.find(inode_id);
             if (idx_it == inode_to_read_task_id_.end()) {
-                const std::string detail = std::string("phase=") +
-                    start_failure_phase::kReadObjectByInodeId +
-                    " subphase=inode_not_found inode_id=" + inode_id;
+                const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByInodeId, "inode_not_found",
+                    "inode_id=" + inode_id);
                 last_failure_reason_buf_ = detail;
                 return volumemanager::ErrorCode::TASK_NOT_FOUND;
             }
@@ -777,20 +782,16 @@ namespace optical_node_manager {
             uint64_t offset,
             uint64_t total_size) {
         if (!data && data_size > 0) {
-            const std::string detail = std::string("phase=") +
-                start_failure_phase::kWriteObject +
-                " subphase=invalid_parameter data=null data_size=" +
-                std::to_string(data_size) +
-                " inode_id=" + inode_id;
+            const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "invalid_parameter",
+                "data=null data_size=" + std::to_string(data_size) + " inode_id=" + inode_id);
             last_failure_reason_buf_ = detail;
             return volumemanager::ErrorCode::INVALID_PARAMETER;
         }
 
         // 仅 RUNNING 接受写数据；其它状态拒绝。
         if (GetStatus() != manager_status::kRunning) {
-            const std::string detail = std::string("phase=") +
-                start_failure_phase::kWriteObject +
-                " subphase=not_ready status=" + GetStatus();
+            const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "not_ready",
+                "status=" + GetStatus());
             last_failure_reason_buf_ = detail;
             return volumemanager::ErrorCode::MANAGER_NOT_READY;
         }
@@ -807,12 +808,13 @@ namespace optical_node_manager {
                 // 空文件：直接创建空文件 + 任务 + 入压缩队列。
                 std::ofstream trunc(output_path, std::ios::binary | std::ios::trunc);
                 if (!trunc) {
-                    const std::string detail = std::string("phase=") +
-                        start_failure_phase::kWriteObject +
-                        " subphase=open_failed code=" +
+                    const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "open_failed",
+                        std::string("code=") +
                         volumemanager::GetErrorMessage(volumemanager::ErrorCode::IO_ERROR) +
-                        " code_int=" + std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
-                        " path=" + output_path;
+                        " code_int=" +
+                        std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
+                        " path=" +
+                        output_path);
                     last_failure_reason_buf_ = detail;
                     return volumemanager::ErrorCode::IO_ERROR;
                 }
@@ -830,12 +832,13 @@ namespace optical_node_manager {
 
             std::ofstream trunc(output_path, std::ios::binary | std::ios::trunc);
             if (!trunc) {
-                const std::string detail = std::string("phase=") +
-                    start_failure_phase::kWriteObject +
-                    " subphase=open_failed code=" +
+                const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "open_failed",
+                    std::string("code=") +
                     volumemanager::GetErrorMessage(volumemanager::ErrorCode::IO_ERROR) +
-                    " code_int=" + std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
-                    " path=" + output_path;
+                    " code_int=" +
+                    std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
+                    " path=" +
+                    output_path);
                 last_failure_reason_buf_ = detail;
                 return volumemanager::ErrorCode::IO_ERROR;
             }
@@ -851,24 +854,26 @@ namespace optical_node_manager {
 
         // total_size 必须与首次调用一致；不一致视为参数错误。
         if (state.total_size != total_size) {
-            const std::string detail = std::string("phase=") +
-                start_failure_phase::kWriteObject +
-                " subphase=invalid_parameter total_size_mismatch expected=" +
+            const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "invalid_parameter",
+                "total_size_mismatch expected=" +
                 std::to_string(state.total_size) +
-                " got=" + std::to_string(total_size) +
-                " inode_id=" + inode_id;
+                " got=" +
+                std::to_string(total_size) +
+                " inode_id=" +
+                inode_id);
             last_failure_reason_buf_ = detail;
             return volumemanager::ErrorCode::INVALID_PARAMETER;
         }
 
         // offset 必须严格等于已累积字节数；不接受乱序或重复写。
         if (offset != state.bytes_received) {
-            const std::string detail = std::string("phase=") +
-                start_failure_phase::kWriteObject +
-                " subphase=invalid_parameter offset_mismatch expected=" +
+            const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "invalid_parameter",
+                "offset_mismatch expected=" +
                 std::to_string(state.bytes_received) +
-                " got=" + std::to_string(offset) +
-                " inode_id=" + inode_id;
+                " got=" +
+                std::to_string(offset) +
+                " inode_id=" +
+                inode_id);
             last_failure_reason_buf_ = detail;
             return volumemanager::ErrorCode::INVALID_PARAMETER;
         }
@@ -878,23 +883,21 @@ namespace optical_node_manager {
             std::fstream fs(output_path,
                             std::ios::binary | std::ios::in | std::ios::out);
             if (!fs) {
-                const std::string detail = std::string("phase=") +
-                    start_failure_phase::kWriteObject +
-                    " subphase=open_failed code=" +
+                const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "open_failed",
+                    std::string("code=") +
                     volumemanager::GetErrorMessage(volumemanager::ErrorCode::IO_ERROR) +
-                    " code_int=" + std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
-                    " path=" + output_path;
+                    " code_int=" +
+                    std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
+                    " path=" +
+                    output_path);
                 last_failure_reason_buf_ = detail;
                 return volumemanager::ErrorCode::IO_ERROR;
             }
             fs.seekp(static_cast<std::streamoff>(offset), std::ios::beg);
             if (!fs.good()) {
                 fs.close();
-                const std::string detail = std::string("phase=") +
-                    start_failure_phase::kWriteObject +
-                    " subphase=seek_failed offset=" +
-                    std::to_string(offset) +
-                    " path=" + output_path;
+                const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "seek_failed",
+                    "offset=" + std::to_string(offset) + " path=" + output_path);
                 last_failure_reason_buf_ = detail;
                 return volumemanager::ErrorCode::IO_ERROR;
             }
@@ -903,23 +906,28 @@ namespace optical_node_manager {
                 fs.close();
                 // 写失败：清状态 + 删残留文件；删失败走 sidecar。
                 in_progress_writes_.erase(it);
-                const std::string detail = std::string("phase=") +
-                    start_failure_phase::kWriteObject +
-                    " subphase=write_failed code=" +
+                const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "write_failed",
+                    std::string("code=") +
                     volumemanager::GetErrorMessage(volumemanager::ErrorCode::IO_ERROR) +
-                    " code_int=" + std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
-                    " offset=" + std::to_string(offset) +
-                    " data_size=" + std::to_string(data_size) +
-                    " path=" + output_path;
+                    " code_int=" +
+                    std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
+                    " offset=" +
+                    std::to_string(offset) +
+                    " data_size=" +
+                    std::to_string(data_size) +
+                    " path=" +
+                    output_path);
                 last_failure_reason_buf_ = detail;
                 if (::unlink(output_path.c_str()) != 0 && errno != ENOENT) {
-                    last_sidecar_failure_reason_buf_ = std::string("phase=") +
-                        start_failure_phase::kWriteObject +
-                        " subphase=residual_unlink_failed code=" +
+                    last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kWriteObject, "residual_unlink_failed",
+                        std::string("code=") +
                         volumemanager::GetErrorMessage(volumemanager::ErrorCode::IO_ERROR) +
-                        " code_int=" + std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
-                        " path=" + output_path +
-                        " errno=" + std::to_string(errno);
+                        " code_int=" +
+                        std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
+                        " path=" +
+                        output_path +
+                        " errno=" +
+                        std::to_string(errno));
                 }
                 return volumemanager::ErrorCode::IO_ERROR;
             }
@@ -944,21 +952,23 @@ namespace optical_node_manager {
     }
 
     void OpticalNodeManager::OnCDReadComplete(const cd_manager_sim::ReadCompleteEvent& event) {
+        // event.task_id 对应 CD_READ 任务（光盘库读请求）。
         // cd_manager_sim 当前未提供 success 字段，默认视为成功（TODO-08 留口）。
-        if (!MarkTaskState(event.task_id, WR_task::WRTaskState::LOADED)) {
-            // MarkTaskState 失败：任务已被 Erase / 终态；任务不存在时记录排查信号后退出。
-            auto existing = task_map_->Get(event.task_id);
-            if (!existing.has_value()) {
-                last_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kOnCDReadComplete +
-                    " subphase=unknown_task_id task_id=" +
-                    std::to_string(event.task_id);
-            }
+        auto cd_task = task_map_->Get(event.task_id);
+        if (!cd_task.has_value()) {
+            // 任务已被 Erase（异常清理）：只记录排查信号。
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDReadComplete, "unknown_task_id",
+                "task_id=" + std::to_string(event.task_id));
+            return;
+        }
+        if (cd_task->type != WR_task::WRTaskType::CD_READ) {
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDReadComplete, "invalid_type",
+                "task_id=" + std::to_string(event.task_id) + " type=" + WR_task::WRTaskTypeToString(cd_task->type));
             return;
         }
 
         // 镜像从 disc_sim_dir_ 转移到 image_dir_/ 并登记到 image_dir_manager_（扇平布局）。
-        // 与 WRITE 链路 (PackVolume + MoveFrom) 形成对称；失败走 sidecar，不阻塞 LOADED 推进。
+        // 与 WRITE 链路 (PackVolume + MoveFrom) 形成对称；失败走 sidecar，不阻塞 CD_READ 收尾。
         if (image_dir_manager_ != nullptr) {
             const std::string src_image_path =
                 disc_sim_dir_ + "volume_" + event.volume_id + ".vimg";
@@ -972,32 +982,35 @@ namespace optical_node_manager {
                     image_dir_manager_->MoveFrom(src_image_path,
                                                  space_manager::ImageCategory::READ);
                 if (move_ret != volumemanager::ErrorCode::SUCCESS) {
-                    // 副作用失败：不影响 LOADED 状态推进，sidecar 记录便于运维排查。
-                    last_sidecar_failure_reason_buf_ = std::string("phase=") +
-                        start_failure_phase::kOnCDReadComplete +
-                        " subphase=MoveFrom_failed code=" +
+                    // 副作用失败：不影响 CD_READ 收尾，sidecar 记录便于运维排查。
+                    last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDReadComplete, "MoveFrom_failed",
+                        std::string("code=") +
                         volumemanager::GetErrorMessage(move_ret) +
-                        " code_int=" + std::to_string(static_cast<int>(move_ret)) +
-                        " src=" + src_image_path +
-                        " dst=image_dir_/" + read_basename +
-                        " task_id=" + std::to_string(event.task_id);
+                        " code_int=" +
+                        std::to_string(static_cast<int>(move_ret)) +
+                        " src=" +
+                        src_image_path +
+                        " dst=image_dir_/" +
+                        read_basename +
+                        " task_id=" +
+                        std::to_string(event.task_id));
                 }
             } else {
                 // 解析失败：兜底未来 cd_manager 落盘命名变更；sidecar 记录。
-                last_sidecar_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kOnCDReadComplete +
-                    " subphase=ParseVolumeFile_failed code=" +
+                last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDReadComplete, "ParseVolumeFile_failed",
+                    std::string("code=") +
                     volumemanager::GetErrorMessage(parse_ret) +
-                    " code_int=" + std::to_string(static_cast<int>(parse_ret)) +
-                    " src=" + src_image_path +
-                    " task_id=" + std::to_string(event.task_id);
+                    " code_int=" +
+                    std::to_string(static_cast<int>(parse_ret)) +
+                    " src=" +
+                    src_image_path +
+                    " task_id=" +
+                    std::to_string(event.task_id));
             }
         } else {
             // image_dir_manager_ 未就绪：后续 MountVolume 大概率 FILE_NOT_FOUND；仅 sidecar。
-            last_sidecar_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kOnCDReadComplete +
-                " subphase=image_dir_manager_null task_id=" +
-                std::to_string(event.task_id);
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDReadComplete, "image_dir_manager_null",
+                "task_id=" + std::to_string(event.task_id));
         }
 
         // 触发"按镜像批量读"批次：处理 volume_read_index_ 中所有等待该卷的挂起读任务。
@@ -1010,11 +1023,14 @@ namespace optical_node_manager {
         }
         zip_task_queue_->Push(
             WR_task::WRTaskShort(batch_task_id, WR_task::WRTaskType::READ_BATCH_BY_VOLUME));
+
+        // CD_READ 一次性完成：镜像已加载回 image_dir_ 且批量读已派发，置 FINISH 等清理线程落审计日志。
+        MarkTaskState(event.task_id, WR_task::WRTaskState::FINISH);
     }
 
-    void OpticalNodeManager::ReadTaskProcessor(){
+    void OpticalNodeManager::CDReadTaskProcessor(){
         do{
-            auto opt_task = read_task_queue_->Pop();
+            auto opt_task = cd_read_task_queue_->Pop();
             if (!opt_task.has_value()) {
                 break;
             }
@@ -1029,32 +1045,66 @@ namespace optical_node_manager {
                 continue;
             }
 
-            if (!SubmitTaskToCDManager(*full_task)) {
+            if (!SubmitCDReadTaskToCDManager(*full_task)) {
                 // 失败根因：cd_manager 已停 / cd_manager 内部拒绝。
                 if (cd_manager_ == nullptr) {
                     MarkTaskFailed(task.task_id,
                                    volumemanager::ErrorCode::READ_FAILED,
-                                   "SubmitTaskToCDManager_failed cd_manager_null");
+                                   FormatFailureDetail(start_failure_phase::kCDReadTaskProcessor,
+                                              "SubmitCDReadTaskToCDManager_failed",
+                                              "cd_manager_null"));
                 } else if (ShouldGiveUpRetry(task.task_id)) {
                     MarkTaskFailed(task.task_id,
                                    volumemanager::ErrorCode::READ_FAILED,
-                                   std::string("attempt_exceeded limit=") +
-                                       std::to_string(attempt_count_max_) +
-                                       " reason=SubmitReadTask_rejected_by_cd_manager");
+                                   FormatFailureDetail(start_failure_phase::kCDReadTaskProcessor,
+                                              "attempt_exceeded",
+                                              "limit=" + std::to_string(attempt_count_max_) +
+                                              " reason=SubmitReadTask_rejected_by_cd_manager"));
                 } else {
                     // 未超限：保留 WAITING 重试，写失败痕迹但不切终态。
+                    // 先提交其它字段，状态单独走 MarkTaskState（终态保护生效）。
                     auto current = task_map_->Get(task.task_id);
                     if (current.has_value()) {
-                        current->ResetForRetry();
-                        current->state = WR_task::WRTaskState::WAITING;
+                        current->IncrementAttemptCount();
                         current->last_error_code = volumemanager::ErrorCode::READ_FAILED;
                         current->last_error_detail = "SubmitReadTask_rejected_by_cd_manager";
                         task_map_->Update(std::move(*current));
+                        MarkTaskState(task.task_id, WR_task::WRTaskState::WAITING);
                     }
-                    read_task_queue_->Push(WR_task::WRTaskShort(task.task_id, WR_task::WRTaskType::READ));
+                    cd_read_task_queue_->Push(
+                        WR_task::WRTaskShort(task.task_id, WR_task::WRTaskType::CD_READ));
                 }
             }
         } while(true);
+    }
+
+    // 构造 CD_READ 任务并登记入 task_map_ / cd_read_task_queue_。
+    // 仅 ZipTaskProcessor 调用（单线程），无需额外加锁。
+    void OpticalNodeManager::EnqueueCDReadTask(const std::string& disk_id,
+                                               const std::string& volume_id) {
+        const uint64_t cd_task_id = GenerateTaskId();
+        WR_task::WRTask cd_task(cd_task_id, WR_task::WRTaskType::CD_READ);
+        cd_task.SetCDReadTask(disk_id, volume_id);
+        task_map_->Insert(std::move(cd_task));
+        cd_read_task_queue_->Push(WR_task::WRTaskShort(cd_task_id, WR_task::WRTaskType::CD_READ));
+    }
+
+    std::string OpticalNodeManager::VolumeImagePath(const std::string& volume_id) const {
+        return image_dir_ + "volume_" + volume_id + ".vimg";
+    }
+
+    void OpticalNodeManager::TouchVolume(const std::string& volume_id) {
+        if (image_dir_manager_ == nullptr) {
+            return;
+        }
+        uint64_t parsed_volume_id = 0;
+        std::string parsed_basename;
+        if (image_dir_manager_->ParseVolumeFile(VolumeImagePath(volume_id),
+                                                parsed_volume_id,
+                                                parsed_basename)
+                == volumemanager::ErrorCode::SUCCESS) {
+            image_dir_manager_->Touch(parsed_volume_id);
+        }
     }
 
     bool OpticalNodeManager::MarkTaskState(uint64_t task_id, WR_task::WRTaskState new_state) {
@@ -1077,6 +1127,7 @@ namespace optical_node_manager {
         }
 
         current->state = new_state;
+        current->state_changed_at_ms = WR_task::NowMs();
         if (!task_map_->Update(std::move(*current))) {
             return false;
         }
@@ -1134,7 +1185,7 @@ namespace optical_node_manager {
         return current->attempt_count >= attempt_count_max_;
     }
 
-    bool OpticalNodeManager::SubmitTaskToCDManager(const WR_task::WRTask& task) {
+    bool OpticalNodeManager::SubmitCDReadTaskToCDManager(const WR_task::WRTask& task) {
         if (cd_manager_ == nullptr) {
             return false;
         }
@@ -1215,17 +1266,14 @@ namespace optical_node_manager {
     bool OpticalNodeManager::BuildNodeAddressMap(
         std::unordered_map<std::string, std::string>* out) {
         if (out == nullptr) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=invalid_parameter out=null";
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "invalid_parameter",
+                "out=null");
             return false;
         }
         out->clear();
 
         if (scheduler_addr_.empty()) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=scheduler_addr_empty";
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "scheduler_addr_empty");
             return false;
         }
 
@@ -1237,9 +1285,8 @@ namespace optical_node_manager {
             options.timeout_ms = 3000;
             options.max_retry = 0;
             if (channel->Init(scheduler_addr_.c_str(), &options) != 0) {
-                last_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kArchiveTaskProcessor +
-                    " subphase=scheduler_channel_init_failed addr=" + scheduler_addr_;
+                last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "scheduler_channel_init_failed",
+                    "addr=" + scheduler_addr_);
                 return false;
             }
             scheduler_channel_ = std::move(channel);
@@ -1253,16 +1300,13 @@ namespace optical_node_manager {
         stub.GetClusterView(&cntl, &request, &response, nullptr);
         if (cntl.Failed()) {
             scheduler_channel_.reset();
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=GetClusterView_failed error=" + cntl.ErrorText();
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "GetClusterView_failed",
+                "error=" + cntl.ErrorText());
             return false;
         }
         if (response.status().code() != zb::rpc::SCHED_OK) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=GetClusterView_status code=" +
-                std::to_string(static_cast<int>(response.status().code()));
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "GetClusterView_status",
+                "code=" + std::to_string(static_cast<int>(response.status().code())));
             return false;
         }
 
@@ -1293,23 +1337,20 @@ namespace optical_node_manager {
                                                  const std::string& target_node_address,
                                                  std::string* out_relative_path) {
         if (out_relative_path == nullptr) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=invalid_parameter out=null inode_id=" + std::to_string(file.inode_id);
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "invalid_parameter",
+                "out=null inode_id=" + std::to_string(file.inode_id));
             return false;
         }
         out_relative_path->clear();
 
         if (input_file_dir_.empty()) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=input_dir_empty inode_id=" + std::to_string(file.inode_id);
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "input_dir_empty",
+                "inode_id=" + std::to_string(file.inode_id));
             return false;
         }
         if (target_node_address.empty()) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=node_address_empty inode_id=" + std::to_string(file.inode_id);
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "node_address_empty",
+                "inode_id=" + std::to_string(file.inode_id));
             return false;
         }
 
@@ -1325,10 +1366,8 @@ namespace optical_node_manager {
             options.timeout_ms = 5000;
             options.max_retry = 0;
             if (new_channel->Init(target_node_address.c_str(), &options) != 0) {
-                last_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kArchiveTaskProcessor +
-                    " subphase=data_channel_init_failed address=" + target_node_address +
-                    " inode_id=" + std::to_string(file.inode_id);
+                last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "data_channel_init_failed",
+                    "address=" + target_node_address + " inode_id=" + std::to_string(file.inode_id));
                 return false;
             }
             channel = new_channel.get();
@@ -1350,19 +1389,23 @@ namespace optical_node_manager {
         if (resolve_cntl.Failed()) {
             // 连接可能已失效：丢弃缓存 channel，后续文件/批次重建。
             data_node_channels_.erase(target_node_address);
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=ResolveFileRead_failed inode_id=" + std::to_string(file.inode_id) +
-                " address=" + target_node_address +
-                " error=" + resolve_cntl.ErrorText();
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "ResolveFileRead_failed",
+                "inode_id=" +
+                std::to_string(file.inode_id) +
+                " address=" +
+                target_node_address +
+                " error=" +
+                resolve_cntl.ErrorText());
             return false;
         }
         if (resolve_resp.status().code() != zb::rpc::STATUS_OK) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=ResolveFileRead_status inode_id=" + std::to_string(file.inode_id) +
-                " code=" + std::to_string(static_cast<int>(resolve_resp.status().code())) +
-                " message=" + resolve_resp.status().message();
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "ResolveFileRead_status",
+                "inode_id=" +
+                std::to_string(file.inode_id) +
+                " code=" +
+                std::to_string(static_cast<int>(resolve_resp.status().code())) +
+                " message=" +
+                resolve_resp.status().message());
             return false;
         }
 
@@ -1370,17 +1413,18 @@ namespace optical_node_manager {
         const zb::rpc::FileMeta& meta = resolve_resp.meta();
         const uint64_t object_unit_size = meta.object_unit_size();
         if (meta.file_size() != file.size) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=size_mismatch inode_id=" + std::to_string(file.inode_id) +
-                " expected=" + std::to_string(file.size) +
-                " actual=" + std::to_string(meta.file_size());
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "size_mismatch",
+                "inode_id=" +
+                std::to_string(file.inode_id) +
+                " expected=" +
+                std::to_string(file.size) +
+                " actual=" +
+                std::to_string(meta.file_size()));
             return false;
         }
         if (object_unit_size == 0 && file.size > 0) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=object_unit_size_zero inode_id=" + std::to_string(file.inode_id);
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "object_unit_size_zero",
+                "inode_id=" + std::to_string(file.inode_id));
             return false;
         }
 
@@ -1390,21 +1434,25 @@ namespace optical_node_manager {
                 static_cast<uint64_t>(slice.object_index()) * object_unit_size +
                 slice.object_offset();
             if (slice_offset != expected_offset) {
-                last_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kArchiveTaskProcessor +
-                    " subphase=slice_not_contiguous inode_id=" + std::to_string(file.inode_id) +
-                    " expected_offset=" + std::to_string(expected_offset) +
-                    " slice_offset=" + std::to_string(slice_offset);
+                last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "slice_not_contiguous",
+                    "inode_id=" +
+                    std::to_string(file.inode_id) +
+                    " expected_offset=" +
+                    std::to_string(expected_offset) +
+                    " slice_offset=" +
+                    std::to_string(slice_offset));
                 return false;
             }
             expected_offset += slice.length();
         }
         if (expected_offset != file.size) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=slice_total_mismatch inode_id=" + std::to_string(file.inode_id) +
-                " expected=" + std::to_string(file.size) +
-                " actual=" + std::to_string(expected_offset);
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "slice_total_mismatch",
+                "inode_id=" +
+                std::to_string(file.inode_id) +
+                " expected=" +
+                std::to_string(file.size) +
+                " actual=" +
+                std::to_string(expected_offset));
             return false;
         }
 
@@ -1413,10 +1461,8 @@ namespace optical_node_manager {
         const std::string local_path = input_file_dir_ + relative_path;
         const int fd = ::open(local_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
         if (fd < 0) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=open_failed path=" + local_path +
-                " errno=" + std::to_string(errno);
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "open_failed",
+                "path=" + local_path + " errno=" + std::to_string(errno));
             return false;
         }
 
@@ -1424,9 +1470,8 @@ namespace optical_node_manager {
             if (stop_requested_.load(std::memory_order_relaxed)) {
                 ::close(fd);
                 ::unlink(local_path.c_str());
-                last_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kArchiveTaskProcessor +
-                    " subphase=stopped inode_id=" + std::to_string(file.inode_id);
+                last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "stopped",
+                    "inode_id=" + std::to_string(file.inode_id));
                 return false;
             }
 
@@ -1442,23 +1487,28 @@ namespace optical_node_manager {
                 ::close(fd);
                 ::unlink(local_path.c_str());
                 data_node_channels_.erase(target_node_address);
-                last_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kArchiveTaskProcessor +
-                    " subphase=ReadObject_failed inode_id=" + std::to_string(file.inode_id) +
-                    " object_id=" + slice.object_id() +
-                    " error=" + read_cntl.ErrorText();
+                last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "ReadObject_failed",
+                    "inode_id=" +
+                    std::to_string(file.inode_id) +
+                    " object_id=" +
+                    slice.object_id() +
+                    " error=" +
+                    read_cntl.ErrorText());
                 return false;
             }
             if (read_resp.status().code() != zb::rpc::STATUS_OK ||
                 static_cast<uint64_t>(read_resp.data().size()) != slice.length()) {
                 ::close(fd);
                 ::unlink(local_path.c_str());
-                last_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kArchiveTaskProcessor +
-                    " subphase=ReadObject_bad_response inode_id=" + std::to_string(file.inode_id) +
-                    " object_id=" + slice.object_id() +
-                    " expected_len=" + std::to_string(slice.length()) +
-                    " actual_len=" + std::to_string(read_resp.data().size());
+                last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "ReadObject_bad_response",
+                    "inode_id=" +
+                    std::to_string(file.inode_id) +
+                    " object_id=" +
+                    slice.object_id() +
+                    " expected_len=" +
+                    std::to_string(slice.length()) +
+                    " actual_len=" +
+                    std::to_string(read_resp.data().size()));
                 return false;
             }
 
@@ -1471,10 +1521,8 @@ namespace optical_node_manager {
                            write_offset)) {
                 ::close(fd);
                 ::unlink(local_path.c_str());
-                last_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kArchiveTaskProcessor +
-                    " subphase=pwrite_failed inode_id=" + std::to_string(file.inode_id) +
-                    " offset=" + std::to_string(write_offset);
+                last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "pwrite_failed",
+                    "inode_id=" + std::to_string(file.inode_id) + " offset=" + std::to_string(write_offset));
                 return false;
             }
         }
@@ -1486,11 +1534,13 @@ namespace optical_node_manager {
                 (st.st_size > 0) ? static_cast<uint64_t>(st.st_size) : 0;
             ::close(fd);
             ::unlink(local_path.c_str());
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=verify_size_failed inode_id=" + std::to_string(file.inode_id) +
-                " expected=" + std::to_string(file.size) +
-                " actual=" + std::to_string(actual_size);
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "verify_size_failed",
+                "inode_id=" +
+                std::to_string(file.inode_id) +
+                " expected=" +
+                std::to_string(file.size) +
+                " actual=" +
+                std::to_string(actual_size));
             return false;
         }
         ::close(fd);
@@ -1505,21 +1555,18 @@ namespace optical_node_manager {
     bool OpticalNodeManager::SubmitWriteTaskForArchive(uint64_t inode_id,
                                                        const std::string& relative_path) {
         if (relative_path.empty()) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=empty_file_path inode_id=" + std::to_string(inode_id);
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "empty_file_path",
+                "inode_id=" + std::to_string(inode_id));
             return false;
         }
         if (zip_task_queue_ == nullptr || zip_task_queue_->IsClosed()) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=zip_queue_closed inode_id=" + std::to_string(inode_id);
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "zip_queue_closed",
+                "inode_id=" + std::to_string(inode_id));
             return false;
         }
         if (stop_requested_.load(std::memory_order_relaxed)) {
-            last_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kArchiveTaskProcessor +
-                " subphase=stopping inode_id=" + std::to_string(inode_id);
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "stopping",
+                "inode_id=" + std::to_string(inode_id));
             return false;
         }
 
@@ -1563,10 +1610,8 @@ namespace optical_node_manager {
                 if (!ResolveNodeAddressFromMap(node_address_map,
                                                file.target_node_id,
                                                &target_node_address)) {
-                    last_failure_reason_buf_ = std::string("phase=") +
-                        start_failure_phase::kArchiveTaskProcessor +
-                        " subphase=node_not_found target_node_id=" + file.target_node_id +
-                        " inode_id=" + std::to_string(file.inode_id);
+                    last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "node_not_found",
+                        "target_node_id=" + file.target_node_id + " inode_id=" + std::to_string(file.inode_id));
                     continue;
                 }
 
@@ -1605,7 +1650,9 @@ namespace optical_node_manager {
                 if (full_task->inode_id_num == WR_task::WRTask::INVALID_INODE_ID) {
                     MarkTaskFailed(full_task->task_id,
                                    volumemanager::ErrorCode::READ_FAILED,
-                                   "inode_id_invalid inode_id=" + full_task->inode_id);
+                                   FormatFailureDetail(start_failure_phase::kZipTaskProcessor,
+                                              "inode_id_invalid",
+                                              "inode_id=" + full_task->inode_id));
                     continue;
                 }
                 const uint64_t inode_id_num = full_task->inode_id_num;
@@ -1614,9 +1661,9 @@ namespace optical_node_manager {
                 // 当前任务登记后置 WAITING，等待批量唤醒。
                 if (volume_read_index_.ContainsVolume(full_task->volume_id)) {
                     volume_read_index_.AddTask(full_task->volume_id, full_task->task_id);
-                    full_task->ResetForRetry();
-                    full_task->state = WR_task::WRTaskState::WAITING;
+                    full_task->IncrementAttemptCount();
                     task_map_->Update(std::move(*full_task));
+                    MarkTaskState(task.task_id, WR_task::WRTaskState::WAITING);
                     continue;
                 }
 
@@ -1630,29 +1677,14 @@ namespace optical_node_manager {
                     image_dir_manager_->ReadLock();
                 }
 
-                // 命中后 Touch 推迟该卷的 LRU 淘汰；解析失败静默跳过（best-effort）。
-                auto touch_volume = [this](const std::string& volume_id_str) {
-                    if (image_dir_manager_ == nullptr) return;
-                    uint64_t parsed_volume_id = 0;
-                    std::string parsed_basename;
-                    const std::string volume_image_path =
-                        image_dir_ + "volume_" + volume_id_str + ".vimg";
-                    if (image_dir_manager_->ParseVolumeFile(volume_image_path,
-                                                            parsed_volume_id,
-                                                            parsed_basename)
-                            == volumemanager::ErrorCode::SUCCESS) {
-                        image_dir_manager_->Touch(parsed_volume_id);
-                    }
-                };
-
                 std::string output_path;
                 volumemanager::ErrorCode ret = volume_manager_.ReadFile(inode_id_num, output_path);
 
                 if (ret == volumemanager::ErrorCode::SUCCESS) {
-                    touch_volume(full_task->volume_id);
+                    TouchVolume(full_task->volume_id);
                     full_task->file_path = std::move(output_path);
-                    full_task->state = WR_task::WRTaskState::READY;
                     task_map_->Update(std::move(*full_task));
+                    MarkTaskState(task.task_id, WR_task::WRTaskState::READY);
                     continue;
                 }
 
@@ -1664,43 +1696,48 @@ namespace optical_node_manager {
                         if (ShouldGiveUpRetry(full_task->task_id)) {
                             MarkTaskFailed(full_task->task_id,
                                            volumemanager::ErrorCode::READ_FAILED,
-                                           std::string("attempt_exceeded limit=") +
-                                               std::to_string(attempt_count_max_) +
-                                               " volume_id=" + full_task->volume_id);
+                                           FormatFailureDetail(start_failure_phase::kZipTaskProcessor,
+                                                      "attempt_exceeded",
+                                                      "limit=" + std::to_string(attempt_count_max_) +
+                                                      " volume_id=" + full_task->volume_id));
                             continue;
                         }
                         volume_read_index_.AddTask(full_task->volume_id, full_task->task_id);
-                        full_task->ResetForRetry();
-                        full_task->state = WR_task::WRTaskState::WAITING;
+                        // 委托光盘库把该卷镜像加载回 image_dir_；本 READ 任务留在 WAITING，
+                        // 由加载完成后的批量读任务唤醒。
+                        // 注意：必须在 Update(std::move(...)) 之前取用 disk_id / volume_id。
+                        EnqueueCDReadTask(full_task->disk_id, full_task->volume_id);
+                        full_task->IncrementAttemptCount();
                         task_map_->Update(std::move(*full_task));
-                        read_task_queue_->Push(WR_task::WRTaskShort(full_task->task_id, WR_task::WRTaskType::READ));
+                        MarkTaskState(task.task_id, WR_task::WRTaskState::WAITING);
                         continue;
                     } else if (mount_ret == volumemanager::ErrorCode::SUCCESS) {
                         output_path.clear();
                         ret = volume_manager_.ReadFile(inode_id_num, output_path);
                         if (ret == volumemanager::ErrorCode::SUCCESS) {
-                            touch_volume(full_task->volume_id);
+                            TouchVolume(full_task->volume_id);
                             full_task->file_path = std::move(output_path);
-                            full_task->state = WR_task::WRTaskState::READY;
                             task_map_->Update(std::move(*full_task));
+                            MarkTaskState(task.task_id, WR_task::WRTaskState::READY);
                             continue;
                         }
                         // Mount 成功但 inode 缺席：真实业务错误，重试不会变 SUCCESS。
                         MarkTaskFailed(full_task->task_id,
                                        volumemanager::ErrorCode::READ_FAILED,
-                                       std::string("subphase=read_after_mount_failed ret=") +
-                                           std::to_string(static_cast<int>(ret)) +
-                                           " ret_code=" + volumemanager::GetErrorMessage(ret) +
-                                           " volume_id=" + full_task->volume_id +
-                                           " inode_id_num=" + std::to_string(inode_id_num));
+                                       FormatFailureDetail(start_failure_phase::kZipTaskProcessor,
+                                                  "read_after_mount_failed",
+                                                  "ret=" + std::to_string(static_cast<int>(ret)) +
+                                                  " ret_code=" + volumemanager::GetErrorMessage(ret) +
+                                                  " volume_id=" + full_task->volume_id +
+                                                  " inode_id_num=" + std::to_string(inode_id_num)));
                         continue;
                     } else {
                         // 不可恢复的 Mount 错误（IO_ERROR / INVALID_VOLUME_FORMAT / INVALID_VOLUME_ID）。
-                        const std::string detail =
-                            std::string("subphase=mount_volume_failed type=") +
-                            volumemanager::GetErrorMessage(mount_ret) +
+                        const std::string detail = FormatFailureDetail(
+                            start_failure_phase::kZipTaskProcessor, "mount_volume_failed",
+                            std::string("type=") + volumemanager::GetErrorMessage(mount_ret) +
                             " code=" + std::to_string(static_cast<int>(mount_ret)) +
-                            " volume_id=" + full_task->volume_id;
+                            " volume_id=" + full_task->volume_id);
                         MarkTaskFailed(full_task->task_id, volumemanager::ErrorCode::READ_FAILED, detail);
                         continue;
                     }
@@ -1714,8 +1751,7 @@ namespace optical_node_manager {
                     }
                     uint64_t parsed_volume_id = 0;
                     std::string parsed_basename;
-                    const std::string volume_image_path =
-                        image_dir_ + "volume_" + full_task->volume_id + ".vimg";
+                    const std::string volume_image_path = VolumeImagePath(full_task->volume_id);
                     const volumemanager::ErrorCode parse_ret =
                         image_dir_manager_ != nullptr
                             ? image_dir_manager_->ParseVolumeFile(volume_image_path,
@@ -1725,37 +1761,41 @@ namespace optical_node_manager {
                     if (parse_ret != volumemanager::ErrorCode::SUCCESS) {
                         MarkTaskFailed(full_task->task_id,
                                        volumemanager::ErrorCode::READ_FAILED,
-                                       "subphase=io_error_parse_failed volume_id=" +
-                                           full_task->volume_id);
+                                       FormatFailureDetail(start_failure_phase::kZipTaskProcessor,
+                                                  "io_error_parse_failed",
+                                                  "volume_id=" + full_task->volume_id));
                         continue;
                     }
                     if (ShouldGiveUpRetry(full_task->task_id)) {
                         MarkTaskFailed(full_task->task_id,
                                        volumemanager::ErrorCode::READ_FAILED,
-                                       std::string("attempt_exceeded limit=") +
-                                           std::to_string(attempt_count_max_) +
-                                           " subphase=io_error_evicted" +
-                                           " volume_id=" + full_task->volume_id);
+                                       FormatFailureDetail(start_failure_phase::kZipTaskProcessor,
+                                                  "io_error_evicted",
+                                                  "attempt_exceeded limit=" +
+                                                      std::to_string(attempt_count_max_) +
+                                                      " volume_id=" + full_task->volume_id));
                         continue;
                     }
                     // UnmountVolume 对未挂载卷返回 VOLUME_NOT_FOUND，视为幂等 no-op。
                     (void)volume_manager_.UnmountVolume(parsed_volume_id);
                     volume_read_index_.AddTask(full_task->volume_id, full_task->task_id);
-                    full_task->ResetForRetry();
-                    full_task->state = WR_task::WRTaskState::WAITING;
+                    // 镜像被换出：同样委托光盘库重新加载，本 READ 任务留在 WAITING 等唤醒。
+                    // 注意：必须在 Update(std::move(...)) 之前取用 disk_id / volume_id。
+                    EnqueueCDReadTask(full_task->disk_id, full_task->volume_id);
+                    full_task->IncrementAttemptCount();
                     task_map_->Update(std::move(*full_task));
-                    read_task_queue_->Push(
-                        WR_task::WRTaskShort(full_task->task_id, WR_task::WRTaskType::READ));
+                    MarkTaskState(task.task_id, WR_task::WRTaskState::WAITING);
                     continue;
                 }
 
                 // 兜底：未知读失败。
                 MarkTaskFailed(full_task->task_id,
                                volumemanager::ErrorCode::READ_FAILED,
-                               "subphase=read_failed ret=" +
-                                   std::to_string(static_cast<int>(ret)) +
-                                   " ret_code=" + volumemanager::GetErrorMessage(ret) +
-                                   " inode_id_num=" + std::to_string(inode_id_num));
+                               FormatFailureDetail(start_failure_phase::kZipTaskProcessor,
+                                          "read_failed",
+                                          "ret=" + std::to_string(static_cast<int>(ret)) +
+                                          " ret_code=" + volumemanager::GetErrorMessage(ret) +
+                                          " inode_id_num=" + std::to_string(inode_id_num)));
                 continue;
             } else if (full_task->type == WR_task::WRTaskType::READ_BATCH_BY_VOLUME) {
                 // 按镜像批量读：镜像就绪后集中处理该卷下所有挂起读任务。
@@ -1765,7 +1805,8 @@ namespace optical_node_manager {
                 if (full_task->volume_id.empty()) {
                     MarkTaskFailed(full_task->task_id,
                                    volumemanager::ErrorCode::READ_FAILED,
-                                   "subphase=batch_volume_id_empty");
+                                   FormatFailureDetail(start_failure_phase::kZipTaskProcessor,
+                                              "batch_volume_id_empty"));
                     continue;
                 }
 
@@ -1781,16 +1822,9 @@ namespace optical_node_manager {
                 const volumemanager::ErrorCode mount_ret =
                     volume_manager_.MountVolume(full_task->volume_id);
                 if (mount_ret == volumemanager::ErrorCode::FILE_NOT_FOUND) {
-                    // 镜像被 LRU 换出：委托 cd_manager 重新生产；本 batch 一次性 FINISH。
-                    if (cd_manager_ != nullptr) {
-                        cd_manager_sim::ReadRequest req;
-                        req.task_id = full_task->task_id;
-                        req.disk_id.clear();
-                        req.volume_id = full_task->volume_id;
-                        req.inode_id.clear();
-                        req.read_size_bytes = volume_manager_.volume_size_;
-                        (void)cd_manager_->SubmitReadTask(req);
-                    }
+                    // 镜像被 LRU 换出：派发 CD_READ 重新加载；本 batch 一次性 FINISH。
+                    // 加载完成后 OnCDReadComplete 会再派发一批 batch 唤醒仍挂起的读任务。
+                    EnqueueCDReadTask(std::string(), full_task->volume_id);
                     MarkTaskState(full_task->task_id, WR_task::WRTaskState::FINISH);
                     continue;
                 }
@@ -1799,28 +1833,18 @@ namespace optical_node_manager {
                     // 不可恢复的 Mount 错误：整批 FAILED。
                     MarkTaskFailed(full_task->task_id,
                                    volumemanager::ErrorCode::READ_FAILED,
-                                   std::string("subphase=batch_mount_failed type=") +
-                                       volumemanager::GetErrorMessage(mount_ret) +
-                                       " code_int=" +
-                                       std::to_string(static_cast<int>(mount_ret)) +
-                                       " volume_id=" + full_task->volume_id);
+                                   FormatFailureDetail(start_failure_phase::kZipTaskProcessor,
+                                              "batch_mount_failed",
+                                              std::string("type=") + volumemanager::GetErrorMessage(mount_ret) +
+                                              " code_int=" +
+                                              std::to_string(static_cast<int>(mount_ret)) +
+                                              " volume_id=" + full_task->volume_id));
                     continue;
                 }
                 // SUCCESS / INVALID_VOLUME_ID：复用挂载态处理子任务。
 
                 // 整卷 LRU 推前：推迟该卷的淘汰窗口。
-                if (image_dir_manager_ != nullptr) {
-                    uint64_t parsed_volume_id = 0;
-                    std::string parsed_basename;
-                    const std::string volume_image_path =
-                        image_dir_ + "volume_" + full_task->volume_id + ".vimg";
-                    if (image_dir_manager_->ParseVolumeFile(volume_image_path,
-                                                             parsed_volume_id,
-                                                             parsed_basename)
-                        == volumemanager::ErrorCode::SUCCESS) {
-                        image_dir_manager_->Touch(parsed_volume_id);
-                    }
-                }
+                TouchVolume(full_task->volume_id);
 
                 // 逐个处理挂起子任务：完成即从 read_index 移除。
                 const std::vector<uint64_t> sub_task_ids =
@@ -1837,8 +1861,9 @@ namespace optical_node_manager {
                     if (sub->inode_id_num == WR_task::WRTask::INVALID_INODE_ID) {
                         MarkTaskFailed(sub_tid,
                                        volumemanager::ErrorCode::READ_FAILED,
-                                       "subphase=batch_sub_inode_id_invalid" +
-                                           std::string(" inode_id=") + sub->inode_id);
+                                       FormatFailureDetail(start_failure_phase::kZipTaskProcessor,
+                                                  "batch_sub_inode_id_invalid",
+                                                  std::string("inode_id=") + sub->inode_id));
                         continue;
                     }
                     std::string output_path;
@@ -1846,17 +1871,18 @@ namespace optical_node_manager {
                         volume_manager_.ReadFile(sub->inode_id_num, output_path);
                     if (sub_ret == volumemanager::ErrorCode::SUCCESS) {
                         sub->file_path = std::move(output_path);
-                        sub->state = WR_task::WRTaskState::READY;
                         task_map_->Update(std::move(*sub));
+                        MarkTaskState(sub_tid, WR_task::WRTaskState::READY);
                     } else {
                         MarkTaskFailed(sub_tid,
                                        volumemanager::ErrorCode::READ_FAILED,
-                                       "subphase=batch_sub_read_failed ret=" +
-                                           std::to_string(static_cast<int>(sub_ret)) +
-                                           " ret_code=" +
-                                           volumemanager::GetErrorMessage(sub_ret) +
-                                           " inode_id_num=" +
-                                           std::to_string(sub->inode_id_num));
+                                       FormatFailureDetail(start_failure_phase::kZipTaskProcessor,
+                                                  "batch_sub_read_failed",
+                                                  "ret=" + std::to_string(static_cast<int>(sub_ret)) +
+                                                  " ret_code=" +
+                                                  volumemanager::GetErrorMessage(sub_ret) +
+                                                  " inode_id_num=" +
+                                                  std::to_string(sub->inode_id_num)));
                     }
                 }
 
@@ -1864,14 +1890,16 @@ namespace optical_node_manager {
                 MarkTaskState(full_task->task_id, WR_task::WRTaskState::FINISH);
                 continue;
             } else if (full_task->type == WR_task::WRTaskType::WRITE) {
-                // 写任务处理：压缩 → 删原始 → 扫描是否触发封装 → 转移 + 构造 BURN 任务。
+                // 写任务处理：压缩 → 删原始 → 扫描是否触发封装 → 转移 + 构造 CD_BURN 任务。
                 if (full_task->isTaskTerminal()) {
                     continue;
                 }
                 if (full_task->inode_id_num == WR_task::WRTask::INVALID_INODE_ID) {
                     MarkTaskFailed(full_task->task_id,
                                    volumemanager::ErrorCode::WRITE_FAILED,
-                                   "inode_id_invalid inode_id=" + full_task->inode_id);
+                                   FormatFailureDetail(start_failure_phase::kZipTaskProcessor,
+                                              "inode_id_invalid",
+                                              "inode_id=" + full_task->inode_id));
                     continue;
                 }
                 const uint64_t inode_id_num = full_task->inode_id_num;
@@ -1899,7 +1927,9 @@ namespace optical_node_manager {
                         " add_ret=" + std::to_string(static_cast<int>(add_ret));
                     MarkTaskFailed(full_task->task_id,
                                    volumemanager::ErrorCode::COMPRESS_FAILED,
-                                   "AddFileToCollect_failed " + keep_detail);
+                                   FormatFailureDetail(start_failure_phase::kZipTaskProcessor,
+                                              "AddFileToCollect_failed",
+                                              keep_detail));
                     continue;
                 }
 
@@ -1907,9 +1937,8 @@ namespace optical_node_manager {
                 const std::string original_file_path = input_file_dir_ + full_task->file_path;
                 ::unlink(original_file_path.c_str());
 
-                // 3. 状态置 FINISH（压缩完成）。
-                full_task->state = WR_task::WRTaskState::FINISH;
-                task_map_->Update(std::move(*full_task));
+                // 3. 状态置 FINISH（压缩完成）；状态一律走 MarkTaskState。
+                MarkTaskState(task.task_id, WR_task::WRTaskState::FINISH);
 
                 // 4. 扫描 temp_dir_ 判断是否已触发封装。
                 std::string packed_volume_path;
@@ -1952,12 +1981,13 @@ namespace optical_node_manager {
                 // 6. 镜像从 temp_dir_ 转移到 image_dir_/（扇平布局）并登记管理表。
                 //    失败统一 PACK_FAILED 暴露；各失败细节走 detail。
                 if (image_dir_manager_ == nullptr) {
-                    const std::string detail = std::string("phase=") +
-                        start_failure_phase::kZipTaskProcessor +
-                        " subphase=image_dir_manager_null ret=" +
+                    const std::string detail = FormatFailureDetail(start_failure_phase::kZipTaskProcessor, "image_dir_manager_null",
+                        "ret=" +
                         std::to_string(static_cast<int>(volumemanager::ErrorCode::PACK_FAILED)) +
-                        " code=" + volumemanager::GetErrorMessage(volumemanager::ErrorCode::PACK_FAILED) +
-                        " output_path=" + packed_volume_path;
+                        " code=" +
+                        volumemanager::GetErrorMessage(volumemanager::ErrorCode::PACK_FAILED) +
+                        " output_path=" +
+                        packed_volume_path);
                     MarkTaskFailed(full_task->task_id, volumemanager::ErrorCode::PACK_FAILED, detail);
                     continue;
                 }
@@ -1966,13 +1996,15 @@ namespace optical_node_manager {
                 const volumemanager::ErrorCode parse_ret =
                     image_dir_manager_->ParseVolumeFile(packed_volume_path, packed_volume_id, packed_basename);
                 if (parse_ret != volumemanager::ErrorCode::SUCCESS) {
-                    const std::string detail = std::string("phase=") +
-                        start_failure_phase::kZipTaskProcessor +
-                        " subphase=ParseVolumeFile_failed ret=" +
+                    const std::string detail = FormatFailureDetail(start_failure_phase::kZipTaskProcessor, "ParseVolumeFile_failed",
+                        "ret=" +
                         std::to_string(static_cast<int>(parse_ret)) +
-                        " code=" + volumemanager::GetErrorMessage(parse_ret) +
-                        " code_int=" + std::to_string(static_cast<int>(parse_ret)) +
-                        " output_path=" + packed_volume_path;
+                        " code=" +
+                        volumemanager::GetErrorMessage(parse_ret) +
+                        " code_int=" +
+                        std::to_string(static_cast<int>(parse_ret)) +
+                        " output_path=" +
+                        packed_volume_path);
                     MarkTaskFailed(full_task->task_id, volumemanager::ErrorCode::PACK_FAILED, detail);
                     continue;
                 }
@@ -1980,30 +2012,33 @@ namespace optical_node_manager {
                     image_dir_manager_->MoveFrom(packed_volume_path,
                                                  space_manager::ImageCategory::WRITE);
                 if (move_ret != volumemanager::ErrorCode::SUCCESS) {
-                    const std::string detail = std::string("phase=") +
-                        start_failure_phase::kZipTaskProcessor +
-                        " subphase=MoveFrom_failed ret=" +
+                    const std::string detail = FormatFailureDetail(start_failure_phase::kZipTaskProcessor, "MoveFrom_failed",
+                        "ret=" +
                         std::to_string(static_cast<int>(move_ret)) +
-                        " code=" + volumemanager::GetErrorMessage(move_ret) +
-                        " code_int=" + std::to_string(static_cast<int>(move_ret)) +
-                        " volume_id=" + std::to_string(packed_volume_id) +
-                        " src=" + packed_volume_path;
+                        " code=" +
+                        volumemanager::GetErrorMessage(move_ret) +
+                        " code_int=" +
+                        std::to_string(static_cast<int>(move_ret)) +
+                        " volume_id=" +
+                        std::to_string(packed_volume_id) +
+                        " src=" +
+                        packed_volume_path);
                     MarkTaskFailed(full_task->task_id, volumemanager::ErrorCode::PACK_FAILED, detail);
                     continue;
                 }
 
-                // 7. 用 image_dir_/ 下的新路径构造 BURN 任务。
+                // 7. 用 image_dir_/ 下的新路径构造 CD_BURN 任务。
                 const std::string final_volume_path = image_dir_ + packed_basename;
 
-                // 8. 构造 BURN 任务并入队；volume_id 来自实际产出。
-                const uint64_t generated_burn_task_id = GenerateTaskId();
-                WR_task::WRTask new_burn_task(generated_burn_task_id, WR_task::WRTaskType::BURN);
+                // 8. 构造 CD_BURN 任务并入队；volume_id 来自实际产出。
+                const uint64_t generated_cd_burn_task_id = GenerateTaskId();
+                WR_task::WRTask new_cd_burn_task(generated_cd_burn_task_id, WR_task::WRTaskType::CD_BURN);
                 const std::string packed_volume_id_str = std::to_string(packed_volume_id);
-                new_burn_task.SetBurnTask(std::string(), packed_volume_id_str, final_volume_path);
+                new_cd_burn_task.SetCDBurnTask(std::string(), packed_volume_id_str, final_volume_path);
 
-                // 9. 入 task_map_ + burn_task_queue_。
-                task_map_->Insert(std::move(new_burn_task));
-                burn_task_queue_->Push(WR_task::WRTaskShort(generated_burn_task_id, WR_task::WRTaskType::BURN));
+                // 9. 入 task_map_ + cd_burn_task_queue_。
+                task_map_->Insert(std::move(new_cd_burn_task));
+                cd_burn_task_queue_->Push(WR_task::WRTaskShort(generated_cd_burn_task_id, WR_task::WRTaskType::CD_BURN));
 
                 // 10. 上报 MDS 更新元数据（TBD）。
             }
@@ -2064,27 +2099,21 @@ namespace optical_node_manager {
         if (!MarkTaskState(event.task_id, WR_task::WRTaskState::FINISH)) {
             auto existing = task_map_->Get(event.task_id);
             if (!existing.has_value()) {
-                last_failure_reason_buf_ = std::string("phase=") +
-                    start_failure_phase::kOnCDBurnComplete +
-                    " subphase=unknown_task_id task_id=" +
-                    std::to_string(event.task_id);
+                last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "unknown_task_id",
+                    "task_id=" + std::to_string(event.task_id));
             }
             return;
         }
 
         // 烧录完成 → 释放对应写镜像；副作用失败不影响 FINISH 主语义。
         if (image_dir_manager_ == nullptr) {
-            last_sidecar_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kOnCDBurnComplete +
-                " subphase=image_dir_manager_null task_id=" +
-                std::to_string(event.task_id);
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "image_dir_manager_null",
+                "task_id=" + std::to_string(event.task_id));
             return;
         }
         if (event.image_path.empty()) {
-            last_sidecar_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kOnCDBurnComplete +
-                " subphase=empty_image_path task_id=" +
-                std::to_string(event.task_id);
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "empty_image_path",
+                "task_id=" + std::to_string(event.task_id));
             return;
         }
         uint64_t burned_volume_id = 0;
@@ -2092,31 +2121,36 @@ namespace optical_node_manager {
         const volumemanager::ErrorCode parse_ret =
             image_dir_manager_->ParseVolumeFile(event.image_path, burned_volume_id, basename);
         if (parse_ret != volumemanager::ErrorCode::SUCCESS) {
-            last_sidecar_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kOnCDBurnComplete +
-                " subphase=ParseVolumeFile_failed code=" +
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "ParseVolumeFile_failed",
+                std::string("code=") +
                 volumemanager::GetErrorMessage(parse_ret) +
-                " code_int=" + std::to_string(static_cast<int>(parse_ret)) +
-                " image_path=" + event.image_path +
-                " task_id=" + std::to_string(event.task_id);
+                " code_int=" +
+                std::to_string(static_cast<int>(parse_ret)) +
+                " image_path=" +
+                event.image_path +
+                " task_id=" +
+                std::to_string(event.task_id));
             return;
         }
         const volumemanager::ErrorCode remove_ret =
             image_dir_manager_->RemoveWriteImage(burned_volume_id);
         if (remove_ret != volumemanager::ErrorCode::SUCCESS) {
-            // 副作用失败走 sidecar，不改 BURN 主语义。
-            last_sidecar_failure_reason_buf_ = std::string("phase=") +
-                start_failure_phase::kOnCDBurnComplete +
-                " subphase=RemoveWriteImage_failed code=" +
+            // 副作用失败走 sidecar，不改 CD_BURN 主语义。
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "RemoveWriteImage_failed",
+                std::string("code=") +
                 volumemanager::GetErrorMessage(remove_ret) +
-                " code_int=" + std::to_string(static_cast<int>(remove_ret)) +
-                " volume_id=" + std::to_string(burned_volume_id) +
-                " image_path=" + event.image_path +
-                " task_id=" + std::to_string(event.task_id);
+                " code_int=" +
+                std::to_string(static_cast<int>(remove_ret)) +
+                " volume_id=" +
+                std::to_string(burned_volume_id) +
+                " image_path=" +
+                event.image_path +
+                " task_id=" +
+                std::to_string(event.task_id));
         }
     }
 
-    bool OpticalNodeManager::SubmitBurnTaskToCDManager(const WR_task::WRTask& task) {
+    bool OpticalNodeManager::SubmitCDBurnTaskToCDManager(const WR_task::WRTask& task) {
         if (cd_manager_ == nullptr) {
             return false;
         }
@@ -2140,15 +2174,15 @@ namespace optical_node_manager {
         return cd_manager_->SubmitBurnTask(request);
     }
 
-    void OpticalNodeManager::BurnTaskProcessor() {
+    void OpticalNodeManager::CDBurnTaskProcessor() {
         do {
-            auto opt_task = burn_task_queue_->Pop();
+            auto opt_task = cd_burn_task_queue_->Pop();
             if (!opt_task.has_value()) {
                 break;
             }
             WR_task::WRTaskShort task = *opt_task;
 
-            if (!MarkTaskState(task.task_id, WR_task::WRTaskState::BURNING)) {
+            if (!MarkTaskState(task.task_id, WR_task::WRTaskState::CD_BURNING)) {
                 continue;
             }
 
@@ -2157,30 +2191,74 @@ namespace optical_node_manager {
                 continue;
             }
 
-            if (!SubmitBurnTaskToCDManager(*full_task)) {
+            if (!SubmitCDBurnTaskToCDManager(*full_task)) {
                 // 提交失败：超限 → 强制 FAILED；未超限 → 保留 WAITING 重试。
                 if (ShouldGiveUpRetry(task.task_id)) {
                     MarkTaskFailed(task.task_id,
                                    volumemanager::ErrorCode::BURN_FAILED,
-                                   std::string("attempt_exceeded limit=") +
-                                       std::to_string(attempt_count_max_) +
-                                       " volume_id=" + full_task->volume_id +
-                                       " image_path=" + full_task->file_path);
+                                   FormatFailureDetail(start_failure_phase::kCDBurnTaskProcessor,
+                                              "attempt_exceeded",
+                                              "limit=" + std::to_string(attempt_count_max_) +
+                                              " volume_id=" + full_task->volume_id +
+                                              " image_path=" + full_task->file_path));
                 } else {
+                    // 先提交其它字段，状态单独走 MarkTaskState（终态保护生效）。
                     auto current = task_map_->Get(task.task_id);
                     if (current.has_value()) {
-                        current->ResetForRetry();
-                        current->state = WR_task::WRTaskState::WAITING;
+                        current->IncrementAttemptCount();
                         current->last_error_code = volumemanager::ErrorCode::BURN_FAILED;
                         current->last_error_detail = "SubmitBurnTask_rejected_by_cd_manager volume_id=" +
                                                      full_task->volume_id +
                                                      " image_path=" + full_task->file_path;
                         task_map_->Update(std::move(*current));
+                        MarkTaskState(task.task_id, WR_task::WRTaskState::WAITING);
                     }
-                    burn_task_queue_->Push(WR_task::WRTaskShort(task.task_id, WR_task::WRTaskType::BURN));
+                    cd_burn_task_queue_->Push(WR_task::WRTaskShort(task.task_id, WR_task::WRTaskType::CD_BURN));
                 }
             }
         } while (!stop_requested_.load(std::memory_order_relaxed));
+    }
+
+    void OpticalNodeManager::AppendTaskDoneLog(const WR_task::WRTask& task) {
+        if (log_dir_.empty()) {
+            return;
+        }
+
+        const uint64_t now_ms = WR_task::NowMs();
+        const std::string date_str = FormatLocalTimeMs(now_ms, "%Y%m%d");
+        const std::string now_str = FormatLocalTimeMs(now_ms, "%Y-%m-%d %H:%M:%S");
+        if (date_str.empty() || now_str.empty()) {
+            return;
+        }
+
+        const std::string log_path = log_dir_ + "task_done_" + date_str + ".log";
+        // ios::app：文件不存在时自动新建，已存在则追加到末尾。
+        std::ofstream log(log_path, std::ios::app);
+        if (!log.is_open()) {
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kCleanupTaskProcessor, "open_failed",
+                "path=" + log_path + " errno=" + std::to_string(errno));
+            return;
+        }
+
+        log << now_str
+            << " task_id=" << task.task_id
+            << " type=" << WR_task::WRTaskTypeToString(task.type)
+            << " state=" << WR_task::WRTaskStateToString(task.state)
+            << " state_changed_at="
+            << FormatLocalTimeMs(task.state_changed_at_ms, "%Y-%m-%d %H:%M:%S")
+            << " disk_id=" << task.disk_id
+            << " volume_id=" << task.volume_id
+            << " inode_id=" << task.inode_id
+            << " file_path=" << task.file_path
+            << " attempt_count=" << task.attempt_count
+            << " error_code=" << volumemanager::GetErrorMessage(task.last_error_code)
+            << '\n';
+        log.flush();
+
+        if (!log.good()) {
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kCleanupTaskProcessor, "write_failed",
+                "path=" + log_path + " task_id=" + std::to_string(task.task_id));
+        }
     }
 
     void OpticalNodeManager::CleanupTaskProcessor() {
@@ -2201,6 +2279,9 @@ namespace optical_node_manager {
                 // 读 inode_id 用于索引清理；任务可能已被并发移除，取不到则跳过。
                 auto finish_task = task_map_->Get(finish_id);
                 if (finish_task.has_value()) {
+                    // 先落审计日志再 Erase；日志写失败不影响清理。
+                    AppendTaskDoneLog(finish_task.value());
+
                     std::lock_guard<std::mutex> lock(inode_to_read_task_id_mutex_);
                     auto idx_it = inode_to_read_task_id_.find(finish_task->inode_id);
                     if (idx_it != inode_to_read_task_id_.end() && idx_it->second == finish_id) {

@@ -29,6 +29,7 @@ __pycache__/
 
 # Per-module raw test logs (test results are ignored separately).
 tests/*/log/
+/tests/benchmark/**/log/
 
 # Local experiment reports are evidence, not source deliverables.
 tests/scheduler/REPORT-*.md

@@ -98,11 +98,18 @@ private:
     uint64_t GenerateTaskId();
 
     // 取用 volume_id 前补齐 available_volume_ids：元素数少于 available_volume_id_count_ 时，
-    // 循环向 MDS 申请（AllocateAvailableImageIdFromMds），直到达到该数量。
+    // 循环本地生成（GenerateVolumeId），直到达到该数量。
     void EnsureAvailableVolumeIds();
 
-    // 向 MDS 申请一个可用 image_id；MDS 侧尚未实现，暂时返回 0 占位。
-    uint64_t AllocateAvailableImageIdFromMds();
+    // 本地递增生成一个可用 volume_id（对应 MDS 的 image_id）。
+    // MDS 的 AllocateAvailableImageId 尚未实现，暂由节点自行分配作为替代；
+    // 本地序号与 MDS 分配的 image_id 数值空间不做隔离，接入 MDS 后需整体替换。
+    uint64_t GenerateVolumeId();
+
+    // 本地递增生成一个 disk_id（对应 MDS 的 disc_id）。
+    // MDS 的 AllocateAvailableDiscId 尚未实现，且光盘库刻录细节未完善，
+    // 该值当前仅作为 CD_BURN 任务的占位标识，不参与实际调度语义。
+    std::string GenerateDiskId();
 
     // 启动 cd_manager 与后台工作线程；任一失败回滚并返回 false。
     bool StartBackgroundWorkers();
@@ -167,7 +174,8 @@ private:
     bool SubmitWriteTaskForArchive(uint64_t inode_id, const std::string& relative_path);
 
     // 封装触发后调用：扫描 temp_dir_ 剩余 temp_*.compressed，与待打包集合 diff，
-    // 并从集合移除本次已打包的 inode_id。
+    // 从集合移除本次已打包的 inode_id，并把 volume_id → inode_ids 对应关系打印到控制台
+    // （MDS 的 ReportFilesPackedToImage 上报接口未完善前的替代）。
     void ReportPackedInodes(const std::string& volume_id);
 
     // 消费 cd_burn_task_queue_，将刻录任务提交给 cd_manager。
@@ -236,6 +244,10 @@ private:
     std::atomic<bool> stop_requested_{false};
     // 异步任务 ID 单调递增计数器。
     std::atomic<uint64_t> next_task_id_{1};
+    // 本地 volume_id（对应 MDS image_id）单调递增计数器。
+    std::atomic<uint64_t> next_volume_id_{1};
+    // 本地 disk_id（对应 MDS disc_id）单调递增计数器。
+    std::atomic<uint64_t> next_disk_id_{1};
 
     // WriteObject 分片上传中的 inode 状态：累计字节数 + 预期总大小。
     // 累计 == total_size 时创建 WRITE 任务并从 map 移除；中途失败或客户端放弃则残留。

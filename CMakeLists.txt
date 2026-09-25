@@ -941,3 +941,49 @@ if(UNIX)
         endif()
     endif()
 endif()
+
+# 光存储节点归档集成测试：进程内起 fake real_node / scheduler 与真光节点服务，
+# 走完 归档下载 → 压缩 → 卷镜像封装 → 打包汇报 → CD_BURN → 数据面读 / CD_READ 重载 全链路。
+if(BUILD_TESTING)
+    add_executable(optical_node_archive_integration_test
+        tests/optical_node/optical_node_archive_integration_test.cpp
+        tests/optical_node/fake_services.cpp
+        tests/optical_node/fake_client.cpp
+        tests/optical_node/fake_real_node_data.cpp
+        src/data_node/optical_node/config/OpticalNodeConfig.cpp
+        src/data_node/optical_node/service/OpticalStorageServiceImpl.cpp
+        src/data_node/optical_node/service/BrpcOpticalNodeService.cpp
+    )
+    target_include_directories(optical_node_archive_integration_test
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/data_node/optical_node/service
+            ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
+            ${GFLAGS_INCLUDE_PATH}
+            ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    target_link_libraries(optical_node_archive_integration_test
+        PRIVATE
+            optical_node_manager
+            zb_proto
+            brpc-static
+            ${GFLAGS_LIBRARY}
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    if(BRPC_DYNAMIC_LIB)
+        target_link_libraries(optical_node_archive_integration_test PRIVATE ${BRPC_DYNAMIC_LIB})
+    endif()
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        # smoke：单卷最小闭环，分钟级；full：6 卷（容量 5 的 LRU 淘汰 + CD_READ 重载），十分钟级。
+        add_test(NAME optical_node_archive_smoke
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/optical_node/run_optical_node_archive_test.py
+                --driver $<TARGET_FILE:optical_node_archive_integration_test> --scenario smoke)
+        set_tests_properties(optical_node_archive_smoke PROPERTIES TIMEOUT 300 LABELS "optical_node;slow")
+        add_test(NAME optical_node_archive_full
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/optical_node/run_optical_node_archive_test.py
+                --driver $<TARGET_FILE:optical_node_archive_integration_test> --scenario full)
+        set_tests_properties(optical_node_archive_full PROPERTIES TIMEOUT 1500 LABELS "optical_node;slow" SKIP_RETURN_CODE 77)
+    endif()
+endif()

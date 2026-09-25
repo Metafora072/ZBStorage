@@ -6,6 +6,7 @@
 #include <ctime>
 #include <dirent.h>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <queue>
 #include <string>
@@ -597,15 +598,20 @@ namespace optical_node_manager {
     void OpticalNodeManager::EnsureAvailableVolumeIds() {
         while (available_volume_ids.size() <
                static_cast<size_t>(available_volume_id_count_)) {
-            // MDS 未实现前返回 0 占位；仍入队以保证循环终止。
-            available_volume_ids.push(AllocateAvailableImageIdFromMds());
+            available_volume_ids.push(GenerateVolumeId());
         }
     }
 
-    // 向 MDS 申请一个可用 image_id。MDS 侧尚未实现，暂时返回 0 占位。
-    // TODO: 接入 MDS AllocateAvailableImageId 后，返回 MDS 分配的全局唯一 image_id。
-    uint64_t OpticalNodeManager::AllocateAvailableImageIdFromMds() {
-        return 0;
+    // 本地递增生成 volume_id：MDS 的 AllocateAvailableImageId 尚未实现，先由节点自行分配。
+    // TODO: 接入 MDS 后改为向 MDS 申请全局唯一 image_id。
+    uint64_t OpticalNodeManager::GenerateVolumeId() {
+        return next_volume_id_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // 本地递增生成 disk_id：MDS 的 AllocateAvailableDiscId 尚未实现，先由节点自行分配。
+    // TODO: 光盘库刻录细节完善 / 接入 MDS 后，改为向 MDS 申请全局唯一 disc_id。
+    std::string OpticalNodeManager::GenerateDiskId() {
+        return std::to_string(next_disk_id_.fetch_add(1, std::memory_order_relaxed));
     }
 
     volumemanager::ErrorCode OpticalNodeManager::RequestAsyncReadFile(const std::string& disk_id,
@@ -1966,7 +1972,8 @@ namespace optical_node_manager {
                     available_volume_ids.pop();
                 }
 
-                // 5.5 从 temp_dir_ 剩余 temp_*.compressed 反推本次被打包的 inode_id 并输出。
+                // 5.5 从 temp_dir_ 剩余 temp_*.compressed 反推本次被打包的 inode_id，
+                //     并打印镜像 → inode 对应关系（MDS 上报未完善前的控制台替代）。
                 {
                     // 从 "volume_<id>.vimg" 文件名解析 volume_id。
                     const std::string basename = packed_volume_path.substr(temp_dir_.size());
@@ -2030,17 +2037,18 @@ namespace optical_node_manager {
                 // 7. 用 image_dir_/ 下的新路径构造 CD_BURN 任务。
                 const std::string final_volume_path = image_dir_ + packed_basename;
 
-                // 8. 构造 CD_BURN 任务并入队；volume_id 来自实际产出。
+                // 8. 构造 CD_BURN 任务并入队；volume_id 来自实际产出，disk_id 为本地递增生成的占位标识。
                 const uint64_t generated_cd_burn_task_id = GenerateTaskId();
                 WR_task::WRTask new_cd_burn_task(generated_cd_burn_task_id, WR_task::WRTaskType::CD_BURN);
                 const std::string packed_volume_id_str = std::to_string(packed_volume_id);
-                new_cd_burn_task.SetCDBurnTask(std::string(), packed_volume_id_str, final_volume_path);
+                new_cd_burn_task.SetCDBurnTask(GenerateDiskId(), packed_volume_id_str, final_volume_path);
 
                 // 9. 入 task_map_ + cd_burn_task_queue_。
                 task_map_->Insert(std::move(new_cd_burn_task));
                 cd_burn_task_queue_->Push(WR_task::WRTaskShort(generated_cd_burn_task_id, WR_task::WRTaskType::CD_BURN));
 
-                // 10. 上报 MDS 更新元数据（TBD）。
+                // 10. 第二次上报（镜像 → 光盘，ReportImagesBurnedToDisc）待光盘库刻录细节完善后
+                //     在 OnCDBurnComplete 中实现，本轮不实现。
             }
         } while (!stop_requested_.load(std::memory_order_relaxed));
     }
@@ -2090,8 +2098,18 @@ namespace optical_node_manager {
             }
         }
 
-        // volume_id 预留给后续上报 MDS 使用。
-        (void)volume_id;
+        // 本次打包的镜像 → inode 对应关系打印到控制台：MDS 的
+        // ReportFilesPackedToImage 上报尚未实现，先以控制台输出替代，便于单模块测试观察。
+        std::cout << "[ReportFilesPackedToImage] image_id=" << volume_id
+                  << " count=" << packed_inodes.size()
+                  << " inode_ids=";
+        for (size_t i = 0; i < packed_inodes.size(); ++i) {
+            if (i > 0) {
+                std::cout << ',';
+            }
+            std::cout << packed_inodes[i];
+        }
+        std::cout << std::endl;
     }
 
     void OpticalNodeManager::OnCDBurnComplete(const cd_manager_sim::BurnCompleteEvent& event) {

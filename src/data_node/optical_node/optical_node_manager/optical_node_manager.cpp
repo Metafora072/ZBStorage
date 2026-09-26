@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <optical_node_manager_structs.h>
+#include <space_manager/sha256.h>
 
 #include <brpc/channel.h>
 #include "real_node.pb.h"
@@ -49,6 +50,256 @@ namespace optical_node_manager {
             written += static_cast<size_t>(n);
         }
         return true;
+    }
+
+    // 循环写直到写满 len 字节；处理短写与 EINTR。失败返回 false。
+    static bool WriteAll(int fd, const char* data, size_t len) {
+        size_t written = 0;
+        while (written < len) {
+            const ssize_t n = ::write(fd, data + written, len - written);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return false;
+            }
+            if (n == 0) {
+                return false;
+            }
+            written += static_cast<size_t>(n);
+        }
+        return true;
+    }
+
+    // 顺序写入 count 个零字节（光盘各区域与镜像的对齐填充）。
+    static bool WriteZeros(int fd, uint64_t count) {
+        static const char kZeros[4096] = {0};
+        while (count > 0) {
+            const size_t chunk =
+                (count < sizeof(kZeros)) ? static_cast<size_t>(count) : sizeof(kZeros);
+            if (!WriteAll(fd, kZeros, chunk)) {
+                return false;
+            }
+            count -= chunk;
+        }
+        return true;
+    }
+
+    // 把 src_path 的全部内容顺序写入 fd，并补零到 padded_size 字节。
+    // 源文件实际大小与 expected_size 不一致（写入期间被改动）时返回 false。
+    static bool CopyFileAndPadToFd(int fd,
+                                   const std::string& src_path,
+                                   uint64_t expected_size,
+                                   uint64_t padded_size) {
+        const int src_fd = ::open(src_path.c_str(), O_RDONLY);
+        if (src_fd < 0) {
+            return false;
+        }
+        std::vector<char> buffer(1u << 20);
+        uint64_t copied = 0;
+        bool ok = true;
+        for (;;) {
+            const ssize_t n = ::read(src_fd, buffer.data(), buffer.size());
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                ok = false;
+                break;
+            }
+            if (n == 0) {
+                break;
+            }
+            if (!WriteAll(fd, buffer.data(), static_cast<size_t>(n))) {
+                ok = false;
+                break;
+            }
+            copied += static_cast<uint64_t>(n);
+        }
+        ::close(src_fd);
+        if (!ok || copied != expected_size || padded_size < expected_size) {
+            return false;
+        }
+        return WriteZeros(fd, padded_size - expected_size);
+    }
+
+    // 读取元数据区编码的镜像清单：DiscMetaHeader + entry_count 条定长记录。
+    // 文件不可读、大小与头部声明不一致、任一条记录不合法时返回 false 并清空输出。
+    static bool ReadDiscMetaFile(const std::string& path,
+                                 std::vector<DiscImageEntry>& out_entries) {
+        out_entries.clear();
+
+        struct stat st {};
+        if (::stat(path.c_str(), &st) != 0 || st.st_size <= 0) {
+            return false;
+        }
+        std::vector<uint8_t> buffer(static_cast<size_t>(st.st_size));
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            return false;
+        }
+        size_t read_total = 0;
+        bool read_ok = true;
+        while (read_total < buffer.size()) {
+            const ssize_t n = ::read(fd, buffer.data() + read_total, buffer.size() - read_total);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                read_ok = false;
+                break;
+            }
+            if (n == 0) {
+                break;
+            }
+            read_total += static_cast<size_t>(n);
+        }
+        ::close(fd);
+        if (!read_ok || read_total != buffer.size()) {
+            return false;
+        }
+
+        DiscMetaHeader header;
+        if (!DiscMetaHeader::Parse(buffer.data(), buffer.size(), header)) {
+            return false;
+        }
+        if (DiscMetaAreaSize(header.entry_count) != buffer.size()) {
+            return false;
+        }
+
+        out_entries.reserve(header.entry_count);
+        for (uint32_t i = 0; i < header.entry_count; ++i) {
+            DiscImageEntry entry;
+            const size_t record_offset =
+                DISC_META_HEADER_SIZE + static_cast<size_t>(i) * DISC_IMAGE_RECORD_SIZE;
+            if (!DiscImageEntry::Parse(buffer.data() + record_offset, DISC_IMAGE_RECORD_SIZE,
+                                       entry)) {
+                out_entries.clear();
+                return false;
+            }
+            out_entries.push_back(entry);
+        }
+        return true;
+    }
+
+    // 解析十进制无符号整数串（要求非空且全为数字）；失败返回 false。
+    static bool ParseUint64Decimal(const std::string& text, uint64_t& out) {
+        if (text.empty()) {
+            return false;
+        }
+        for (char c : text) {
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        try {
+            size_t consumed = 0;
+            const unsigned long long value = std::stoull(text, &consumed);
+            if (consumed != text.size()) {
+                return false;
+            }
+            out = static_cast<uint64_t>(value);
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+
+    // 从光盘文件中复制出 [offset, offset+size) 区间，写入 dst_path（O_TRUNC 新建）。
+    // 光盘文件缺失、越界或读写失败时返回 false 并清理半成品。
+    static bool ExtractRangeFromDisc(const std::string& disc_path,
+                                     const std::string& dst_path,
+                                     uint64_t offset,
+                                     uint64_t size) {
+        if (size == 0) {
+            return false;
+        }
+        const int src_fd = ::open(disc_path.c_str(), O_RDONLY);
+        if (src_fd < 0) {
+            return false;
+        }
+        struct stat st {};
+        if (::fstat(src_fd, &st) != 0 || st.st_size <= 0 ||
+            offset + size > static_cast<uint64_t>(st.st_size)) {
+            // 元数据记录的区间超出光盘文件范围：不读、不写半成品。
+            ::close(src_fd);
+            return false;
+        }
+
+        const int dst_fd = ::open(dst_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (dst_fd < 0) {
+            ::close(src_fd);
+            return false;
+        }
+
+        std::vector<char> buffer(1u << 20);
+        uint64_t remaining = size;
+        bool ok = true;
+        while (remaining > 0) {
+            const size_t want =
+                (remaining < buffer.size()) ? static_cast<size_t>(remaining) : buffer.size();
+            const ssize_t n = ::pread(src_fd, buffer.data(), want,
+                                      static_cast<off_t>(offset + (size - remaining)));
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                ok = false;
+                break;
+            }
+            if (n == 0) {
+                ok = false;
+                break;
+            }
+            if (!WriteAll(dst_fd, buffer.data(), static_cast<size_t>(n))) {
+                ok = false;
+                break;
+            }
+            remaining -= static_cast<uint64_t>(n);
+        }
+        ::close(src_fd);
+        if (::close(dst_fd) != 0) {
+            ok = false;
+        }
+        if (!ok) {
+            ::unlink(dst_path.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    // 把 value 向上对齐到 alignment 的整数倍；alignment 为 0 时原样返回。
+    static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
+        if (alignment == 0) {
+            return value;
+        }
+        const uint64_t remainder = value % alignment;
+        return (remainder == 0) ? value : value + (alignment - remainder);
+    }
+
+    // 元数据区占用的字节数：按标准镜像数预留（实际条数超过基线时按实际条数），
+    // 并对齐到光盘数据块。
+    static uint64_t MetadataAreaBytes(uint64_t entry_count,
+                                      uint32_t standard_images_per_disc,
+                                      uint64_t block_size_bytes) {
+        const uint64_t reserved =
+            std::max<uint64_t>(entry_count, static_cast<uint64_t>(standard_images_per_disc));
+        return AlignUp(DiscMetaAreaSize(reserved), block_size_bytes);
+    }
+
+    // 按 [超级块][元数据区][数据区] 布局回填每条记录的 aligned_size_bytes /
+    // offset_in_disc，并返回整张光盘占用的总字节数。三个区域与每个镜像均按数据块对齐。
+    static uint64_t FillDiscLayout(std::vector<DiscImageEntry>& entries,
+                                   uint32_t standard_images_per_disc,
+                                   uint64_t block_size_bytes) {
+        uint64_t cursor = AlignUp(DISC_SUPERBLOCK_SIZE, block_size_bytes) +
+                          MetadataAreaBytes(entries.size(), standard_images_per_disc, block_size_bytes);
+        for (DiscImageEntry& entry : entries) {
+            entry.aligned_size_bytes = AlignUp(entry.image_size_bytes, block_size_bytes);
+            entry.offset_in_disc = cursor;
+            cursor += entry.aligned_size_bytes;
+        }
+        return cursor;
     }
 
     // 把 epoch 毫秒时间戳格式化为本地时间字符串；localtime_r / strftime 失败时返回空串。
@@ -116,6 +367,8 @@ namespace optical_node_manager {
                                            uint8_t available_volume_id_count,
                                            uint64_t disc_capacity_bytes,
                                            uint32_t standard_images_per_disc,
+                                           uint64_t disc_block_size_bytes,
+                                           uint32_t max_write_images,
                                            const std::string& scheduler_addr)
         : volume_manager_(volume_size, size_threshold),
           cd_read_task_queue_(new WR_task::WRTaskQueue()),
@@ -130,6 +383,8 @@ namespace optical_node_manager {
         available_volume_id_count_ = available_volume_id_count;
         disc_capacity_bytes_ = disc_capacity_bytes;
         standard_images_per_disc_ = standard_images_per_disc;
+        disc_block_size_bytes_ = disc_block_size_bytes;
+        max_write_images_ = max_write_images < 1 ? 1 : max_write_images;
     }
 
     // 把字符串先拷到成员变量再发布指针，避免栈上临时 string 析构导致悬空。
@@ -171,6 +426,16 @@ namespace optical_node_manager {
             detail += last_sidecar_failure_reason_buf_;
             detail += ")";
         }
+        // 追加归档下载背压快照：下载停住时用于判断是「写镜像占满」还是「原始文件积压」，
+        // 抑或只是配额节拍（两者都未过载）。
+        const ArchiveBackpressureState backpressure = GetArchiveBackpressureState();
+        detail += " backpressure=(throttled=";
+        detail += backpressure.throttled ? "true" : "false";
+        detail += " write_images=" + std::to_string(backpressure.write_images) + "/" +
+                  std::to_string(backpressure.write_image_limit);
+        detail += " input_pending=" + std::to_string(backpressure.input_pending_bytes) + "/" +
+                  std::to_string(backpressure.input_pending_limit);
+        detail += ")";
         return detail;
     }
 
@@ -240,6 +505,11 @@ namespace optical_node_manager {
             StopBackgroundWorkers();
             return false;
         }
+
+        // 重启后从 node_discs_meta 恢复「镜像 → 光盘」定位索引，
+        // 否则已刻录光盘的读回请求无法定位 vdisc 与偏移。
+        RebuildDiscImageIndex();
+
         if (!StartBackgroundWorkers()) {
             // StartBackgroundWorkers 已写完整结构化 KV，直接转发给 SetStatus。
             SetStatus(manager_status::kStartFailed, last_failure_reason_buf_);
@@ -398,18 +668,6 @@ namespace optical_node_manager {
                 RollbackCreatedDirs(created_dirs);
                 return false;
             }
-            // 注入模拟光盘库目录：Release / LRU 换出 / 刻录释放时 rename 到此处。
-            const volumemanager::ErrorCode disc_sim_ret =
-                space_manager_->SetDiscSimDir(disc_sim_dir_);
-            if (disc_sim_ret != volumemanager::ErrorCode::SUCCESS) {
-                last_failure_reason_buf_ = std::string("SpaceManager_SetDiscSimDir_failed code=")
-                    + std::to_string(static_cast<int>(disc_sim_ret))
-                    + " disc_sim_dir=" + disc_sim_dir_;
-                space_manager_.reset();
-                rollback_volume_manager();
-                RollbackCreatedDirs(created_dirs);
-                return false;
-            }
         } catch (const std::exception& e) {
             last_failure_reason_buf_ = std::string("SpaceManager_init_failed what=") + e.what();
             space_manager_.reset();
@@ -426,6 +684,116 @@ namespace optical_node_manager {
 
         last_failure_reason_buf_.clear();
         return true;
+    }
+
+    void OpticalNodeManager::RebuildDiscImageIndex() {
+        {
+            std::lock_guard<std::mutex> lock(disc_image_index_mutex_);
+            disc_image_index_.clear();
+        }
+
+        const std::string path = meta_dir_ + "node_discs_meta";
+        struct stat st {};
+        if (::stat(path.c_str(), &st) != 0) {
+            // 首次启动尚无该文件：空索引即为正确状态。
+            return;
+        }
+        if (st.st_size <= 0) {
+            return;
+        }
+
+        // 全量读入后顺序扫描：文件为「32B 块头 + entry_count×128B 记录」的追加序列，
+        // 规模与镜像总数成正比（每镜像 128B），一次读入可接受。
+        std::vector<uint8_t> buffer(static_cast<size_t>(st.st_size));
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(
+                start_failure_phase::kRebuildDiscImageIndex, "open_failed",
+                "path=" + path + " errno=" + std::to_string(errno));
+            return;
+        }
+        size_t read_total = 0;
+        bool read_ok = true;
+        while (read_total < buffer.size()) {
+            const ssize_t n = ::read(fd, buffer.data() + read_total, buffer.size() - read_total);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                read_ok = false;
+                break;
+            }
+            if (n == 0) {
+                break;
+            }
+            read_total += static_cast<size_t>(n);
+        }
+        ::close(fd);
+        if (!read_ok || read_total != buffer.size()) {
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(
+                start_failure_phase::kRebuildDiscImageIndex, "read_failed",
+                "path=" + path + " read=" + std::to_string(read_total) +
+                " size=" + std::to_string(buffer.size()));
+            return;
+        }
+
+        std::unordered_map<uint64_t, DiscImageLocation> rebuilt;
+        size_t cursor = 0;
+        size_t parsed_blocks = 0;
+        bool complete = true;
+        while (cursor < buffer.size()) {
+            DiscIndexHeader header;
+            if (!DiscIndexHeader::Parse(buffer.data() + cursor, buffer.size() - cursor, header)) {
+                complete = false;
+                break;
+            }
+            const uint64_t block_bytes =
+                DISC_INDEX_HEADER_SIZE +
+                static_cast<uint64_t>(header.entry_count) * DISC_IMAGE_RECORD_SIZE;
+            // 块不完整（进程中断留下的残块）→ 停止扫描，保留此前已解析的块。
+            if (block_bytes > buffer.size() - cursor) {
+                complete = false;
+                break;
+            }
+
+            const std::string disk_id = std::to_string(header.disc_id);
+            bool block_ok = true;
+            for (uint32_t i = 0; i < header.entry_count; ++i) {
+                DiscImageEntry entry;
+                const size_t record_offset =
+                    cursor + DISC_INDEX_HEADER_SIZE + static_cast<size_t>(i) * DISC_IMAGE_RECORD_SIZE;
+                if (!DiscImageEntry::Parse(buffer.data() + record_offset, DISC_IMAGE_RECORD_SIZE,
+                                           entry)) {
+                    block_ok = false;
+                    break;
+                }
+                DiscImageLocation location;
+                location.disk_id = disk_id;
+                location.offset_in_disc = entry.offset_in_disc;
+                location.image_size_bytes = entry.image_size_bytes;
+                location.sha256_hex = entry.sha256_hex;
+                rebuilt[entry.volume_id] = std::move(location);
+            }
+            if (!block_ok) {
+                complete = false;
+                break;
+            }
+            cursor += block_bytes;
+            ++parsed_blocks;
+        }
+
+        if (!complete) {
+            // 不阻塞启动：已解析的块仍可正常读回，未恢复的镜像读回时会明确失败。
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(
+                start_failure_phase::kRebuildDiscImageIndex, "node_discs_meta_truncated",
+                "path=" + path +
+                " parsed_blocks=" + std::to_string(parsed_blocks) +
+                " parsed_bytes=" + std::to_string(cursor) +
+                " size=" + std::to_string(buffer.size()));
+        }
+
+        std::lock_guard<std::mutex> lock(disc_image_index_mutex_);
+        disc_image_index_ = std::move(rebuilt);
     }
 
     // 倒序删除本次 InitializeDir 新建的目录；非空 / 无权限时静默跳过。
@@ -534,6 +902,12 @@ namespace optical_node_manager {
         if (archive_task_queue_ != nullptr) {
             archive_task_queue_->Close();
         }
+        // 唤醒可能阻塞在背压等待上的归档线程：让它看到 stop / 队列已关闭后退出。
+        // 需持背压锁 notify，避免通知落在等待方「判定谓词 → 进入睡眠」窗口内而丢失（会导致 join 卡死）。
+        {
+            std::lock_guard<std::mutex> lock(archive_backpressure_mutex_);
+            archive_backpressure_cv_.notify_all();
+        }
 
         if (archive_task_thread_.joinable()) {
             archive_task_thread_.join();
@@ -615,9 +989,10 @@ namespace optical_node_manager {
     }
 
     // 本地递增生成 disk_id：MDS 的 AllocateAvailableDiscId 尚未实现，先由节点自行分配。
+    // 返回数值形式；落任务 / 拼文件名时取其十进制字符串。
     // TODO: 光盘库刻录细节完善 / 接入 MDS 后，改为向 MDS 申请全局唯一 disc_id。
-    std::string OpticalNodeManager::GenerateDiskId() {
-        return std::to_string(next_disk_id_.fetch_add(1, std::memory_order_relaxed));
+    uint64_t OpticalNodeManager::GenerateDiskId() {
+        return next_disk_id_.fetch_add(1, std::memory_order_relaxed);
     }
 
     volumemanager::ErrorCode OpticalNodeManager::RequestAsyncReadFile(const std::string& disk_id,
@@ -979,45 +1354,74 @@ namespace optical_node_manager {
             return;
         }
 
-        // 镜像从 disc_sim_dir_ 转移到 image_dir_/ 并登记到 space_manager_（扇平布局）。
-        // 与 WRITE 链路 (PackVolume + MoveFrom) 形成对称；失败走 sidecar，不阻塞 CD_READ 收尾。
+        // 从 vdisc 中按元数据记录的偏移与大小提取该卷镜像，落到 disc_sim_dir_ 下作为
+        // MoveFrom 的跳板，再 rename 进 image_dir_ 并登记（vdisc 持久保留，只读不搬移）。
+        // 失败走 sidecar，不阻塞 CD_READ 收尾。
         if (space_manager_ != nullptr) {
-            const std::string src_image_path =
-                disc_sim_dir_ + "volume_" + event.volume_id + ".vimg";
-
+            // 1. 按 volume_id 在 node_discs_meta 的内存索引中定位所在光盘与区间。
             uint64_t read_volume_id = 0;
-            std::string read_basename;
-            const volumemanager::ErrorCode parse_ret =
-                space_manager_->ParseVolumeFile(src_image_path, read_volume_id, read_basename);
-            if (parse_ret == volumemanager::ErrorCode::SUCCESS) {
-                const volumemanager::ErrorCode move_ret =
-                    space_manager_->MoveFrom(src_image_path,
-                                                 space_manager::ImageCategory::READ);
-                if (move_ret != volumemanager::ErrorCode::SUCCESS) {
-                    // 副作用失败：不影响 CD_READ 收尾，sidecar 记录便于运维排查。
-                    last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDReadComplete, "MoveFrom_failed",
-                        std::string("code=") +
-                        volumemanager::GetErrorMessage(move_ret) +
-                        " code_int=" +
-                        std::to_string(static_cast<int>(move_ret)) +
-                        " src=" +
-                        src_image_path +
-                        " dst=image_dir_/" +
-                        read_basename +
-                        " task_id=" +
-                        std::to_string(event.task_id));
+            DiscImageLocation location;
+            bool located = false;
+            if (ParseUint64Decimal(event.volume_id, read_volume_id)) {
+                std::lock_guard<std::mutex> lock(disc_image_index_mutex_);
+                const auto it = disc_image_index_.find(read_volume_id);
+                if (it != disc_image_index_.end()) {
+                    location = it->second;
+                    located = true;
                 }
+            }
+            if (!located) {
+                last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDReadComplete, "image_location_not_found",
+                    "volume_id=" + event.volume_id +
+                    " task_id=" + std::to_string(event.task_id));
             } else {
-                // 解析失败：兜底未来 cd_manager 落盘命名变更；sidecar 记录。
-                last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDReadComplete, "ParseVolumeFile_failed",
-                    std::string("code=") +
-                    volumemanager::GetErrorMessage(parse_ret) +
-                    " code_int=" +
-                    std::to_string(static_cast<int>(parse_ret)) +
-                    " src=" +
-                    src_image_path +
-                    " task_id=" +
-                    std::to_string(event.task_id));
+                const std::string disc_path = disc_sim_dir_ + "disc_" + location.disk_id + ".vdisc";
+                const std::string extracted_path =
+                    disc_sim_dir_ + "volume_" + std::to_string(read_volume_id) + ".vimg";
+
+                // 2. 从 vdisc 复制出该镜像区间（vdisc 本身不再被搬移/删除）。
+                if (!ExtractRangeFromDisc(disc_path, extracted_path, location.offset_in_disc,
+                                          location.image_size_bytes)) {
+                    (void)::unlink(extracted_path.c_str());
+                    last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDReadComplete, "ExtractRangeFromDisc_failed",
+                        "disc_path=" + disc_path +
+                        " offset=" + std::to_string(location.offset_in_disc) +
+                        " size=" + std::to_string(location.image_size_bytes) +
+                        " volume_id=" + std::to_string(read_volume_id) +
+                        " task_id=" + std::to_string(event.task_id));
+                } else {
+                    // 3. 校验提取内容与元数据记录的 SHA-256 一致（镜像级完整性校验）。
+                    std::string extracted_sha256;
+                    if (!space_manager::Sha256FileHex(extracted_path, &extracted_sha256) ||
+                        extracted_sha256 != location.sha256_hex) {
+                        (void)::unlink(extracted_path.c_str());
+                        last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDReadComplete, "sha256_mismatch",
+                            "volume_id=" + std::to_string(read_volume_id) +
+                            " expected=" + location.sha256_hex +
+                            " actual=" + extracted_sha256 +
+                            " disc_path=" + disc_path +
+                            " task_id=" + std::to_string(event.task_id));
+                    } else {
+                        // 4. 跳板 rename 进 image_dir_ 并登记（复用容量 / LRU / 回滚逻辑）。
+                        const volumemanager::ErrorCode move_ret =
+                            space_manager_->MoveFrom(extracted_path,
+                                                     space_manager::ImageCategory::READ);
+                        if (move_ret != volumemanager::ErrorCode::SUCCESS) {
+                            (void)::unlink(extracted_path.c_str());
+                            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDReadComplete, "MoveFrom_failed",
+                                std::string("code=") +
+                                volumemanager::GetErrorMessage(move_ret) +
+                                " code_int=" +
+                                std::to_string(static_cast<int>(move_ret)) +
+                                " src=" +
+                                extracted_path +
+                                " volume_id=" +
+                                std::to_string(read_volume_id) +
+                                " task_id=" +
+                                std::to_string(event.task_id));
+                        }
+                    }
+                }
             }
         } else {
             // space_manager_ 未就绪：后续 MountVolume 大概率 FILE_NOT_FOUND；仅 sidecar。
@@ -1271,6 +1675,117 @@ namespace optical_node_manager {
         munmap(addr, effective_size);
         close(fd);
         return volumemanager::ErrorCode::SUCCESS;
+    }
+
+    ArchiveBackpressureState OpticalNodeManager::GetArchiveBackpressureState() const {
+        ArchiveBackpressureState state;
+        state.write_image_limit = max_write_images_;
+        if (space_manager_ != nullptr) {
+            state.write_images = space_manager_->GetWriteImageCount();
+        }
+
+        // 硬编码：原始文件积压阈值 = 卷镜像容量的 10%，避免一次性下载太多原始文件。
+        state.input_pending_limit = volume_manager_.volume_size_ / 10;
+        state.input_pending_bytes = EstimateInputPendingBytes();
+
+        state.write_overloaded =
+            state.write_image_limit > 0 && state.write_images >= state.write_image_limit;
+        state.input_overloaded =
+            state.input_pending_limit > 0 && state.input_pending_bytes >= state.input_pending_limit;
+        state.throttled = state.write_overloaded || state.input_overloaded;
+        return state;
+    }
+
+    uint64_t OpticalNodeManager::EstimateInputPendingBytes() const {
+        if (input_file_dir_.empty()) {
+            return 0;
+        }
+        // 粗略估算：不加锁，并发写入期间 readdir 可能漏项，对背压判断足够。
+        std::unique_ptr<DIR, decltype(&closedir)> dir(opendir(input_file_dir_.c_str()), closedir);
+        if (!dir) {
+            return 0;
+        }
+        uint64_t total = 0;
+        struct dirent* entry = nullptr;
+        while ((entry = readdir(dir.get())) != nullptr) {
+            const std::string name(entry->d_name);
+            if (name == "." || name == "..") {
+                continue;
+            }
+            struct stat st {};
+            if (::stat((input_file_dir_ + name).c_str(), &st) != 0) {
+                continue;
+            }
+            if (S_ISREG(st.st_mode)) {
+                total += static_cast<uint64_t>(st.st_size);
+            }
+        }
+        return total;
+    }
+
+    bool OpticalNodeManager::WaitIfArchiveDownloadThrottled() {
+        const uint64_t round_quota = volume_manager_.volume_size_;
+        const bool round_exhausted =
+            round_quota > 0 && archive_round_downloaded_bytes_ >= round_quota;
+        const bool load_throttled = GetArchiveBackpressureState().throttled;
+        if (!round_exhausted && !load_throttled) {
+            return true;
+        }
+
+        std::unique_lock<std::mutex> lock(archive_backpressure_mutex_);
+
+        // ① 负载过载（写镜像达上限 / 原始文件积压超阈值）：必须等负载真正降下来。
+        if (load_throttled) {
+            archive_backpressure_cv_.wait(lock, [this] {
+                return stop_requested_.load(std::memory_order_relaxed) ||
+                       archive_task_queue_->IsClosed() ||
+                       !GetArchiveBackpressureState().throttled;
+            });
+            if (stop_requested_.load(std::memory_order_relaxed) ||
+                archive_task_queue_->IsClosed()) {
+                return false;
+            }
+        }
+
+        // ② 本轮配额用尽：等「本轮提交的待压缩文件都被压缩完」。
+        //    用「轮次内已完成的压缩次数 ≥ 本轮提交任务数」而不是「seq 发生变化」：
+        //    否则若这些文件在本线程进入等待前就已压完，seq 不会再变、也不再有新文件下载
+        //    → 永久挂死；而按此判定时条件已满足则直接放行（不必空睡）。
+        //    注意：这里是计数是全局累计的，因此上一轮残留未压完的文件也会被计入（略偏保守）。
+        if (round_exhausted) {
+            archive_backpressure_cv_.wait(lock, [this] {
+                if (stop_requested_.load(std::memory_order_relaxed) ||
+                    archive_task_queue_->IsClosed()) {
+                    return true;
+                }
+                // 逃生条件：压缩队列已空 → 本轮提交的压缩要么已完成、要么永远不会来
+                // （例如压缩失败被置 FAILED），继续等就是睡死。
+                // 放松节拍不会失控：步骤 11 的「原始文件积压阈值」仍独立限流。
+                if (zip_task_queue_ == nullptr || zip_task_queue_->Size() == 0) {
+                    return true;
+                }
+                const uint64_t progressed = zip_compress_completed_seq_ - archive_round_start_seq_;
+                return progressed >= archive_round_submitted_tasks_;
+            });
+            if (stop_requested_.load(std::memory_order_relaxed) ||
+                archive_task_queue_->IsClosed()) {
+                return false;
+            }
+        }
+
+        // 唤醒即开启新一轮：配额与提交计数清零，并以当前压缩进度作为新一轮基准。
+        archive_round_downloaded_bytes_ = 0;
+        archive_round_submitted_tasks_ = 0;
+        archive_round_start_seq_ = zip_compress_completed_seq_;
+        return true;
+    }
+
+    void OpticalNodeManager::NotifyArchiveCompressionProgress() {
+        // 必须在持背压锁下递增计数并唤醒：等待方的「判定谓词 → 进入睡眠」是在持锁下完成的，
+        // 若通知方不在持锁下 notify，通知可能恰好落进该窗口而丢失 → 永久睡死。
+        std::lock_guard<std::mutex> lock(archive_backpressure_mutex_);
+        ++zip_compress_completed_seq_;
+        archive_backpressure_cv_.notify_all();
     }
 
     // 向 scheduler 拉取全量节点视图并建立 node_id -> node_address 临时映射。
@@ -1594,29 +2109,71 @@ namespace optical_node_manager {
         return true;
     }
 
-    // 归档任务消费线程：从 archive_task_queue_ 取出批次，每批次重建一次节点映射，
+    // 归档任务消费线程（下载线程）：从 archive_task_queue_ 取 MDS 批次，重建节点映射，
     // 再逐文件下载（real_node 分片重组）并建 WRITE 任务入 zip_task_queue_。
+    //
+    // 数据流与背压反馈：
+    //   MDS ──SendArchiveMetadata──▶ archive_task_queue_
+    //     └▶ ArchiveTaskProcessor（本函数）
+    //          ├─ BuildNodeAddressMap()      ← scheduler GetClusterView（每次重新开始处理时刷新）
+    //          ├─ DownloadArchiveFile()      ← real_node ResolveFileRead / ReadObject
+    //          │       └─▶ input_file_dir_/<inode_id>.archive
+    //          └─ SubmitWriteTaskForArchive() ─▶ zip_task_queue_ + task_map_
+    //                                              └▶ ZipTaskProcessor（压缩线程）
+    //                                                   ├─ AddFileToCollect：压缩累加进卷镜像
+    //                                                   ├─ unlink input/<inode_id>.archive
+    //                                                   └─ NotifyArchiveCompressionProgress() ← 唤醒本线程
+    //
+    // 本线程会阻塞在两个地方，唤醒来源不同（排查「下载不动」时按此二分）：
+    //   ① WaitIfArchiveDownloadThrottled 的背压 CV：
+    //        - ZipTaskProcessor 每完成一次压缩（NotifyArchiveCompressionProgress）：原始文件被消化；
+    //        - 刻录完成释放写镜像后（WriteVdiscAndReleaseImages 内，运行在 cd_manager 线程）：
+    //          写镜像占用下降；
+    //        - StopBackgroundWorkers 关队列后的 notify_all ——停机兜底。
+    //      规则：凡是「能解除阻塞条件（写镜像占用下降 / 原始文件被消化）」的事件都必须 notify，
+    //      漏一个就会永久睡死（曾因漏掉「刻录完成释放」而在 smoke 里挂住）。
+    //      另注意：配额节拍的推进完全依赖 Zip 的压缩进度，因此「下载不动」有可能是
+    //      「压缩没进展」（例如大镜像压缩耗时长、或本轮文件全都没能提交到压缩队列）。
+    //   ② archive_task_queue_->Pop()：
+    //        - MDS 新归档请求到达（Push 内部 notify_one）——全部请求下完后停在这里等新请求；
+    //        - 队列 Close（停机）。
     void OpticalNodeManager::ArchiveTaskProcessor() {
         while (!stop_requested_.load(std::memory_order_relaxed)) {
-            auto opt_request = archive_task_queue_->Pop();
-            if (!opt_request.has_value()) {
-                // 队列已 Close：退出消费循环。
-                break;
+            // 取一个 MDS 批次作为本轮起点；若上一轮阻塞在批次中间，断点仍然有效、不重复取队。
+            if (!pending_archive_request_.has_value()) {
+                auto opt_request = archive_task_queue_->Pop();
+                if (!opt_request.has_value()) {
+                    // 队列已 Close：退出消费循环。全部请求下完后也停在这里等新请求。
+                    break;
+                }
+                pending_archive_request_ = std::move(*opt_request);
+                pending_archive_file_index_ = 0;
             }
 
-            const SendArchiveMetadataRequest& request = *opt_request;
-
-            // 步骤 1：每批次重建一次节点映射，避免地址过期。
+            // 步骤 1：每次（重新）开始处理时重建节点映射，避免等待期间地址过期。
             std::unordered_map<std::string, std::string> node_address_map;
             if (!BuildNodeAddressMap(&node_address_map)) {
+                // 映射失败：丢弃当前批次，避免卡在同一批次上反复失败。
+                pending_archive_request_.reset();
+                pending_archive_file_index_ = 0;
                 continue;
             }
 
-            // 步骤 2：逐文件下载 + 建 WRITE 任务。
-            for (const ArchiveFileInfo& file : request.files) {
+            // 步骤 2：从断点起逐文件下载 + 建 WRITE 任务；每个文件前做一次背压检查
+            // （本轮下载量达 volume_size，或写镜像/原始文件积压过载）。
+            bool stop_consuming = false;
+            while (pending_archive_file_index_ < pending_archive_request_->files.size()) {
                 if (stop_requested_.load(std::memory_order_relaxed)) {
+                    stop_consuming = true;
                     break;
                 }
+                if (!WaitIfArchiveDownloadThrottled()) {
+                    stop_consuming = true;
+                    break;
+                }
+
+                const ArchiveFileInfo& file =
+                    pending_archive_request_->files[pending_archive_file_index_];
 
                 std::string target_node_address;
                 if (!ResolveNodeAddressFromMap(node_address_map,
@@ -1624,20 +2181,36 @@ namespace optical_node_manager {
                                                &target_node_address)) {
                     last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kArchiveTaskProcessor, "node_not_found",
                         "target_node_id=" + file.target_node_id + " inode_id=" + std::to_string(file.inode_id));
+                    ++pending_archive_file_index_;
                     continue;
                 }
 
                 std::string relative_path;
                 if (!DownloadArchiveFile(file, target_node_address, &relative_path)) {
+                    ++pending_archive_file_index_;
                     continue;
                 }
 
+                // 本轮下载量按文件原始大小累计（与卷镜像容量的口径一致）。
+                archive_round_downloaded_bytes_ += file.size;
+
                 if (!SubmitWriteTaskForArchive(file.inode_id, relative_path)) {
-                    // 队列已关闭 / 正在停止：清理已下载文件，避免残留，并退出本批次。
+                    // 队列已关闭 / 正在停止：清理已下载文件，避免残留，并退出消费循环。
                     ::unlink((input_file_dir_ + relative_path).c_str());
+                    stop_consuming = true;
                     break;
                 }
+                ++archive_round_submitted_tasks_;
+                ++pending_archive_file_index_;
             }
+
+            if (stop_consuming) {
+                break;
+            }
+
+            // 当前 MDS 批次已下完：清空断点，回到外层取下一个批次（本轮配额跨批次累计）。
+            pending_archive_request_.reset();
+            pending_archive_file_index_ = 0;
         }
     }
 
@@ -1949,6 +2522,10 @@ namespace optical_node_manager {
                 const std::string original_file_path = input_file_dir_ + full_task->file_path;
                 ::unlink(original_file_path.c_str());
 
+                // 背压反馈：一次压缩完成意味着流水线前进一步（原始文件已消化、写镜像占用可能下降），
+                // 唤醒可能正在等待的归档下载线程。
+                NotifyArchiveCompressionProgress();
+
                 // 3. 状态置 FINISH（压缩完成）；状态一律走 MarkTaskState。
                 MarkTaskState(task.task_id, WR_task::WRTaskState::FINISH);
 
@@ -2040,21 +2617,25 @@ namespace optical_node_manager {
                     continue;
                 }
 
-                // 7. 用 image_dir_/ 下的新路径构造 CD_BURN 任务。
+                // 7. 把 image_dir_/ 下的写镜像纳入待打包光盘：计算 SHA-256、按容量判定是否
+                //    触发封印、追加待打包集合并原子重写 meta/pending_disc_meta。
                 const std::string final_volume_path = image_dir_ + packed_basename;
+                const volumemanager::ErrorCode accumulate_ret =
+                    AccumulatePackedImage(final_volume_path, packed_volume_id);
+                if (accumulate_ret != volumemanager::ErrorCode::SUCCESS) {
+                    MarkTaskFailed(full_task->task_id,
+                                   volumemanager::ErrorCode::PACK_FAILED,
+                                   FormatFailureDetail(start_failure_phase::kZipTaskProcessor,
+                                              "AccumulatePackedImage_failed",
+                                              "ret=" + std::to_string(static_cast<int>(accumulate_ret)) +
+                                              " code=" + volumemanager::GetErrorMessage(accumulate_ret) +
+                                              " volume_id=" + std::to_string(packed_volume_id) +
+                                              " image_path=" + final_volume_path));
+                    continue;
+                }
 
-                // 8. 构造 CD_BURN 任务并入队；volume_id 来自实际产出，disk_id 为本地递增生成的占位标识。
-                const uint64_t generated_cd_burn_task_id = GenerateTaskId();
-                WR_task::WRTask new_cd_burn_task(generated_cd_burn_task_id, WR_task::WRTaskType::CD_BURN);
-                const std::string packed_volume_id_str = std::to_string(packed_volume_id);
-                new_cd_burn_task.SetCDBurnTask(GenerateDiskId(), packed_volume_id_str, final_volume_path);
-
-                // 9. 入 task_map_ + cd_burn_task_queue_。
-                task_map_->Insert(std::move(new_cd_burn_task));
-                cd_burn_task_queue_->Push(WR_task::WRTaskShort(generated_cd_burn_task_id, WR_task::WRTaskType::CD_BURN));
-
-                // 10. 第二次上报（镜像 → 光盘，ReportImagesBurnedToDisc）待光盘库刻录细节完善后
-                //     在 OnCDBurnComplete 中实现，本轮不实现。
+                // 8. 第二次上报（镜像 → 光盘）在刻录完成回调 OnCDBurnComplete 中发出，
+                //    本处不实现。
             }
         } while (!stop_requested_.load(std::memory_order_relaxed));
     }
@@ -2118,8 +2699,292 @@ namespace optical_node_manager {
         std::cout << std::endl;
     }
 
+    void OpticalNodeManager::ReportImagesBurnedToDisc(const std::string& disc_id,
+                                                      const std::vector<DiscImageEntry>& entries) {
+        // 本盘的镜像 → 光盘对应关系打印到控制台：MDS 的 ReportImagesBurnedToDisc
+        // 上报尚未实现，先以控制台输出替代，便于单模块测试观察。
+        // 字段名与 ReportImagesBurnedToDiscRequest 对齐（disc_id + image_ids），
+        // 额外带上 count 便于测试解析。
+        std::cout << "[ReportImagesBurnedToDisc] disc_id=" << disc_id
+                  << " count=" << entries.size()
+                  << " image_ids=";
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (i > 0) {
+                std::cout << ',';
+            }
+            std::cout << entries[i].volume_id;
+        }
+        std::cout << std::endl;
+    }
+
+    volumemanager::ErrorCode OpticalNodeManager::PersistPendingDiscMeta() {
+        std::vector<uint8_t> buffer;
+        {
+            std::lock_guard<std::mutex> lock(pending_disc_mutex_);
+            DiscMetaHeader header;
+            header.entry_count = static_cast<uint32_t>(pending_disc_entries_.size());
+            header.Serialize(buffer);
+            for (const DiscImageEntry& entry : pending_disc_entries_) {
+                std::vector<uint8_t> record;
+                entry.Serialize(record);
+                buffer.insert(buffer.end(), record.begin(), record.end());
+            }
+        }
+
+        const std::string final_path = meta_dir_ + "pending_disc_meta";
+        const std::string tmp_path = final_path + ".tmp";
+
+        const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            return volumemanager::ErrorCode::IO_ERROR;
+        }
+        // 顺序写入元数据区内容。
+        if (!WriteAll(fd, reinterpret_cast<const char*>(buffer.data()), buffer.size())) {
+            ::close(fd);
+            ::unlink(tmp_path.c_str());
+            return volumemanager::ErrorCode::IO_ERROR;
+        }
+        // 先落盘再 rename：避免中断后留下半截元数据。
+        if (::fsync(fd) != 0) {
+            ::close(fd);
+            ::unlink(tmp_path.c_str());
+            return volumemanager::ErrorCode::IO_ERROR;
+        }
+        if (::close(fd) != 0) {
+            ::unlink(tmp_path.c_str());
+            return volumemanager::ErrorCode::IO_ERROR;
+        }
+        if (::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+            ::unlink(tmp_path.c_str());
+            return volumemanager::ErrorCode::IO_ERROR;
+        }
+        return volumemanager::ErrorCode::SUCCESS;
+    }
+
+    volumemanager::ErrorCode OpticalNodeManager::SealPendingDiscAndSubmitBurn() {
+        // 1. 快照待打包集合；空集合无需封印。
+        std::vector<DiscImageEntry> entries;
+        {
+            std::lock_guard<std::mutex> lock(pending_disc_mutex_);
+            if (pending_disc_entries_.empty()) {
+                return volumemanager::ErrorCode::SUCCESS;
+            }
+            entries = pending_disc_entries_;
+        }
+
+        // 2. 定稿布局：回填每条记录的 aligned_size_bytes / offset_in_disc，
+        //    返回值即整张光盘（含超级块与元数据区）应占的字节数。
+        const uint64_t disc_total_bytes =
+            FillDiscLayout(entries, standard_images_per_disc_, disc_block_size_bytes_);
+
+        // 3. 分配光盘全局 ID。
+        const uint64_t disc_id = GenerateDiskId();
+        const std::string disk_id = std::to_string(disc_id);
+
+        // 4. 元数据定稿：pending_disc_meta 改名为 disc_<disk_id>_meta，避免影响后续打包
+        //    （新盘继续从空的 pending_disc_meta 积攒）。
+        const std::string pending_meta_path = meta_dir_ + "pending_disc_meta";
+        const std::string disc_meta_path = meta_dir_ + "disc_" + disk_id + "_meta";
+        if (::rename(pending_meta_path.c_str(), disc_meta_path.c_str()) != 0) {
+            return volumemanager::ErrorCode::IO_ERROR;
+        }
+
+        // 5. 构造光盘级刻录任务并入队；盘内全部 volume_id 与预期盘大小一并携带，
+        //    供刻录完成后逐个写入 vdisc 并释放写镜像。
+        //    vdisc 本步不生成：镜像数据在 OnCDBurnComplete 中边写边释放。
+        const std::string vdisc_path = disc_sim_dir_ + "disc_" + disk_id + ".vdisc";
+        std::vector<std::string> volume_ids;
+        volume_ids.reserve(entries.size());
+        for (const DiscImageEntry& entry : entries) {
+            volume_ids.push_back(std::to_string(entry.volume_id));
+        }
+        const uint64_t disc_burn_task_id = GenerateTaskId();
+        WR_task::WRTask disc_burn_task(disc_burn_task_id, WR_task::WRTaskType::DISC_BURN);
+        disc_burn_task.SetDiscBurnTask(disk_id, vdisc_path, volume_ids, disc_total_bytes);
+        task_map_->Insert(std::move(disc_burn_task));
+        cd_burn_task_queue_->Push(
+            WR_task::WRTaskShort(disc_burn_task_id, WR_task::WRTaskType::DISC_BURN));
+
+        // 6. 清空待打包集合：本盘已封印，后续镜像从新盘从零积攒。
+        {
+            std::lock_guard<std::mutex> lock(pending_disc_mutex_);
+            pending_disc_entries_.clear();
+        }
+        return volumemanager::ErrorCode::SUCCESS;
+    }
+
+    bool OpticalNodeManager::WriteVdiscAndReleaseImages(const std::string& vdisc_path,
+                                                        const std::vector<DiscImageEntry>& entries,
+                                                        uint64_t disc_id) {
+        // 元数据区编码：与 meta/disc_<disk_id>_meta 使用同一格式（头部 + 定长记录）。
+        std::vector<uint8_t> meta_area;
+        DiscMetaHeader meta_header;
+        meta_header.entry_count = static_cast<uint32_t>(entries.size());
+        meta_header.Serialize(meta_area);
+        for (const DiscImageEntry& entry : entries) {
+            std::vector<uint8_t> record;
+            entry.Serialize(record);
+            meta_area.insert(meta_area.end(), record.begin(), record.end());
+        }
+
+        // 超级块：记录三个区域的布局、容量与镜像公共路径前缀。
+        DiscSuperblock superblock;
+        superblock.disc_id = disc_id;
+        superblock.capacity_bytes = disc_capacity_bytes_;
+        superblock.created_at_ms = WR_task::NowMs();
+        superblock.block_size_bytes = static_cast<uint32_t>(disc_block_size_bytes_);
+        superblock.image_count = static_cast<uint64_t>(entries.size());
+        superblock.metadata_offset = AlignUp(DISC_SUPERBLOCK_SIZE, disc_block_size_bytes_);
+        superblock.metadata_size =
+            MetadataAreaBytes(entries.size(), standard_images_per_disc_, disc_block_size_bytes_);
+        superblock.data_offset = superblock.metadata_offset + superblock.metadata_size;
+        superblock.path_prefix = image_dir_;
+
+        std::vector<uint8_t> superblock_bytes;
+        superblock.Serialize(superblock_bytes);
+
+        const std::string tmp_path = vdisc_path + ".tmp";
+        const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            return false;
+        }
+
+        // 按 [超级块][元数据区][数据区] 顺序写入，区域之间补零到各自的起始偏移。
+        bool ok = WriteAll(fd, reinterpret_cast<const char*>(superblock_bytes.data()),
+                           superblock_bytes.size());
+        if (ok) {
+            ok = WriteZeros(fd, superblock.metadata_offset - superblock_bytes.size());
+        }
+        if (ok) {
+            ok = WriteAll(fd, reinterpret_cast<const char*>(meta_area.data()), meta_area.size());
+        }
+        if (ok) {
+            ok = WriteZeros(fd,
+                            superblock.data_offset - superblock.metadata_offset - meta_area.size());
+        }
+        // 数据区：按元数据记录的顺序逐个写入卷镜像，各自补零到对齐长度；
+        // 每写完一个立即释放其 image_dir_ 内副本（写一个释放一个），
+        // 使 image_dir_ 的空间压力在刻录过程中逐步缓解。
+        if (ok) {
+            for (const DiscImageEntry& entry : entries) {
+                const std::string image_path = VolumeImagePath(std::to_string(entry.volume_id));
+                if (!CopyFileAndPadToFd(fd, image_path, entry.image_size_bytes,
+                                        entry.aligned_size_bytes)) {
+                    ok = false;
+                    break;
+                }
+                const volumemanager::ErrorCode remove_ret =
+                    space_manager_->RemoveWriteImage(entry.volume_id);
+                if (remove_ret == volumemanager::ErrorCode::SUCCESS) {
+                    // 背压反馈：释放写镜像会让「写镜像占用」下降，可能解除归档下载的等待。
+                    // 本回调运行在 cd_manager 线程上，必须主动唤醒归档线程——否则若此刻
+                    // 压缩已全部完成（无其它 notify 来源），等待中的归档线程会永久睡死。
+                    // 且必须在持背压锁下 notify，避免通知落在等待方「判定谓词 → 进入睡眠」的窗口内。
+                    std::lock_guard<std::mutex> lock(archive_backpressure_mutex_);
+                    archive_backpressure_cv_.notify_all();
+                } else {
+                    // 镜像已写入 vdisc，释放失败只影响缓存副本残留；记录 sidecar 不中断。
+                    last_sidecar_failure_reason_buf_ = FormatFailureDetail(
+                        start_failure_phase::kOnCDBurnComplete, "RemoveWriteImage_failed",
+                        std::string("code=") + volumemanager::GetErrorMessage(remove_ret) +
+                        " code_int=" + std::to_string(static_cast<int>(remove_ret)) +
+                        " volume_id=" + std::to_string(entry.volume_id) +
+                        " image_path=" + image_path);
+                }
+            }
+        }
+        if (ok) {
+            ok = (::fsync(fd) == 0);
+        }
+        if (::close(fd) != 0) {
+            ok = false;
+        }
+        if (!ok) {
+            ::unlink(tmp_path.c_str());
+            return false;
+        }
+        // 先落盘再 rename：避免留下半截光盘文件被误当成有效光盘。
+        if (::rename(tmp_path.c_str(), vdisc_path.c_str()) != 0) {
+            ::unlink(tmp_path.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    bool OpticalNodeManager::AppendToNodeDiscsMeta(uint64_t disc_id,
+                                                   const std::vector<DiscImageEntry>& entries) {
+        DiscIndexHeader index_header;
+        index_header.entry_count = static_cast<uint32_t>(entries.size());
+        index_header.disc_id = disc_id;
+
+        std::vector<uint8_t> block;
+        index_header.Serialize(block);
+        for (const DiscImageEntry& entry : entries) {
+            std::vector<uint8_t> record;
+            entry.Serialize(record);
+            block.insert(block.end(), record.begin(), record.end());
+        }
+
+        const std::string path = meta_dir_ + "node_discs_meta";
+        // O_APPEND：多张光盘按刻录完成顺序追加，不覆盖既有内容。
+        const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd < 0) {
+            return false;
+        }
+        bool ok = WriteAll(fd, reinterpret_cast<const char*>(block.data()), block.size());
+        if (ok) {
+            ok = (::fsync(fd) == 0);
+        }
+        if (::close(fd) != 0) {
+            ok = false;
+        }
+        return ok;
+    }
+
+    volumemanager::ErrorCode OpticalNodeManager::AccumulatePackedImage(
+            const std::string& image_path,
+            uint64_t volume_id) {
+        // 1. 采集镜像实大小与 SHA-256，构造元数据记录。
+        struct stat st {};
+        if (image_path.empty() || ::stat(image_path.c_str(), &st) != 0 || st.st_size <= 0) {
+            return volumemanager::ErrorCode::IO_ERROR;
+        }
+        DiscImageEntry entry;
+        entry.volume_id = volume_id;
+        entry.image_size_bytes = static_cast<uint64_t>(st.st_size);
+        if (!space_manager::Sha256FileHex(image_path, &entry.sha256_hex)) {
+            return volumemanager::ErrorCode::IO_ERROR;
+        }
+
+        // 2. 容量判定：加入本条后会超出光盘容量时，先把当前集合封印为一张光盘。
+        //    空盘无论如何都要容纳第一条（单条镜像自身超容量时独占一张光盘）。
+        bool need_seal = false;
+        {
+            std::lock_guard<std::mutex> lock(pending_disc_mutex_);
+            std::vector<DiscImageEntry> candidate = pending_disc_entries_;
+            candidate.push_back(entry);
+            const uint64_t bytes_if_added =
+                FillDiscLayout(candidate, standard_images_per_disc_, disc_block_size_bytes_);
+            need_seal = !pending_disc_entries_.empty() && bytes_if_added > disc_capacity_bytes_;
+        }
+        if (need_seal) {
+            const volumemanager::ErrorCode seal_ret = SealPendingDiscAndSubmitBurn();
+            if (seal_ret != volumemanager::ErrorCode::SUCCESS) {
+                return seal_ret;
+            }
+        }
+
+        // 3. 追加进待打包集合，按光盘布局回填偏移后原子落盘。
+        {
+            std::lock_guard<std::mutex> lock(pending_disc_mutex_);
+            pending_disc_entries_.push_back(entry);
+            FillDiscLayout(pending_disc_entries_, standard_images_per_disc_, disc_block_size_bytes_);
+        }
+        return PersistPendingDiscMeta();
+    }
+
     void OpticalNodeManager::OnCDBurnComplete(const cd_manager_sim::BurnCompleteEvent& event) {
-        // cd_manager_sim 当前未提供 success 字段，默认视为成功（TODO-08 留口）。
+        // cd_manager_sim 当前未提供 success 字段，默认视为成功。
         if (!MarkTaskState(event.task_id, WR_task::WRTaskState::FINISH)) {
             auto existing = task_map_->Get(event.task_id);
             if (!existing.has_value()) {
@@ -2129,49 +2994,74 @@ namespace optical_node_manager {
             return;
         }
 
-        // 烧录完成 → 释放对应写镜像；副作用失败不影响 FINISH 主语义。
+        // 烧录完成 → 按该盘元数据逐个释放写镜像，并把元数据追加到 node_discs_meta。
+        // 以下均为副作用，失败走 sidecar，不影响 DISC_BURN 的 FINISH 主语义。
+        const auto burned_task = task_map_->Get(event.task_id);
+        if (!burned_task.has_value()) {
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "unknown_task_id",
+                "task_id=" + std::to_string(event.task_id));
+            return;
+        }
+        if (burned_task->type != WR_task::WRTaskType::DISC_BURN) {
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "invalid_type",
+                "task_id=" + std::to_string(event.task_id) +
+                " type=" + WR_task::WRTaskTypeToString(burned_task->type));
+            return;
+        }
         if (space_manager_ == nullptr) {
             last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "space_manager_null",
                 "task_id=" + std::to_string(event.task_id));
             return;
         }
-        if (event.image_path.empty()) {
-            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "empty_image_path",
-                "task_id=" + std::to_string(event.task_id));
+
+        // 1. 回读该盘元数据，拿到镜像清单及其在光盘文件中的偏移 / 大小 / SHA-256。
+        //    元数据文件是封印时的定稿产物，作为释放与索引的唯一依据。
+        const std::string disc_meta_path = meta_dir_ + "disc_" + burned_task->disk_id + "_meta";
+        std::vector<DiscImageEntry> entries;
+        if (!ReadDiscMetaFile(disc_meta_path, entries)) {
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "ReadDiscMetaFile_failed",
+                "disk_id=" + burned_task->disk_id +
+                " path=" + disc_meta_path +
+                " task_id=" + std::to_string(event.task_id));
             return;
         }
-        uint64_t burned_volume_id = 0;
-        std::string basename;
-        const volumemanager::ErrorCode parse_ret =
-            space_manager_->ParseVolumeFile(event.image_path, burned_volume_id, basename);
-        if (parse_ret != volumemanager::ErrorCode::SUCCESS) {
-            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "ParseVolumeFile_failed",
-                std::string("code=") +
-                volumemanager::GetErrorMessage(parse_ret) +
-                " code_int=" +
-                std::to_string(static_cast<int>(parse_ret)) +
-                " image_path=" +
-                event.image_path +
-                " task_id=" +
-                std::to_string(event.task_id));
+
+        // 2. 拼接光盘文件：超级块 + 元数据区 + 逐个写入卷镜像，每写入一个即释放其
+        //    image_dir_ 内副本（写一个释放一个）。此时镜像数据才真正落到 vdisc。
+        const std::string vdisc_path = disc_sim_dir_ + "disc_" + burned_task->disk_id + ".vdisc";
+        uint64_t disc_id_num = 0;
+        (void)ParseUint64Decimal(burned_task->disk_id, disc_id_num);
+        if (!WriteVdiscAndReleaseImages(vdisc_path, entries, disc_id_num)) {
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "WriteVdiscAndReleaseImages_failed",
+                "disk_id=" + burned_task->disk_id +
+                " path=" + vdisc_path +
+                " task_id=" + std::to_string(event.task_id));
             return;
         }
-        const volumemanager::ErrorCode remove_ret =
-            space_manager_->RemoveWriteImage(burned_volume_id);
-        if (remove_ret != volumemanager::ErrorCode::SUCCESS) {
-            // 副作用失败走 sidecar，不改 CD_BURN 主语义。
-            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "RemoveWriteImage_failed",
-                std::string("code=") +
-                volumemanager::GetErrorMessage(remove_ret) +
-                " code_int=" +
-                std::to_string(static_cast<int>(remove_ret)) +
-                " volume_id=" +
-                std::to_string(burned_volume_id) +
-                " image_path=" +
-                event.image_path +
-                " task_id=" +
-                std::to_string(event.task_id));
+
+        // 3. 元数据追加进 node_discs_meta，并同步内存索引供读回时定位。
+        //    先落盘再更新索引，保证索引不会指向文件中不存在的光盘。
+        if (!AppendToNodeDiscsMeta(disc_id_num, entries)) {
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "AppendToNodeDiscsMeta_failed",
+                "disk_id=" + burned_task->disk_id +
+                " path=" + meta_dir_ + "node_discs_meta" +
+                " task_id=" + std::to_string(event.task_id));
+            return;
         }
+        {
+            std::lock_guard<std::mutex> lock(disc_image_index_mutex_);
+            for (const DiscImageEntry& entry : entries) {
+                DiscImageLocation location;
+                location.disk_id = burned_task->disk_id;
+                location.offset_in_disc = entry.offset_in_disc;
+                location.image_size_bytes = entry.image_size_bytes;
+                location.sha256_hex = entry.sha256_hex;
+                disc_image_index_[entry.volume_id] = std::move(location);
+            }
+        }
+
+        // 4. 第二次上报（镜像 → 光盘）：本盘包含的全部镜像上报给 MDS。
+        ReportImagesBurnedToDisc(burned_task->disk_id, entries);
     }
 
     bool OpticalNodeManager::SubmitCDBurnTaskToCDManager(const WR_task::WRTask& task) {
@@ -2185,6 +3075,11 @@ namespace optical_node_manager {
         if (!task.file_path.empty() &&
             ::stat(task.file_path.c_str(), &st) == 0 && st.st_size > 0) {
             image_size_bytes = static_cast<uint64_t>(st.st_size);
+        } else if (task.expected_image_size_bytes != 0) {
+            // DISC_BURN 提交时 vdisc 尚未生成（镜像在刻录完成后才逐个写入）：
+            // 用封印时算出的预期盘大小，避免 cd_manager 回退到 config 默认值
+            // （10GB 默认值会把刻录耗时放大数百倍）。
+            image_size_bytes = task.expected_image_size_bytes;
         }
 
         cd_manager_sim::BurnRequest request{
@@ -2223,7 +3118,7 @@ namespace optical_node_manager {
                                    FormatFailureDetail(start_failure_phase::kCDBurnTaskProcessor,
                                               "attempt_exceeded",
                                               "limit=" + std::to_string(attempt_count_max_) +
-                                              " volume_id=" + full_task->volume_id +
+                                              " disk_id=" + full_task->disk_id +
                                               " image_path=" + full_task->file_path));
                 } else {
                     // 先提交其它字段，状态单独走 MarkTaskState（终态保护生效）。
@@ -2231,13 +3126,14 @@ namespace optical_node_manager {
                     if (current.has_value()) {
                         current->IncrementAttemptCount();
                         current->last_error_code = volumemanager::ErrorCode::BURN_FAILED;
-                        current->last_error_detail = "SubmitBurnTask_rejected_by_cd_manager volume_id=" +
-                                                     full_task->volume_id +
+                        current->last_error_detail = "SubmitBurnTask_rejected_by_cd_manager disk_id=" +
+                                                     full_task->disk_id +
                                                      " image_path=" + full_task->file_path;
                         task_map_->Update(std::move(*current));
                         MarkTaskState(task.task_id, WR_task::WRTaskState::WAITING);
                     }
-                    cd_burn_task_queue_->Push(WR_task::WRTaskShort(task.task_id, WR_task::WRTaskType::CD_BURN));
+                    // 保留原任务类型（CD_BURN / DISC_BURN）重新入队。
+                    cd_burn_task_queue_->Push(WR_task::WRTaskShort(task.task_id, task.type));
                 }
             }
         } while (!stop_requested_.load(std::memory_order_relaxed));

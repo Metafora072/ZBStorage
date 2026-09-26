@@ -2,8 +2,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <mutex>
 #include <string>
@@ -28,8 +30,10 @@ public:
     // volume_size / size_threshold 透传给 volume_manager；同时构建 cd_manager 调度组件。
     // root_dir / capacity_in_images / available_volume_id_count 为启动所需的工作目录、
     // image_dir 镜像数上限与 volume_id 队列容量上限。
-    // disc_capacity_bytes / standard_images_per_disc 为光盘打包参数（单张光盘容量上限
-    // 与标准镜像数基线）。
+    // disc_capacity_bytes / standard_images_per_disc / disc_block_size_bytes 为光盘有关参数
+    // （单张光盘容量上限、标准镜像数基线、数据块对齐大小）。
+    // max_write_images 为下载侧背压阈值：image_dir 中允许同时存在的写镜像数上限，
+    // 超过即暂停下载原始文件（须大于单盘可容纳的镜像数，否则无法封盘）。
     // scheduler_addr 为 scheduler 服务地址，供归档线程查询全量节点视图（node_id→address）。
     OpticalNodeManager(uint64_t volume_size,
                        double size_threshold,
@@ -38,6 +42,8 @@ public:
                        uint8_t available_volume_id_count,
                        uint64_t disc_capacity_bytes,
                        uint32_t standard_images_per_disc,
+                       uint64_t disc_block_size_bytes,
+                       uint32_t max_write_images,
                        const std::string& scheduler_addr);
     ~OpticalNodeManager();
 
@@ -112,8 +118,9 @@ private:
 
     // 本地递增生成一个 disk_id（对应 MDS 的 disc_id）。
     // MDS 的 AllocateAvailableDiscId 尚未实现，且光盘库刻录细节未完善，
-    // 该值当前仅作为 CD_BURN 任务的占位标识，不参与实际调度语义。
-    std::string GenerateDiskId();
+    // 该值当前仅作为光盘级刻录任务（DISC_BURN）与超级块的占位标识，
+    // 不参与实际调度语义。任务中的 disk_id 字段取其十进制字符串形式。
+    uint64_t GenerateDiskId();
 
     // 启动 cd_manager 与后台工作线程；任一失败回滚并返回 false。
     bool StartBackgroundWorkers();
@@ -124,6 +131,12 @@ private:
 
     // 倒序删除 InitializeDir 内部本次新建的目录；非空 / 无权限时静默跳过。
     void RollbackCreatedDirs(const std::vector<std::string>& created_dirs);
+
+    // 从 meta/node_discs_meta 重建「镜像 → 光盘」定位索引 disc_image_index_：
+    // 按「32B 块头 + N×128B 记录」顺序扫描追加块，恢复 volume_id → vdisc 偏移。
+    // 文件不存在（首次启动）视为空索引；尾部截断 / 块头损坏时保留已解析部分，
+    // 只写 sidecar 原因，不阻塞启动。
+    void RebuildDiscImageIndex();
 
     // 请求后台线程退出并完成资源回收。
     void StopBackgroundWorkers();
@@ -161,6 +174,25 @@ private:
     // input_file_dir_/<inode_id>.archive，再建 WRITE 任务入 zip_task_queue_。
     void ArchiveTaskProcessor();
 
+    // 采集一次归档下载背压判定快照：写镜像占用（SpaceManager，内部加读锁）+
+    // input/ 未压缩原始文件总量（opendir + stat 粗略估算，不加锁）。
+    // 纯查询、无副作用；由归档下载批次在开始前调用，决定是否暂停。
+    ArchiveBackpressureState GetArchiveBackpressureState() const;
+
+    // 估算 input_file_dir_ 下未压缩原始文件的总字节数。
+    // 粗略估算：并发写入期间 readdir 可能漏项，用于背压判断足够；目录不可读时返回 0。
+    uint64_t EstimateInputPendingBytes() const;
+
+    // 归档下载节流：若「本轮配额用尽」或「负载过载」则阻塞，直到被 Zip 压缩完成信号 /
+    // Stop 唤醒；唤醒后开启新一轮（配额清零）并从断点继续。
+    // 返回 false 表示应当停止（stop_requested_ 或归档队列已关闭）。
+    // 仅 ArchiveTaskProcessor 单线程调用。
+    bool WaitIfArchiveDownloadThrottled();
+
+    // Zip 每次压缩完成（原始文件已被消化）后递增并唤醒归档线程，作为「流水线前进一步」的信号；
+    // 由 ZipTaskProcessor 写入、ArchiveTaskProcessor 读取，访问需持有 archive_backpressure_mutex_。
+    void NotifyArchiveCompressionProgress();
+
     // 向 scheduler 拉取全量节点视图（GetClusterView, min_generation=0）并建立
     // node_id -> node_address 临时映射；仅保留 NODE_REAL 且健康/启用的节点。
     // 成功返回 true；失败返回 false 并写 last_failure_reason_buf_。
@@ -182,8 +214,49 @@ private:
     // （MDS 的 ReportFilesPackedToImage 上报接口未完善前的替代）。
     void ReportPackedInodes(const std::string& volume_id);
 
+    // 第二次上报（镜像 → 光盘）：把本盘包含的全部镜像上报给 MDS。
+    // MDS 的 ReportImagesBurnedToDisc 上报接口未完善前，先以控制台输出替代
+    // （格式与 proto 字段对齐：disc_id + image_ids）。
+    void ReportImagesBurnedToDisc(const std::string& disc_id,
+                                  const std::vector<DiscImageEntry>& entries);
+
     // 消费 cd_burn_task_queue_，将刻录任务提交给 cd_manager。
     void CDBurnTaskProcessor();
+
+    // 把已登记到 image_dir_ 的写镜像纳入待打包光盘：
+    //   1) 计算 vimg 实大小与 SHA-256，构造 DiscImageEntry；
+    //   2) 若加入后超出光盘容量，先把当前待打包集合封印为一张光盘
+    //      （见 SealPendingDiscAndSubmitBurn）；
+    //   3) 追加进 pending_disc_entries_，按光盘布局回填 aligned_size_bytes /
+    //      offset_in_disc，并原子重写 meta/pending_disc_meta。
+    // 仅 ZipTaskProcessor 调用（单线程）；失败返回对应错误码。
+    volumemanager::ErrorCode AccumulatePackedImage(const std::string& image_path,
+                                                   uint64_t volume_id);
+
+    // 把 pending_disc_entries_ 按「元数据区头 + 定长记录」编码后写入
+    // meta/pending_disc_meta；先写 .tmp 再 rename，避免中断后留下半截元数据。
+    volumemanager::ErrorCode PersistPendingDiscMeta();
+
+    // 把当前待打包集合封印为一张光盘：分配 disk_id、定稿该盘元数据（按布局回填
+    // 偏移）并改名为 meta/disc_<disk_id>_meta，随后提交光盘级刻录任务（DISC_BURN）；
+    // 成功后清空 pending_disc_entries_。
+    // 注意：光盘文件（vdisc）此时**不**生成——镜像数据在刻录完成回调
+    // OnCDBurnComplete 中逐个写入 vdisc 并逐个释放，见 WriteVdiscAndReleaseImages。
+    // 仅 ZipTaskProcessor 调用（单线程）。
+    volumemanager::ErrorCode SealPendingDiscAndSubmitBurn();
+
+    // 把 [超级块][元数据区][镜像数据区] 拼接为一个光盘文件，边写边释放：
+    // 每写入一个镜像后立即调用 RemoveWriteImage 删除 image_dir_ 内的 vimg 副本。
+    // 镜像按 entries 顺序从 image_dir_ 逐个读取；先写 .tmp 再 rename。
+    // 由 OnCDBurnComplete（刻录完成）调用。
+    bool WriteVdiscAndReleaseImages(const std::string& vdisc_path,
+                                    const std::vector<DiscImageEntry>& entries,
+                                    uint64_t disc_id);
+
+    // 把一张光盘的元数据块（DiscIndexHeader + 镜像记录）以追加方式写入
+    // meta/node_discs_meta：记录该盘全部镜像的偏移 / 大小 / SHA-256，供读回时定位。
+    // 刻录完成后由 OnCDBurnComplete 调用。
+    bool AppendToNodeDiscsMeta(uint64_t disc_id, const std::vector<DiscImageEntry>& entries);
 
     // 清理线程主体：周期性扫描 task_map_，移除 FINISH 终态任务（含 inode 索引清理）。
     void CleanupTaskProcessor();
@@ -274,6 +347,17 @@ private:
     std::unordered_set<uint64_t> pending_pack_inode_ids_;
     std::mutex pending_pack_inode_ids_mutex_;
 
+    // 待打包光盘的镜像元数据：按登记顺序积攒，达到光盘容量后由
+    // SealPendingDiscAndSubmitBurn 封印为一张光盘。
+    // 仅 ZipTaskProcessor 单线程访问，仍加锁以满足线程安全要求。
+    std::vector<DiscImageEntry> pending_disc_entries_;
+    std::mutex pending_disc_mutex_;
+
+    // node_discs_meta 的内存索引：volume_id → 镜像在已刻录光盘中的位置。
+    // 读回时据此定位 vdisc 文件与复制区间；由 OnCDBurnComplete 在追加元数据后同步。
+    std::unordered_map<uint64_t, DiscImageLocation> disc_image_index_;
+    std::mutex disc_image_index_mutex_;
+
     // InitializeDir 派生的八个子目录路径。
     std::string root_dir_;
     std::string input_file_dir_;
@@ -288,10 +372,35 @@ private:
     // 构造函数给出的 image_dir 镜像数上限，InitializeDir 时下发给 space_manager_。
     uint64_t capacity_in_images_{0};
 
-    // 构造函数给出的光盘打包参数：单张光盘容量上限（字节）与单张光盘标准镜像数基线。
-    // 当前仅完成配置透传，待光盘打包逻辑接入后由打包 / 刻录路径消费。
+    // 构造函数给出的光盘打包参数：单张光盘容量上限（字节）、单张光盘标准镜像数基线、
+    // 光盘数据块对齐大小（字节）。standard_images_per_disc 仅作元数据区预留基线，
+    // 不作硬上限；实际容纳镜像数以 disc_capacity_bytes 为准。
     uint64_t disc_capacity_bytes_{0};
     uint32_t standard_images_per_disc_{0};
+    uint64_t disc_block_size_bytes_{0};
+
+    // 下载侧背压阈值：image_dir 中允许同时存在的写镜像数上限（含「已封印、等刻录释放」的）。
+    // 由归档下载批次在开始前检查，超过即暂停下载，等 Zip 压缩 / 刻录释放降低占用。
+    uint32_t max_write_images_{1};
+
+    // 归档下载背压：Archive 线程在「本轮下载量达 volume_size」或「负载过载」时在此 CV 等待，
+    // 由 Zip 每次压缩完成唤醒、Stop 时唤醒全部。
+    std::mutex archive_backpressure_mutex_;
+    std::condition_variable archive_backpressure_cv_;
+    // 「流水线前进一步」的信号计数：Zip 每完成一次压缩递增。
+    // Zip 写、Archive 读，均在 archive_backpressure_mutex_ 保护下访问。
+    uint64_t zip_compress_completed_seq_{0};
+
+    // 以下五项仅 ArchiveTaskProcessor 单线程访问，无需加锁：
+    // 本轮（自上次唤醒以来）已下载的原始字节数（跨 MDS 批次累计，达 volume_size 即阻塞）。
+    uint64_t archive_round_downloaded_bytes_{0};
+    // 本轮已成功提交到压缩队列的文件数 + 本轮起点时的压缩进度；
+    // 两者配合用于配额判定：等本轮提交的文件都被压缩完即放行（已满足则不空睡）。
+    uint64_t archive_round_submitted_tasks_{0};
+    uint64_t archive_round_start_seq_{0};
+    // 下载断点：当前未下完的 MDS 请求与其下一个待下载文件下标；阻塞时不丢请求。
+    std::optional<SendArchiveMetadataRequest> pending_archive_request_;
+    size_t pending_archive_file_index_{0};
 
     // 原子地更新 status_ 与 last_status_reason_；提供稳定的字符串生命周期。
     void SetStatus(const std::string& new_status, const std::string& reason = std::string());

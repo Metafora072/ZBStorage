@@ -8,16 +8,23 @@
     3. 回显日志末尾的「测试点汇总」区块，并按需清理工作目录。
 
 场景（--scenario）：
-    smoke  1 卷 12 文件，走完 归档→压缩→封装→打包汇报→刻录释放→读；墙钟约 1 分钟。
-    full   6 卷 72 文件，在 smoke 基础上覆盖 image_dir 容量 5 的 LRU 淘汰与 CD_READ 重载；
-           墙钟 6~10 分钟（光盘仿真时长不可压缩，产线未提供测试旋钮）。
+    smoke  14 卷 140 文件（1 MiB/文件，按 256 KiB 切成 4 片，镜像 ≈ 10.1 MiB）：走完
+           归档→压缩→封装→打包汇报→封盘（生成 vdisc）→刻录释放→光盘读回；
+           墙钟约 1~2 分钟。
+    full   56 卷 560 文件：在 smoke 基础上覆盖多张光盘共存（5 张）、四种 MDS 批次形态
+           （逐文件小批次 / 整卷单批次 / 跨卷边界批次 / 大小混合批次）与下载背压的
+           触发与恢复（image_dir 容量 100 / 背压上限 30）；墙钟 10~20 分钟
+           （光盘仿真时长不可压缩，产线未提供测试旋钮）。
+    evict  26 卷 260 文件：小容量档位（image_dir 容量 14 / 背压上限 12），覆盖
+           image_dir 满载后的 LRU 淘汰、CD_READ 重载与背压触发恢复；墙钟 6~10 分钟。
 
 语料来源：--input-dir，其次环境变量 ZBSTORAGE_OPTICAL_CORPUS，缺省 ~/WR/testWrite。
 工作目录：默认 tests/optical_node/results/<scenario>-<时间戳>/（见 tests/README.md 结果保存约定），
         其中 corpus/ 为脚本产出的语料、archive/ 为光节点工作目录、
         output.log 为本次运行的完整日志（按测试点记录目标 / 期望 / 验证方法 / 逐项检查结论）。
 
-产物保留约定（实测占用：smoke 约 192MB、full 约 1.2GB）：
+产物保留约定（实测占用：smoke 约 0.5GB、evict 约 1GB、full 约 1.5GB
+（56 卷语料 0.55GB + 5 张 vdisc 0.5GB + image_dir 峰值 0.3GB），含语料与 vdisc 光盘文件）：
     默认（成功）          删除 corpus/ 与 archive/，保留 output.log 作为可追溯的测试记录；
     失败                  全部保留以便排查；
     --keep                无论成败全部保留。
@@ -101,7 +108,7 @@ def print_case_summary(log_path):
 def main():
     parser = argparse.ArgumentParser(description="光存储节点归档集成测试驱动")
     parser.add_argument("--driver", required=True, help="C++ 测试二进制路径")
-    parser.add_argument("--scenario", required=True, choices=["smoke", "full"],
+    parser.add_argument("--scenario", required=True, choices=["smoke", "full", "evict"],
                         help="测试场景")
     parser.add_argument("--work-dir", default=None, help="工作目录")
     parser.add_argument("--input-dir", default=None, help="语料来源目录")
@@ -122,7 +129,12 @@ def main():
           % (args.scenario, corpus_src, work_dir))
 
     corpus_out = os.path.join(work_dir, "corpus")
-    volumes = 1 if args.scenario == "smoke" else 6
+    # 卷数必须大于「单盘可容纳的镜像数」才会触发封印（生成 vdisc 并刻录）：
+    # 10 MiB 卷 → 镜像 ≈ 10.1 MiB；100 MiB 盘恰好容纳 10 个，故至少要 11 卷才封出第一张盘。
+    #   smoke 14 卷：1 张完整盘 + 尾盘；
+    #   full  56 卷：5 张完整盘 + 尾盘（容量 100 的档位不触发淘汰，专注写链路与背压）；
+    #   evict 26 卷：2 张完整盘 + 尾盘，叠加容量 14 的小缓存触发 LRU 淘汰。
+    volumes = {"smoke": 14, "full": 56, "evict": 26}[args.scenario]
     log_path = os.path.join(work_dir, LOG_NAME)
 
     with open(log_path, "w", encoding="utf-8") as log:
@@ -142,6 +154,8 @@ def main():
             "--input-dir", corpus_src,
             "--out-dir", corpus_out,
             "--volumes", str(volumes),
+            # 256 KiB 分片：1 MiB 文件 → 4 片，覆盖下载侧的多分片重组（见 README 测试点 A2）。
+            "--object-unit-kib", "256",
         ]
         prep_rc = run_tee(prep_cmd, log)
         if prep_rc != 0:

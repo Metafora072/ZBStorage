@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -51,6 +52,8 @@ namespace start_failure_phase {
 inline constexpr const char* kRunEntry      = "run_entry";
 inline constexpr const char* kInitializeDir = "InitializeDir";
 inline constexpr const char* kStartWorkers  = "StartBackgroundWorkers";
+// 从 node_discs_meta 重建镜像定位索引（Run 内紧接 InitializeDir）。
+inline constexpr const char* kRebuildDiscImageIndex = "RebuildDiscImageIndex";
 
 // 后台线程创建失败的细分 phase。
 inline constexpr const char* kThreadRead    = "StartBackgroundWorkers.thread=read";
@@ -84,8 +87,8 @@ inline constexpr const char* kCleanupTaskProcessor = "CleanupTaskProcessor";
 namespace WR_task {
 
 // 任务生命周期状态：START 等待 zip；WAITING 等底层调度；LOADING 已下发 cd_manager（仅 CD_READ）；
-// READY 读产物已解压可读（仅 READ）；ZIPPED 压缩完成；CD_BURNING 刻录中（仅 CD_BURN）；
-// FINISH 已消费完毕（READ 读完 / WRITE 压缩完 / CD_BURN 烧完 / batch 处理完 / CD_READ 加载完）；FAILED 终态。
+// READY 读产物已解压可读（仅 READ）；ZIPPED 压缩完成；CD_BURNING 刻录中（仅 CD_BURN / DISC_BURN）；
+// FINISH 已消费完毕（READ 读完 / WRITE 压缩完 / CD_BURN 烧完 / DISC_BURN 刻录完 / batch 处理完 / CD_READ 加载完）；FAILED 终态。
 // FINISH / FAILED 为终态，由清理线程周期性从 task_map_ 移除 FINISH 任务。
 enum class WRTaskState { START, WAITING, LOADING, READY, ZIPPED, CD_BURNING, FINISH, FAILED };
 
@@ -106,16 +109,18 @@ inline const char* WRTaskStateToString(WRTaskState state) {
 // 任务类型：
 //   READ                 数据面读任务（客户端 RequestAsyncReadFile 发起，产物为解压后的读文件）
 //   WRITE                写任务（压缩并封装进卷镜像）
-//   CD_BURN              刻录任务
+//   CD_BURN              单卷刻录任务（旧链路保留）
+//   DISC_BURN            光盘级刻录任务：一张光盘包含多个卷镜像，volume_ids 有效
 //   READ_BATCH_BY_VOLUME 仅 volume_id 有效，镜像就绪后批量推进该卷下挂起的 READ 任务
 //   CD_READ              光盘库读请求：让光盘库把某卷镜像加载回 image_dir_（不产出用户数据）
-enum class WRTaskType { READ, WRITE, CD_BURN, READ_BATCH_BY_VOLUME, CD_READ };
+enum class WRTaskType { READ, WRITE, CD_BURN, DISC_BURN, READ_BATCH_BY_VOLUME, CD_READ };
 
 inline const char* WRTaskTypeToString(WRTaskType type) {
     switch (type) {
         case WRTaskType::READ:                 return "READ";
         case WRTaskType::WRITE:                return "WRITE";
         case WRTaskType::CD_BURN:              return "CD_BURN";
+        case WRTaskType::DISC_BURN:            return "DISC_BURN";
         case WRTaskType::READ_BATCH_BY_VOLUME: return "READ_BATCH_BY_VOLUME";
         case WRTaskType::CD_READ:              return "CD_READ";
     }
@@ -145,6 +150,13 @@ public:
     // 与 state 同批赋值，落审计日志时再转成可读时间串。
     uint64_t state_changed_at_ms;
     std::string file_path;
+
+    // 仅 DISC_BURN 有效：本张光盘包含的全部卷镜像 ID（顺序与光盘数据区顺序一致）。
+    std::vector<std::string> volume_ids;
+
+    // 仅 DISC_BURN 有效：待刻录光盘文件的预期字节数（封印时按布局算出）。
+    // 提交刻录任务时 vdisc 尚未生成，供 cd_manager 估算刻录时长，避免回退到默认值。
+    uint64_t expected_image_size_bytes{0};
 
     // 仅当 state==FAILED 时有意义；task_map_->Get(id) 可读到具体失败码与上下文。
     volumemanager::ErrorCode last_error_code;
@@ -230,6 +242,25 @@ public:
         state_changed_at_ms = NowMs();
     }
 
+    // 设置光盘级刻录任务载荷：disk_id 为光盘 ID，file_path 为待刻录的光盘文件
+    // （vdisc）路径，volume_ids 为本张光盘包含的全部卷镜像 ID，
+    // expected_image_size_bytes 为该盘封盘后应占的字节数；不含 inode_id。
+    void SetDiscBurnTask(const std::string& disk_id,
+                         const std::string& file_path,
+                         const std::vector<std::string>& volume_ids,
+                         uint64_t expected_image_size_bytes) {
+        this->disk_id = disk_id;
+        this->volume_id.clear();
+        this->inode_id.clear();
+        this->inode_id_num = INVALID_INODE_ID;
+        this->file_path = file_path;
+        this->volume_ids = volume_ids;
+        this->expected_image_size_bytes = expected_image_size_bytes;
+        this->type = WRTaskType::DISC_BURN;
+        state = WRTaskState::START;
+        state_changed_at_ms = NowMs();
+    }
+
     // 设置按镜像批量读请求载荷；仅 volume_id 有效。
     void SetReadBatchByVolumeTask(const std::string& volume_id) {
         this->disk_id.clear();
@@ -255,7 +286,7 @@ public:
         state_changed_at_ms = NowMs();
     }
 
-    // 任务是否已到达 FINISH 终态（通用语义：READ 读完 / WRITE 压缩完 / CD_BURN 刻录完 / batch 处理完）。
+    // 任务是否已到达 FINISH 终态（通用语义：READ 读完 / WRITE 压缩完 / CD_BURN / DISC_BURN 刻录完 / batch 处理完）。
     bool isTaskFinish() const {
         return (this->state == WRTaskState::FINISH);
     }
@@ -688,6 +719,18 @@ private:
     std::unordered_map<std::string, std::vector<uint64_t>> map_;
 };
 
+// 归档下载背压判定的一次快照：记录「为什么暂停/放行」，便于日志与排查。
+// 判定为「需暂停下一批下载」当且仅当：写镜像占用达上限，或原始文件积压超阈值。
+struct ArchiveBackpressureState {
+    uint64_t write_images{0};         // image_dir 中当前写镜像数（含已封印、等刻录释放的）
+    uint64_t write_image_limit{0};    // 写镜像数上限（MAX_WRITE_IMAGES）
+    uint64_t input_pending_bytes{0};  // input/ 未压缩原始文件总量（粗略估算）
+    uint64_t input_pending_limit{0};  // 原始文件积压阈值（硬编码 = 卷镜像容量 10%）
+    bool write_overloaded{false};     // 写镜像数达上限
+    bool input_overloaded{false};     // 原始文件积压超阈值
+    bool throttled{false};            // 是否应暂停下一批下载（= 上面两者之一）
+};
+
 // MDS 下发的单个归档文件信息（对应设计文档中的 ArchiveFile）。
 // 只包含从 real_node 下载文件数据所需的最小字段集；
 // 目录名称、父子关系、权限和时间等权威元数据仍保存在 MDS，不在此结构中。
@@ -778,6 +821,314 @@ private:
     std::condition_variable condition_variable_;
     std::queue<SendArchiveMetadataRequest> queue_;
     bool closed_ = false;
+};
+
+// ============================================================================
+// 光盘打包领域结构：超级块 / 元数据区 / 镜像记录
+//
+// 光盘文件（vdisc）布局，三个区域均按 block_size_bytes 对齐：
+//   [超级块 DISC_SUPERBLOCK_SIZE]
+//   [元数据区 DiscMetaHeader + N × DiscImageEntry]
+//   [数据区 卷镜像 0][卷镜像 1]...
+//
+// 编码约定与 volume_manager/Serializer 一致：定长字段按本机字节序 memcpy，
+// 尾部保留区补零；字符串写入定长区，不足处补零（天然以 '\0' 结尾），超长截断。
+// ============================================================================
+
+// 光盘格式版本；字段布局或编码方式变化时必须递增。
+constexpr uint32_t DISC_FORMAT_VERSION = 1;
+
+// 超级块魔数标识 "ZBDC"。
+constexpr uint32_t DISC_SUPERBLOCK_MAGIC = 0x5A424443u;
+// 超级块固定大小（字节）。
+constexpr uint32_t DISC_SUPERBLOCK_SIZE = 4096;
+// 超级块中公共路径前缀字段的容量（含结尾 '\0'）。
+constexpr uint32_t DISC_PATH_PREFIX_CAPACITY = 256;
+// 超级块中 path_prefix 之前的定长字段总大小（字节），须与 Serialize 的写入顺序一致。
+constexpr uint32_t DISC_SUPERBLOCK_FIXED_SIZE = 4 + 4 + 8 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 8;
+
+// 元数据区魔数标识 "ZBDM"。
+constexpr uint32_t DISC_META_MAGIC = 0x5A42444Du;
+// 元数据区头部固定大小（字节）。
+constexpr uint32_t DISC_META_HEADER_SIZE = 32;
+// 元数据区中单条镜像记录的固定大小（字节）。
+constexpr uint32_t DISC_IMAGE_RECORD_SIZE = 128;
+
+// 校验算法标识：SHA-256。
+constexpr uint32_t DISC_CHECKSUM_SHA256 = 1;
+// SHA-256 十六进制串长度（不含结尾 '\0'）。
+constexpr uint32_t DISC_SHA256_HEX_LENGTH = 64;
+
+// node_discs_meta 中每张光盘追加块的魔数标识 "ZBDI"。
+constexpr uint32_t DISC_INDEX_MAGIC = 0x5A424449u;
+// node_discs_meta 追加块头部固定大小（字节）。
+constexpr uint32_t DISC_INDEX_HEADER_SIZE = 32;
+// 追加块头部中 disc_id 之前的定长字段总大小（字节），须与 Serialize 顺序一致。
+constexpr uint32_t DISC_INDEX_HEADER_FIXED_SIZE = 4 + 4 + 4 + 4;
+
+// 元数据区总大小（字节）：头部 + entry_count 条定长记录。
+inline uint64_t DiscMetaAreaSize(uint64_t entry_count) {
+    return static_cast<uint64_t>(DISC_META_HEADER_SIZE) +
+           entry_count * static_cast<uint64_t>(DISC_IMAGE_RECORD_SIZE);
+}
+
+// 从定长区读取字符串：读到 '\0' 或读满 capacity 为止（对应写入时的补零语义）。
+inline std::string ReadFixedString(const uint8_t* field, size_t capacity) {
+    size_t len = 0;
+    while (len < capacity && field[len] != '\0') {
+        ++len;
+    }
+    return std::string(reinterpret_cast<const char*>(field), len);
+}
+
+/**
+ * @brief 元数据区头部：固定 DISC_META_HEADER_SIZE 字节，后跟 entry_count 条镜像记录
+ *
+ * meta/pending_disc_meta 文件与光盘内的元数据区使用同一编码，
+ * 因此待打包文件的内容可直接作为光盘元数据区写入。
+ */
+struct DiscMetaHeader {
+    uint32_t magic_number{DISC_META_MAGIC};        // 魔数 "ZBDM"
+    uint32_t format_version{DISC_FORMAT_VERSION};  // 格式版本
+    uint32_t record_size{DISC_IMAGE_RECORD_SIZE};  // 单条记录大小（字节）
+    uint32_t entry_count{0};                       // 记录条数
+
+    // 序列化为固定 DISC_META_HEADER_SIZE 字节（尾部保留区补零）。
+    void Serialize(std::vector<uint8_t>& out) const {
+        out.assign(DISC_META_HEADER_SIZE, 0);
+        uint8_t* p = out.data();
+        std::memcpy(p, &magic_number, sizeof(magic_number));
+        p += sizeof(magic_number);
+        std::memcpy(p, &format_version, sizeof(format_version));
+        p += sizeof(format_version);
+        std::memcpy(p, &record_size, sizeof(record_size));
+        p += sizeof(record_size);
+        std::memcpy(p, &entry_count, sizeof(entry_count));
+    }
+
+    // 反序列化；缓冲区过短或魔数 / 格式版本 / 记录大小不符时返回 false。
+    static bool Parse(const uint8_t* header, size_t header_size, DiscMetaHeader& out) {
+        if (header == nullptr || header_size < DISC_META_HEADER_SIZE) {
+            return false;
+        }
+        const uint8_t* p = header;
+        std::memcpy(&out.magic_number, p, sizeof(out.magic_number));
+        p += sizeof(out.magic_number);
+        std::memcpy(&out.format_version, p, sizeof(out.format_version));
+        p += sizeof(out.format_version);
+        std::memcpy(&out.record_size, p, sizeof(out.record_size));
+        p += sizeof(out.record_size);
+        std::memcpy(&out.entry_count, p, sizeof(out.entry_count));
+
+        return out.magic_number == DISC_META_MAGIC &&
+               out.format_version == DISC_FORMAT_VERSION &&
+               out.record_size == DISC_IMAGE_RECORD_SIZE;
+    }
+};
+
+/**
+ * @brief 光盘数据区中的单条卷镜像记录
+ *
+ * offset_in_disc 为该镜像在光盘文件中的起始偏移，读回时据此从 vdisc 中
+ * 复制出所需镜像；sha256_hex 用于校验复制出的内容。
+ */
+struct DiscImageEntry {
+    uint64_t volume_id{0};           // 卷镜像 ID（与 volume_<id>.vimg 一致）
+    uint64_t image_size_bytes{0};    // vimg 实际字节数
+    uint64_t aligned_size_bytes{0};  // 按光盘数据块对齐后占用的字节数
+    uint64_t offset_in_disc{0};      // vimg 在光盘文件中的起始偏移
+    std::string sha256_hex;          // vimg 的 SHA-256（64 字符小写十六进制）
+
+    // 序列化为固定 DISC_IMAGE_RECORD_SIZE 字节（尾部保留区补零）。
+    void Serialize(std::vector<uint8_t>& out) const {
+        out.assign(DISC_IMAGE_RECORD_SIZE, 0);
+        uint8_t* p = out.data();
+        std::memcpy(p, &volume_id, sizeof(volume_id));
+        p += sizeof(volume_id);
+        std::memcpy(p, &image_size_bytes, sizeof(image_size_bytes));
+        p += sizeof(image_size_bytes);
+        std::memcpy(p, &aligned_size_bytes, sizeof(aligned_size_bytes));
+        p += sizeof(aligned_size_bytes);
+        std::memcpy(p, &offset_in_disc, sizeof(offset_in_disc));
+        p += sizeof(offset_in_disc);
+
+        const size_t copy_len = std::min<size_t>(sha256_hex.size(), DISC_SHA256_HEX_LENGTH);
+        if (copy_len > 0) {
+            std::memcpy(p, sha256_hex.data(), copy_len);
+        }
+    }
+
+    // 反序列化；缓冲区长度不符时返回 false。
+    static bool Parse(const uint8_t* record, size_t record_size, DiscImageEntry& out) {
+        if (record == nullptr || record_size != DISC_IMAGE_RECORD_SIZE) {
+            return false;
+        }
+        const uint8_t* p = record;
+        std::memcpy(&out.volume_id, p, sizeof(out.volume_id));
+        p += sizeof(out.volume_id);
+        std::memcpy(&out.image_size_bytes, p, sizeof(out.image_size_bytes));
+        p += sizeof(out.image_size_bytes);
+        std::memcpy(&out.aligned_size_bytes, p, sizeof(out.aligned_size_bytes));
+        p += sizeof(out.aligned_size_bytes);
+        std::memcpy(&out.offset_in_disc, p, sizeof(out.offset_in_disc));
+        p += sizeof(out.offset_in_disc);
+        out.sha256_hex = ReadFixedString(p, DISC_SHA256_HEX_LENGTH);
+        return true;
+    }
+};
+
+/**
+ * @brief node_discs_meta 中一张光盘的追加块头部：固定 DISC_INDEX_HEADER_SIZE 字节，
+ *        后跟 entry_count 条 DiscImageEntry 记录
+ *
+ * node_discs_meta 为纯追加文件：每张光盘刻录完成后追加一个「头部 + 镜像记录」块，
+ * 记录该盘全部镜像（volume_id → offset_in_disc / image_size_bytes / sha256），
+ * 供读回时按 volume_id 定位镜像在 vdisc 中的偏移与大小。
+ */
+struct DiscIndexHeader {
+    uint32_t magic_number{DISC_INDEX_MAGIC};        // 魔数 "ZBDI"
+    uint32_t format_version{DISC_FORMAT_VERSION};   // 格式版本
+    uint32_t record_size{DISC_IMAGE_RECORD_SIZE};   // 单条记录大小（字节）
+    uint32_t entry_count{0};                        // 记录条数
+    uint64_t disc_id{0};                            // 光盘全局 ID
+
+    // 序列化为固定 DISC_INDEX_HEADER_SIZE 字节（尾部保留区补零）。
+    void Serialize(std::vector<uint8_t>& out) const {
+        out.assign(DISC_INDEX_HEADER_SIZE, 0);
+        uint8_t* p = out.data();
+        std::memcpy(p, &magic_number, sizeof(magic_number));
+        p += sizeof(magic_number);
+        std::memcpy(p, &format_version, sizeof(format_version));
+        p += sizeof(format_version);
+        std::memcpy(p, &record_size, sizeof(record_size));
+        p += sizeof(record_size);
+        std::memcpy(p, &entry_count, sizeof(entry_count));
+        p += sizeof(entry_count);
+        std::memcpy(p, &disc_id, sizeof(disc_id));
+    }
+
+    // 反序列化；缓冲区过短或魔数 / 格式版本 / 记录大小不符时返回 false。
+    static bool Parse(const uint8_t* header, size_t header_size, DiscIndexHeader& out) {
+        if (header == nullptr || header_size < DISC_INDEX_HEADER_SIZE) {
+            return false;
+        }
+        const uint8_t* p = header;
+        std::memcpy(&out.magic_number, p, sizeof(out.magic_number));
+        p += sizeof(out.magic_number);
+        std::memcpy(&out.format_version, p, sizeof(out.format_version));
+        p += sizeof(out.format_version);
+        std::memcpy(&out.record_size, p, sizeof(out.record_size));
+        p += sizeof(out.record_size);
+        std::memcpy(&out.entry_count, p, sizeof(out.entry_count));
+        p += sizeof(out.entry_count);
+        std::memcpy(&out.disc_id, p, sizeof(out.disc_id));
+
+        return out.magic_number == DISC_INDEX_MAGIC &&
+               out.format_version == DISC_FORMAT_VERSION &&
+               out.record_size == DISC_IMAGE_RECORD_SIZE;
+    }
+};
+
+/**
+ * @brief 内存索引条目：某卷镜像在已刻录光盘中的位置
+ *
+ * 是 node_discs_meta 在内存中的等价视图，供读回时定位 vdisc 文件与复制区间。
+ */
+struct DiscImageLocation {
+    std::string disk_id;             // 所属光盘 ID（光盘文件名为 disc_<disk_id>.vdisc）
+    uint64_t offset_in_disc{0};      // 镜像在光盘文件中的起始偏移
+    uint64_t image_size_bytes{0};    // 镜像实际字节数
+    std::string sha256_hex;          // 镜像 SHA-256，供复制回 image_dir_ 后校验
+};
+
+/**
+ * @brief 光盘超级块：固定 4 KB，位于光盘文件起始处
+ *
+ * 记录整张光盘的全局信息与三个区域的布局。path_prefix 为镜像在节点内的
+ * 公共路径前缀（由上层给出），供后续校验镜像来源。
+ */
+struct DiscSuperblock {
+    uint32_t magic_number{DISC_SUPERBLOCK_MAGIC};   // 魔数 "ZBDC"
+    uint32_t format_version{DISC_FORMAT_VERSION};   // 光盘格式版本
+    uint64_t disc_id{0};                            // 光盘全局 ID
+    uint64_t capacity_bytes{0};                     // 光盘容量（字节）
+    uint64_t created_at_ms{0};                      // 创建时间（epoch 毫秒）
+    uint32_t block_size_bytes{0};                   // 数据块对齐大小（字节）
+    uint32_t checksum_algo{DISC_CHECKSUM_SHA256};   // 校验算法标识
+    uint64_t image_count{0};                        // 数据区镜像条数
+    uint64_t metadata_offset{0};                    // 元数据区起始偏移
+    uint64_t metadata_size{0};                      // 元数据区大小（字节）
+    uint64_t data_offset{0};                        // 数据区起始偏移
+    std::string path_prefix;                        // 镜像公共路径前缀
+
+    // 序列化为固定 DISC_SUPERBLOCK_SIZE 字节（含 path_prefix 定长区，其余补零）。
+    void Serialize(std::vector<uint8_t>& out) const {
+        out.assign(DISC_SUPERBLOCK_SIZE, 0);
+        uint8_t* p = out.data();
+        std::memcpy(p, &magic_number, sizeof(magic_number));
+        p += sizeof(magic_number);
+        std::memcpy(p, &format_version, sizeof(format_version));
+        p += sizeof(format_version);
+        std::memcpy(p, &disc_id, sizeof(disc_id));
+        p += sizeof(disc_id);
+        std::memcpy(p, &capacity_bytes, sizeof(capacity_bytes));
+        p += sizeof(capacity_bytes);
+        std::memcpy(p, &created_at_ms, sizeof(created_at_ms));
+        p += sizeof(created_at_ms);
+        std::memcpy(p, &block_size_bytes, sizeof(block_size_bytes));
+        p += sizeof(block_size_bytes);
+        std::memcpy(p, &checksum_algo, sizeof(checksum_algo));
+        p += sizeof(checksum_algo);
+        std::memcpy(p, &image_count, sizeof(image_count));
+        p += sizeof(image_count);
+        std::memcpy(p, &metadata_offset, sizeof(metadata_offset));
+        p += sizeof(metadata_offset);
+        std::memcpy(p, &metadata_size, sizeof(metadata_size));
+        p += sizeof(metadata_size);
+        std::memcpy(p, &data_offset, sizeof(data_offset));
+        p += sizeof(data_offset);
+
+        // 公共路径前缀：定长区末尾留 '\0'，超长截断。
+        const size_t copy_len =
+            std::min<size_t>(path_prefix.size(), DISC_PATH_PREFIX_CAPACITY - 1);
+        if (copy_len > 0) {
+            std::memcpy(p, path_prefix.data(), copy_len);
+        }
+    }
+
+    // 反序列化；缓冲区过短或魔数 / 格式版本不符时返回 false。
+    static bool Parse(const std::vector<uint8_t>& in, DiscSuperblock& out) {
+        if (in.size() < DISC_SUPERBLOCK_SIZE) {
+            return false;
+        }
+        const uint8_t* p = in.data();
+        std::memcpy(&out.magic_number, p, sizeof(out.magic_number));
+        p += sizeof(out.magic_number);
+        std::memcpy(&out.format_version, p, sizeof(out.format_version));
+        p += sizeof(out.format_version);
+        std::memcpy(&out.disc_id, p, sizeof(out.disc_id));
+        p += sizeof(out.disc_id);
+        std::memcpy(&out.capacity_bytes, p, sizeof(out.capacity_bytes));
+        p += sizeof(out.capacity_bytes);
+        std::memcpy(&out.created_at_ms, p, sizeof(out.created_at_ms));
+        p += sizeof(out.created_at_ms);
+        std::memcpy(&out.block_size_bytes, p, sizeof(out.block_size_bytes));
+        p += sizeof(out.block_size_bytes);
+        std::memcpy(&out.checksum_algo, p, sizeof(out.checksum_algo));
+        p += sizeof(out.checksum_algo);
+        std::memcpy(&out.image_count, p, sizeof(out.image_count));
+        p += sizeof(out.image_count);
+        std::memcpy(&out.metadata_offset, p, sizeof(out.metadata_offset));
+        p += sizeof(out.metadata_offset);
+        std::memcpy(&out.metadata_size, p, sizeof(out.metadata_size));
+        p += sizeof(out.metadata_size);
+        std::memcpy(&out.data_offset, p, sizeof(out.data_offset));
+        p += sizeof(out.data_offset);
+        out.path_prefix = ReadFixedString(p, DISC_PATH_PREFIX_CAPACITY);
+
+        return out.magic_number == DISC_SUPERBLOCK_MAGIC &&
+               out.format_version == DISC_FORMAT_VERSION;
+    }
 };
 
 }  // namespace optical_node_manager

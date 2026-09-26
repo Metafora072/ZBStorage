@@ -200,6 +200,20 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
                 }
                 return {};
             }
+        } else if (key == "DISC_BLOCK_SIZE_BYTES") {
+            if (!ParseUint64(value, &cfg.disc_block_size_bytes)) {
+                if (error) {
+                    *error = "Invalid DISC_BLOCK_SIZE_BYTES at line " + std::to_string(line_no);
+                }
+                return {};
+            }
+        } else if (key == "MAX_WRITE_IMAGES") {
+            if (!ParseUint32(value, &cfg.max_write_images)) {
+                if (error) {
+                    *error = "Invalid MAX_WRITE_IMAGES at line " + std::to_string(line_no);
+                }
+                return {};
+            }
         }
     }
 
@@ -225,7 +239,7 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
         cfg.size_threshold = 0.9;
     }
     if (cfg.capacity_in_images == 0) {
-        cfg.capacity_in_images = 10;
+        cfg.capacity_in_images = 1000;
     }
     if (cfg.available_volume_id_count == 0) {
         cfg.available_volume_id_count = 5;
@@ -235,6 +249,13 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
     }
     if (cfg.standard_images_per_disc == 0) {
         cfg.standard_images_per_disc = 100;
+    }
+    if (cfg.disc_block_size_bytes == 0) {
+        cfg.disc_block_size_bytes = 2048;
+    }
+    // 背压阈值下限为 1：为 0 会让下载侧永久暂停，无法自恢复。
+    if (cfg.max_write_images < 1) {
+        cfg.max_write_images = 1;
     }
     return cfg;
 }

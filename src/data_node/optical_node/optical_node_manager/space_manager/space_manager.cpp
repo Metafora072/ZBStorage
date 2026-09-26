@@ -120,29 +120,12 @@ void EnsureImageDir(const std::string& path) {
 
 SpaceManager::SpaceManager(std::string image_dir_path)
     : image_dir_path_(std::move(image_dir_path)),
-      disc_sim_dir_path_(),  // 必须由 SetDiscSimDir() 显式注入，未注入时 DeleteFileAndEntry
-                             // 会兜底 unlink——见 DeleteFileAndEntry 实现。
       capacity_in_images_(0),
       capacity_set_(false) {
     EnsureImageDir(image_dir_path_);
 }
 
 SpaceManager::~SpaceManager() = default;
-
-volumemanager::ErrorCode SpaceManager::SetDiscSimDir(std::string disc_sim_dir_path) {
-    // 不做"已注入"守门——上层 OpticalNodeManager::InitializeDir() 每次 Run()
-    // 都会重新构造 SpaceManager 并 SetDiscSimDir(disc_sim_dir_)，所以重复
-    // 调用是预期的合法语义（同 SetCapacityInImages 的"重 Run() 重新注入"模式
-    // 不同——capacity 是只能设一次的硬约束，disc_sim_dir 是每次 Run() 都重置）。
-    //
-    // 规范化：与 image_dir_path_ 一致，原样存储（不去尾斜杠）；内部拼路径时强制
-    // 加 '/'。
-    // 允许空字符串：上层如果不想用模拟光盘库兜底（让 DeleteFileAndEntry 走纯
-    // unlink 兜底），可以传 ""。此时 disc_sim_dir_path_.empty() == true 会被
-    // DeleteFileAndEntry 走 unlink 路径。
-    disc_sim_dir_path_ = std::move(disc_sim_dir_path);
-    return volumemanager::ErrorCode::SUCCESS;
-}
 
 void SpaceManager::ReadLock() {
     mutex_.lock_shared();
@@ -210,60 +193,28 @@ volumemanager::ErrorCode SpaceManager::DeleteFileAndEntry(uint64_t volume_id) {
         return volumemanager::ErrorCode::VOLUME_NOT_FOUND;
     }
     const std::string src_path = FullPathForEntry(it->second);
-    // 提前拷贝 filename：后续 erase(it) 后迭代器失效，src_path 还可用，
-    // 但 entry.filename 也直接拷贝出来更便于拼 dst 路径。
-    const std::string basename = it->second.filename;
 
     // 先移管理表项：DeleteFileAndEntry 的调用方（RemoveSingleReadImageLocked /
     // RemoveWriteImage / MoveFrom 容量满时换出 victim）都需要 entries_ 立刻腾
     // 出位置——尤其是 MoveFrom 必须在 try-evict 后腾出槽位才能继续登记新镜像。
-    // 即使后续 rename/unlink 失败，entries_ 已经没有这个条目了，对调用方来说
-    // 是"已释放"，与之前"先 erase 再 unlink"的语义对齐。
+    // 即使后续 unlink 失败，entries_ 已经没有这个条目了，对调用方来说是"已释放"。
     RemoveLRU(volume_id);
     entries_.erase(it);
 
-    // **适配模拟光盘库（2026-08-15 用户决策）**：原本这里直接 unlink，模拟
-    // 光盘库场景下等价于"销毁光盘"，与真实光盘库的物理行为不符。改为：
-    //   1) 若 disc_sim_dir_path_ 已注入 → rename(2) 到 disc_sim_dir_/volume_<id>.vimg，
-    //      等价于"把光盘放回光盘库位"。Rename 失败 → 兜底 unlink 避免文件残留，
-    //      返回 IO_ERROR。
-    //   2) 若 disc_sim_dir_path_ 未注入（空字符串）→ 退化为 unlink 兜底行为，
-    //      与旧实现兼容（OpticalNodeManager 未注入 disc_sim_dir 的极端场景
-    //      不会让 image_dir_ 内残留镜像膨胀）。
-    if (!disc_sim_dir_path_.empty()) {
-        std::string dst_path = disc_sim_dir_path_;
-        if (!dst_path.empty() && dst_path.back() != '/') {
-            dst_path.push_back('/');
-        }
-        dst_path += basename;
-
-        if (rename(src_path.c_str(), dst_path.c_str()) == 0) {
+    // 光盘打包改造（2026-09-26）：镜像数据已随刻录持久化到 disc_sim_dir_ 下的
+    // vdisc 光盘文件中，image_dir_ 内的 vimg 只是缓存副本，释放即直接删除，
+    // 不再搬移到 disc_sim_dir_。
+    if (unlink(src_path.c_str()) != 0) {
+        const int unlink_errno = errno;
+        if (unlink_errno == ENOENT) {
+            // 管理表存在但物理文件已被外部清理：视为已释放，避免误报。
             return volumemanager::ErrorCode::SUCCESS;
         }
-        // rename 失败：兜底 unlink（防止 image_dir_ 内残留膨胀），并返回 IO_ERROR
-        // 让上层感知。errno == ENOENT 时（极端：管理表存在但文件已被外部清理）
-        // 视为 SUCCESS，避免误报。
-        const int rename_errno = errno;
-        if (rename_errno == ENOENT) {
-            return volumemanager::ErrorCode::SUCCESS;
-        }
-        // 兜底 unlink
-        (void)unlink(src_path.c_str());
-        // 记录 rename 失败的 errno 到 last_failure_detail_ 便于排查
-        // （与 MoveFrom 的 detail 风格保持一致：phase + subphase + errno）。
-        last_failure_detail_ = std::string("phase=DeleteFileAndEntry subphase=rename_failed")
-            + " errno=" + std::to_string(rename_errno)
+        last_failure_detail_ = std::string("phase=DeleteFileAndEntry subphase=unlink_failed")
+            + " errno=" + std::to_string(unlink_errno)
             + " src=" + src_path
-            + " dst=" + dst_path
             + " volume_id=" + std::to_string(volume_id);
         return volumemanager::ErrorCode::IO_ERROR;
-    }
-
-    // disc_sim_dir_path_ 未注入：保留旧 unlink 兜底行为。
-    if (unlink(src_path.c_str()) != 0) {
-        if (errno != ENOENT) {
-            return volumemanager::ErrorCode::IO_ERROR;
-        }
     }
     return volumemanager::ErrorCode::SUCCESS;
 }
@@ -420,8 +371,8 @@ volumemanager::ErrorCode SpaceManager::RemoveSingleReadImageLocked() {
         return volumemanager::ErrorCode::VOLUME_NOT_FOUND;
     }
     const uint64_t victim_id = (*victim_it)->first;
-    // 删除走 DeleteFileAndEntry，2026-08-15 适配模拟光盘库后改为 rename 到
-    // disc_sim_dir_/volume_<id>.vimg，等价于"把光盘放回库位"——详见该函数说明。
+    // 释放走 DeleteFileAndEntry：直接删除 image_dir_ 内的 vimg（镜像数据在
+    // disc_sim_dir_ 的 vdisc 中持久保存）——详见该函数说明。
     return DeleteFileAndEntry(victim_id);
 }
 
@@ -431,8 +382,7 @@ volumemanager::ErrorCode SpaceManager::RemoveWriteImage(uint64_t volume_id) {
     if (it == entries_.end() || it->second.category != ImageCategory::WRITE) {
         return volumemanager::ErrorCode::VOLUME_NOT_FOUND;
     }
-    // 走 DeleteFileAndEntry，2026-08-15 适配模拟光盘库后改为 rename 到
-    // disc_sim_dir_/volume_<id>.vimg，等价于"刻完的光盘弹出到库位"——详见该函数说明。
+    // 刻录完成后释放写镜像：直接删除 image_dir_ 内的 vimg——详见 DeleteFileAndEntry。
     return DeleteFileAndEntry(volume_id);
 }
 
@@ -440,20 +390,28 @@ volumemanager::ErrorCode SpaceManager::GetStats(ImageDirStats& out_stats) const 
     std::shared_lock<std::shared_mutex> lock(mutex_);
     out_stats.capacity_images = capacity_in_images_;
     out_stats.used_images = entries_.size();
-    out_stats.read_images = 0;
-    out_stats.write_images = 0;
-    for (const auto& pair : entries_) {
-        if (pair.second.category == ImageCategory::READ) {
-            ++out_stats.read_images;
-        } else {
-            ++out_stats.write_images;
-        }
-    }
+    out_stats.read_images = CountEntriesByCategory(ImageCategory::READ);
+    out_stats.write_images = CountEntriesByCategory(ImageCategory::WRITE);
     out_stats.free_images =
         (out_stats.used_images >= out_stats.capacity_images)
             ? 0
             : (out_stats.capacity_images - out_stats.used_images);
     return volumemanager::ErrorCode::SUCCESS;
+}
+
+uint64_t SpaceManager::GetWriteImageCount() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return CountEntriesByCategory(ImageCategory::WRITE);
+}
+
+uint64_t SpaceManager::CountEntriesByCategory(ImageCategory category) const {
+    uint64_t count = 0;
+    for (const auto& pair : entries_) {
+        if (pair.second.category == category) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 volumemanager::ErrorCode SpaceManager::RebuildManagementTable() {

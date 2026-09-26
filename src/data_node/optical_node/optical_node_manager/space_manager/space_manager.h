@@ -73,13 +73,6 @@ public:
     /**
      * @brief 构造函数
      * @param image_dir_path image_dir 目录绝对路径
-     *
-     * 注意：disc_sim_dir_（模拟光盘库目录）**不会**在构造函数注入。
-     * 调用方必须显式调 SetDiscSimDir() 才能使用 LRU 换出 / 写镜像释放路径，
-     * 否则 DeleteFileAndEntry 在拼"移出目标路径"时使用空字符串，
-     * rename 必然 IO_ERROR。OpticalNodeManager::InitializeDir 流程
-     * 会确保 SetDiscSimDir() 在 RebuildManagementTable 之后、首次
-     * MoveFrom / RemoveSingleReadImage / RemoveWriteImage 之前调用。
      */
     explicit SpaceManager(std::string image_dir_path);
 
@@ -90,29 +83,6 @@ public:
 
     SpaceManager(const SpaceManager&) = delete;
     SpaceManager& operator=(const SpaceManager&) = delete;
-
-    /**
-     * @brief 设置模拟光盘库目录（disc_sim_dir）
-     *
-     * disc_sim_dir 是当前系统为适配"模拟光盘库（cd_manager_sim）"而引入的特殊目录：
-     * 模拟光盘库不会真正销毁/弹出光盘——为了与"真实光盘库把光盘放回库位"的物理行为
-     * 保持一致，SpaceManager 的释放路径（RemoveSingleReadImage / RemoveWriteImage
-     * / MoveFrom 容量满时换出 victim）不再是简单的 unlink，而是把镜像文件 rename(2)
-     * 到 disc_sim_dir/ 下，让后续的 OnCDReadComplete 重新"从光盘库加载"时能够找到。
-     *
-     * **注入时机**：必须在 RebuildManagementTable() 之后、首次
-     * RemoveSingleReadImage() / RemoveWriteImage() / MoveFrom() 之前调用。
-     * OpticalNodeManager::InitializeDir() 会保证这个顺序。
-     *
-     * **重复调用**：允许重复调用（每次 Run() 路径都重新设置新路径），
-     * 但**不**做"已注入"守门——上层调用方负责保证语义正确。
-     *
-     * @param disc_sim_dir_path disc_sim 目录绝对路径（带或不带尾斜杠均可）
-     * @return volumemanager::ErrorCode
-     *         SUCCESS                - 设置成功（含空字符串清空语义）
-     *         INVALID_PATH           - 路径非法（当前实现兜底为空字符串）
-     */
-    volumemanager::ErrorCode SetDiscSimDir(std::string disc_sim_dir_path);
 
     /**
      * @brief 设置容量上限（镜像数）
@@ -189,43 +159,32 @@ public:
      *
      * 写镜像不会被换出。若当前没有任何读镜像，返回 VOLUME_NOT_FOUND。
      *
-     * **适配模拟光盘库（2026-08-15 用户决策）**：本方法不再简单地 unlink 镜像，
-     * 而是把镜像文件 rename(2) 到 disc_sim_dir_/volume_<id>.vimg，
-     * 等价于"把光盘放回光盘库"。这样：
-     *   - 模拟 cd_manager 在后续 OnCDReadComplete 回调里（默认的源路径就是
-     *     disc_sim_dir_/volume_<id>.vimg）能够再次找到该镜像；
-     *   - 与"真实光盘库把光盘放回库位"的物理行为保持一致；
-     *   - 模拟器下"重新读"语义得以闭环（不会因为 unlink 而丢失数据）。
-     *
-     * **前置条件**：调用 SetDiscSimDir() 注入 disc_sim_dir_，否则 rename 必然失败。
+     * **光盘打包改造（2026-09-26）**：镜像数据已随刻录持久化到 disc_sim_dir_
+     * 下的 vdisc 光盘文件中，image_dir_ 内的 vimg 只是缓存副本，换出即直接
+     * 删除（unlink），不再搬移到 disc_sim_dir_——需要再次读取时，上层按
+     * node_discs_meta 记录的偏移从 vdisc 中复制回 image_dir_。
      *
      * @return volumemanager::ErrorCode
      *         SUCCESS             - 成功换出一个读镜像
      *         VOLUME_NOT_FOUND    - 当前没有读镜像可换出
-     *         IO_ERROR            - rename 到 disc_sim_dir 失败
+     *         IO_ERROR            - unlink 镜像文件失败
      */
     volumemanager::ErrorCode RemoveSingleReadImage();
 
     /**
      * @brief 刻录完成后释放指定写镜像
      *
-     * 仅当对应 volume_id 存在且类别为 WRITE 时才会移动。
+     * 仅当对应 volume_id 存在且类别为 WRITE 时才会释放。
      *
-     * **适配模拟光盘库（2026-08-15 用户决策）**：本方法不再简单地 unlink 镜像，
-     * 而是把镜像文件 rename(2) 到 disc_sim_dir_/volume_<id>.vimg，
-     * 等价于"刻完的光盘弹出到库位"。这样：
-     *   - 模拟 cd_manager 的 BurnRequest.image_path 若再次指向 disc_sim_dir_，
-     *     流程可被复用（虽然刻录通常是一次性的，但保留对称）；
-     *   - 上层 OpticalNodeManager::OnCDBurnComplete 调本方法后,
-     *     image_dir_/ 不再保留临时卷,disc_sim_dir_ 接管"已刻光盘库位"。
-     *
-     * **前置条件**：调用 SetDiscSimDir() 注入 disc_sim_dir_，否则 rename 必然失败。
+     * **光盘打包改造（2026-09-26）**：刻录完成后镜像数据已写入 disc_sim_dir_
+     * 下的 vdisc 光盘文件，本方法直接删除 image_dir_ 内的 vimg，
+     * 不再搬移到 disc_sim_dir_。
      *
      * @param volume_id 待释放的卷镜像 ID
      * @return volumemanager::ErrorCode
-     *         SUCCESS             - 移动成功
+     *         SUCCESS             - 释放成功
      *         VOLUME_NOT_FOUND    - 管理表中无该 volume_id 或类别不是 WRITE
-     *         IO_ERROR            - rename 到 disc_sim_dir 失败
+     *         IO_ERROR            - unlink 镜像文件失败
      */
     volumemanager::ErrorCode RemoveWriteImage(uint64_t volume_id);
 
@@ -239,18 +198,23 @@ public:
     volumemanager::ErrorCode GetStats(ImageDirStats& out_stats) const;
 
     /**
+     * @brief 获取当前写镜像数（image_dir 中 category == WRITE 的镜像条数）
+     *
+     * 供归档下载链路做背压判断：一旦写镜像数达到配置上限就暂停下载原始文件，
+     * 等 Zip 压缩（把 WRITE 变成待打包）与刻录释放（RemoveWriteImage）把占用降下来。
+     *
+     * **口径**：包含「已封印、等刻录释放」的镜像——它们在被显式释放前
+     * category 始终是 WRITE，因此自然计入；这正是背压需要的语义（封印并不立即
+     * 腾出 image_dir 空间，物理文件要等刻录完成才删除）。
+     *
+     * 锁语义：内部加读锁，可与其它读操作并发。
+     */
+    uint64_t GetWriteImageCount() const;
+
+    /**
      * @brief 获取 image_dir_ 路径
      */
     const std::string& image_dir_path() const { return image_dir_path_; }
-
-    /**
-     * @brief 获取 disc_sim_dir_ 路径（模拟光盘库目录，2026-08-15 引入）
-     *
-     * 注意：构造后必须显式调 SetDiscSimDir() 才会被设置，否则返回空字符串。
-     * OpticalNodeManager::InitializeDir() 会保证 SetDiscSimDir() 在首次
-     * RemoveSingleReadImage / RemoveWriteImage / MoveFrom 之前被调用。
-     */
-    const std::string& disc_sim_dir_path() const { return disc_sim_dir_path_; }
 
     /**
      * @brief 获取容量（镜像数）
@@ -368,26 +332,22 @@ private:
      *
      * 调用方需持有 unique_lock。被公开接口 RemoveSingleReadImage() 在已持锁路径下复用，
      * MoveFrom 不走这里（MoveFrom 走 DeleteFileAndEntry 直接释放指定 volume_id）。
-     *
-     * **适配模拟光盘库**：换出通过 DeleteFileAndEntry 落到 disc_sim_dir_，详见该函数说明。
      */
     volumemanager::ErrorCode RemoveSingleReadImageLocked();
 
     /**
-     * @brief 把文件从 image_dir_ 移动到 disc_sim_dir_ 并清理管理表项
+     * @brief 直接删除 image_dir_ 内的镜像文件并清理管理表项
      *
      * **适配扇平布局（2026-08-15）**：`entry.filename` 就是 image_dir_/ 下的
      * basename（不再有 read/ write/ 子目录），所以 src_path = image_dir_/<basename>。
      *
-     * **适配模拟光盘库（2026-08-15 用户决策）**：本方法不再简单地 unlink 文件，
-     * 而是把 image_dir_/<basename> rename(2) 到 disc_sim_dir_/<basename>，
-     * 等价于"把光盘放回光盘库位"。Rename 失败时优先 unlink 兜底（防止镜像残留在
-     * image_dir_ 内膨胀），且即使 rename 失败，管理表项也已经移走——这是为了与
-     * MoveFrom 容量满换出语义保持一致（MoveFrom 必须腾出 entries_ 槽位才能继续）。
+     * **光盘打包改造（2026-09-26）**：不再把镜像搬移到 disc_sim_dir_，而是直接
+     * unlink——镜像数据在刻录时已写入 disc_sim_dir_ 下的 vdisc，image_dir_ 内的
+     * vimg 只是缓存副本。管理表项始终先于 unlink 移除，以保证 MoveFrom 容量满
+     * 换出时能立刻腾出 entries_ 槽位；因此 unlink 失败时文件可能残留，调用方
+     * 可重试。
      *
      * 调用方需持有 unique_lock。调用方需保证要释放的 volume_id 在 entries_ 中。
-     *
-     * **前置条件**：必须先调 SetDiscSimDir() 注入 disc_sim_dir_，否则 rename 必然失败。
      */
     volumemanager::ErrorCode DeleteFileAndEntry(uint64_t volume_id);
 
@@ -406,19 +366,18 @@ private:
      */
     void InsertEntryLocked(const ImageEntry& entry);
 
+    /**
+     * @brief 统计某一类别的镜像条数
+     *
+     * 调用方需持锁（读锁即可）。抽出来供 GetStats 与 GetWriteImageCount 共用，
+     * 保证「按 category 计数」只有一处实现。
+     */
+    uint64_t CountEntriesByCategory(ImageCategory category) const;
+
     // Private methods below
 
 private:
     std::string image_dir_path_;                             // image_dir 绝对路径
-    // disc_sim_dir_path_ 是模拟光盘库目录（适配 cd_manager_sim 引入，2026-08-15）：
-    // RemoveSingleReadImage / RemoveWriteImage / MoveFrom 容量满时换出 victim 释放
-    // 镜像时，会把 image_dir_/<basename> rename(2) 到本目录下，等价于
-    // "把光盘放回库位"。允许为空（未注入时 DeleteFileAndEntry 的 rename 会失败
-    // 并兜底 unlink，避免 image_dir_ 内残留——见 DeleteFileAndEntry 实现）。
-    //
-    // 注意：2026-08-15 起 image_dir_/ 内部不再划分子目录，因此 dst 也只有
-    // disc_sim_dir_/volume_<id>.vimg 唯一一个位置。
-    std::string disc_sim_dir_path_;
     uint64_t capacity_in_images_;                            // 容量（镜像数），0 表示尚未设置
     bool capacity_set_;                                      // 是否已设置过容量
 

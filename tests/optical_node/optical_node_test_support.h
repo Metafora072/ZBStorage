@@ -27,6 +27,9 @@ namespace zb::optical_node::test {
 // 被测节点打印的打包汇报行前缀（MDS ReportFilesPackedToImage 未完善前的控制台替代）。
 inline constexpr const char* kPackReportPrefix = "[ReportFilesPackedToImage]";
 
+// 被测节点打印的刻录汇报行前缀（MDS ReportImagesBurnedToDisc 未完善前的控制台替代）。
+inline constexpr const char* kBurnReportPrefix = "[ReportImagesBurnedToDisc]";
+
 // ---------------------------------------------------------------------------
 // 测试点日志
 //
@@ -459,6 +462,32 @@ inline bool ParsePackReport(const std::string& line, PackReport* out) {
     return true;
 }
 
+// 刻录汇报：一张光盘与其包含的全部卷镜像。
+struct BurnReport {
+    uint64_t disc_id{0};
+    uint64_t count{0};
+    std::vector<uint64_t> image_ids;
+};
+
+// 解析形如
+// "[ReportImagesBurnedToDisc] disc_id=1 count=11 image_ids=1,2,..." 的行。
+inline bool ParseBurnReport(const std::string& line, BurnReport* out) {
+    if (out == nullptr || line.rfind(kBurnReportPrefix, 0) != 0) {
+        return false;
+    }
+    const size_t disc_pos = line.find("disc_id=");
+    const size_t cnt_pos = line.find("count=");
+    const size_t ids_pos = line.find("image_ids=");
+    if (disc_pos == std::string::npos || cnt_pos == std::string::npos ||
+        ids_pos == std::string::npos) {
+        return false;
+    }
+    out->disc_id = ::strtoull(line.c_str() + disc_pos + std::strlen("disc_id="), nullptr, 10);
+    out->count = ::strtoull(line.c_str() + cnt_pos + std::strlen("count="), nullptr, 10);
+    out->image_ids = ParseInodeCsv(line.substr(ids_pos + std::strlen("image_ids=")));
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // stdout 抓取
 // ---------------------------------------------------------------------------
@@ -532,6 +561,20 @@ public:
             }
         }
         return count;
+    }
+
+    // 返回全部以 prefix 开头的行（按抓取顺序）。
+    // 与 NextLineWithPrefix 不同，本方法不推进游标，适合汇总类断言
+    // （两类汇报行交错出现时，共用游标会互相吞掉对方的行）。
+    std::vector<std::string> CollectLinesWithPrefix(const std::string& prefix) {
+        std::lock_guard<std::mutex> lock(mu_);
+        std::vector<std::string> matched;
+        for (const std::string& line : lines_) {
+            if (line.rfind(prefix, 0) == 0) {
+                matched.push_back(line);
+            }
+        }
+        return matched;
     }
 
 private:

@@ -31,8 +31,9 @@ struct OpticalNodeConfig {
     uint64_t volume_size_bytes{10ull * 1024 * 1024 * 1024};
     double size_threshold{0.9};
 
-    // image_dir 可容纳的镜像数上限
-    uint64_t capacity_in_images{10};
+    // image_dir 可容纳的镜像数上限（硬上限，READ + WRITE 共用；默认盘 1TiB / 卷 10GiB
+    // 下单盘约 113 个镜像，故取值需远大于单盘镜像数）。
+    uint64_t capacity_in_images{1000};
     // available_volume_ids 队列容量上限
     uint8_t available_volume_id_count{5};
 
@@ -40,6 +41,16 @@ struct OpticalNodeConfig {
     // 标准镜像数为基线口径，实际单张光盘按容量可能容纳更多镜像。
     uint64_t disc_capacity_bytes{1099511627776ULL};
     uint32_t standard_images_per_disc{100};
+    // 光盘数据块大小（字节）：超级块、元数据区与每个 vimg 均按此对齐。
+    uint64_t disc_block_size_bytes{2048};
+
+    // 最大写镜像数：image_dir 中允许同时存在的写（WRITE）镜像数上限，用于下载侧背压
+    // ——超过该值即暂停下载原始文件，等 Zip 压缩 / 刻录释放把写镜像数降下来。
+    // 配置约束：单盘镜像数 < MAX_WRITE_IMAGES < CAPACITY_IN_IMAGES。
+    //   下限侧：必须大于单盘镜像数，否则永远攒不满一张盘（永不封印 → 永不释放 → 活锁）；
+    //   上限侧：必须小于 image_dir 硬上限，否则背压来不及生效、先撞上 VOLUME_FULL_NO_READABLE。
+    // 下限为 1（配置为 0 或负数时按 1 生效）。
+    uint32_t max_write_images{128};
 
     static OpticalNodeConfig LoadFromFile(const std::string& path, std::string* error);
 };

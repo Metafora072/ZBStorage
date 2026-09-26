@@ -148,6 +148,7 @@ add_library(optical_node_manager STATIC
     src/data_node/optical_node/optical_node_manager/optical_node_manager.cpp
     src/data_node/optical_node/optical_node_manager/cd_manager_sim/cd_manager.cpp
     src/data_node/optical_node/optical_node_manager/space_manager/space_manager.cpp
+    src/data_node/optical_node/optical_node_manager/space_manager/sha256.cpp
     src/data_node/optical_node/optical_node_manager/volume_manager/volume_manager.cpp
     src/data_node/optical_node/optical_node_manager/volume_manager/serializer.cpp
     src/data_node/optical_node/optical_node_manager/volume_manager/compression_utils.cpp
@@ -1057,7 +1058,11 @@ if(BUILD_TESTING)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
-        # smoke：单卷最小闭环，分钟级；full：6 卷（容量 5 的 LRU 淘汰 + CD_READ 重载），十分钟级。
+        # smoke：14 卷（约 1 张完整光盘 + 尾盘），覆盖封盘/刻录/释放/光盘读回，分钟级；
+        # full：56 卷（5 张光盘共存 + 四种 MDS 批次形态 + 背压触发与恢复；容量 100 / 写镜像 30），
+        #       十几分钟级；
+        # evict：26 卷（小容量档位 14 / 12，覆盖 image_dir 满载后的 LRU 淘汰与 CD_READ 重载），
+        #        十分钟级。
         add_test(NAME optical_node_archive_smoke
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/optical_node/run_optical_node_archive_test.py
                 --driver $<TARGET_FILE:optical_node_archive_integration_test> --scenario smoke)
@@ -1065,6 +1070,10 @@ if(BUILD_TESTING)
         add_test(NAME optical_node_archive_full
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/optical_node/run_optical_node_archive_test.py
                 --driver $<TARGET_FILE:optical_node_archive_integration_test> --scenario full)
-        set_tests_properties(optical_node_archive_full PROPERTIES TIMEOUT 1500 LABELS "optical_node;slow" SKIP_RETURN_CODE 77)
+        set_tests_properties(optical_node_archive_full PROPERTIES TIMEOUT 1800 LABELS "optical_node;slow" SKIP_RETURN_CODE 77)
+        add_test(NAME optical_node_archive_evict
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/optical_node/run_optical_node_archive_test.py
+                --driver $<TARGET_FILE:optical_node_archive_integration_test> --scenario evict)
+        set_tests_properties(optical_node_archive_evict PROPERTIES TIMEOUT 1500 LABELS "optical_node;slow" SKIP_RETURN_CODE 77)
     endif()
 endif()

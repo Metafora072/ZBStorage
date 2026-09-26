@@ -19,8 +19,8 @@ import random
 import sys
 import zlib
 
-# 被测节点构造参数：100 MiB 卷 + 0.9 阈值
-VOLUME_SIZE = 100 * 1024 * 1024
+# 被测节点构造参数：10 MiB 卷 + 0.9 阈值
+VOLUME_SIZE = 10 * 1024 * 1024
 SIZE_THRESHOLD = 0.9
 
 # 跳过测试的约定退出码（ctest SKIP_RETURN_CODE）
@@ -81,7 +81,7 @@ def predict_plan_and_write(args, jpg_blobs, write_corpus: bool):
       single_ratio 首个文件的实测压缩率
     """
     file_size = args.file_size_mb * 1024 * 1024
-    unit = args.object_unit_mb * 1024 * 1024
+    unit = args.object_unit_kib * 1024
     total_files = args.volumes * args.files_per_volume
     object_dir = os.path.join(args.out_dir, "real-1", "disk0") if write_corpus else None
     if write_corpus:
@@ -116,7 +116,7 @@ def predict_plan_and_write(args, jpg_blobs, write_corpus: bool):
             sys.exit(1)
 
         if write_corpus:
-            # 切分为 object_unit_mb 大小的分片，末片为余数
+            # 切分为 object_unit_kib 大小的分片，末片为余数
             object_count = (len(content) + unit - 1) // unit
             for i in range(object_count):
                 obj_path = os.path.join(
@@ -206,13 +206,15 @@ def main():
                         help="jpg/jpeg 语料来源目录")
     parser.add_argument("--out-dir", default=None,
                         help="输出目录（--selftest 时可省略）")
-    parser.add_argument("--volumes", type=int, default=6, help="卷数量")
-    parser.add_argument("--files-per-volume", type=int, default=12,
-                        help="每卷文件数")
-    parser.add_argument("--file-size-mb", type=int, default=8,
+    parser.add_argument("--volumes", type=int, default=26, help="卷数量")
+    parser.add_argument("--files-per-volume", type=int, default=10,
+                        help="每卷文件数（1 MiB × 10 × 实测压缩率 0.983 ≈ 10.1 MiB，"
+                             "刚好越过 10 MiB 卷的 0.9 封装阈值）")
+    parser.add_argument("--file-size-mb", type=int, default=1,
                         help="每个归档文件大小(MiB)")
-    parser.add_argument("--object-unit-mb", type=int, default=1,
-                        help="对象分片大小(MiB)")
+    parser.add_argument("--object-unit-kib", type=int, default=256,
+                        help="对象分片大小(KiB)；默认 256 KiB，1 MiB 文件 → 4 片"
+                             "（覆盖下载侧的多分片重组）")
     parser.add_argument("--inode-base", type=int, default=1000,
                         help="起始 inode 号")
     parser.add_argument("--seed", type=int, default=20260925,
@@ -271,7 +273,7 @@ def main():
         fp.write("volumes\t%d\n" % args.volumes)
         fp.write("files_per_volume\t%d\n" % args.files_per_volume)
         fp.write("file_size_bytes\t%d\n" % (args.file_size_mb * 1024 * 1024))
-        fp.write("object_unit_bytes\t%d\n" % (args.object_unit_mb * 1024 * 1024))
+        fp.write("object_unit_bytes\t%d\n" % (args.object_unit_kib * 1024))
         fp.write("volume_size_bytes\t%d\n" % VOLUME_SIZE)
         fp.write("size_threshold\t%.2f\n" % SIZE_THRESHOLD)
         fp.write("trigger_bytes\t%d\n" % trigger)

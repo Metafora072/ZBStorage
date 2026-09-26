@@ -18,6 +18,8 @@ struct NodeConfig {
     std::string disk_base_dir;
     uint32_t disk_count{0};
     uint64_t disk_capacity_bytes{0};
+    uint64_t disk_read_bytes_per_sec{200ULL * 1000ULL * 1000ULL};
+    uint64_t disk_write_bytes_per_sec{200ULL * 1000ULL * 1000ULL};
     std::string node_id;
     std::string node_address;
     std::string scheduler_addr;

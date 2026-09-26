@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -100,6 +101,14 @@ private:
             request.set_peer_node_id(peer_node_id_);
             request.set_peer_address(peer_address_);
             request.set_applied_lsn(service_->GetReplicationStatus().applied_lsn);
+            request.set_readiness_reported(true);
+            request.set_initialization_complete(service_->IsArchiveEngineReady());
+            request.set_metadata_ready(service_->IsArchiveEngineReady());
+            // The new archive engine does not yet export a device inventory or
+            // asynchronous task telemetry. Keep the node JOINING (empty disks),
+            // rather than publish fabricated empty inventory / idle measurements.
+            request.set_readiness_message(
+                "archive engine running; awaiting optical inventory and task telemetry");
 
             zb::rpc::HeartbeatReply response;
             brpc::Controller cntl;
@@ -209,14 +218,12 @@ int main(int argc, char* argv[]) {
                                         cfg.virtual_node_count,
                                         cfg.heartbeat_interval_ms,
                                         &storage_service);
-    if (!cfg.scheduler_addr.empty()) {
-        reporter.Start();
-    }
-
     if (server.Start(FLAGS_port, &options) != 0) {
         std::cerr << "Failed to start brpc server on port " << FLAGS_port << std::endl;
         return 1;
     }
+
+    if (!cfg.scheduler_addr.empty()) reporter.Start();
 
     server.RunUntilAskedToQuit();
     reporter.Stop();

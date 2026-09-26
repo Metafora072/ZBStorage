@@ -134,6 +134,15 @@ bool NodeStateCache::ResolveDiskId(const std::string& node_id,
     return false;
 }
 
+bool NodeStateCache::IsWriteAdmitted(const std::string& node_id) const {
+    if (node_id.empty()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    const NodeInfo* node = MatchNodeForLocationLocked(nodes_, node_id);
+    return node && IsNodeAllocatable(*node, node->type, true);
+}
+
 void NodeStateCache::ReplaceNodes(std::vector<NodeInfo> nodes) {
     std::lock_guard<std::mutex> lock(mu_);
     nodes_ = std::move(nodes);

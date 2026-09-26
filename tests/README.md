@@ -19,11 +19,19 @@ tests/
 │   └── results/
 ├── optical_node/       
 │   └── results/
-└── benchmark/          
-    └── results/
+└── benchmark/
+    ├── fio/
+    │   ├── config/
+    │   └── log/
+    └── filebench/
+        ├── run_filebench.conf
+        ├── run_filebench.sh
+        └── log/
 ```
 
-目前暂定的目录结构。当前仓库中的 `tests/` 还只有本说明文件，各负责人开始实现测试时再创建对应模块目录和 `results/`。
+当前客户端测试位于 `tests/client/`；T03 的公共结构、Scheduler、节点管理、CMS、迁移和能耗测试位于 `tests/scheduler/`，运行方法见各模块 README。新增测试及结果继续按此结构组织。
+
+`tests/scheduler/` 只交付说明、两个公开入口、`python/` 下必需的支撑模块及 `fixtures/` 下的固定输入。内部开发回归用例不提交、不参与默认构建；运行结果和历史报告放在不提交的 `results/`。跨模块已知缺陷记录在 `docs/issues/`。
 
 | 目录 | 暂定内容 |
 | --- | --- |
@@ -43,8 +51,8 @@ tests/
 
 ## 结果保存
 
-测试生成的结果和日志放在对应模块的 `results/` 中，例如客户端测试放在 `tests/client/results/`，Scheduler 测试放在 `tests/scheduler/results/`，FIO、FileBench 和 MDTest 放在 `tests/benchmark/results/`。
+测试生成的结果和日志放在对应模块的测试目录中。例如客户端测试放在 `tests/client/results/`，Scheduler 测试放在 `tests/scheduler/results/`，FIO 和 FileBench 的测试结果分别放在 `tests/benchmark/fio/log/` 和 `tests/benchmark/filebench/log/`。
 
 运行参数、工具原始输出、客户端和服务端日志、汇总结果、Trace 及图表都按这一规则保存。`results/` 内部的文件名和目录结构由负责人自行安排，注意不要覆盖已有结果。跨模块测试放在主负责人对应模块的 `results/` 中。
 
-不要在项目根目录、`tests/` 根目录或其他位置另建测试结果目录。各模块的 `results/` 已被 Git 忽略，大规模 Trace、临时测试文件、光盘镜像、原始结果和运行日志不提交到 Git。
+不要在项目根目录、`tests/` 根目录或其他位置另建测试结果目录。各模块的结果和日志目录已被 Git 忽略，大规模 Trace、临时测试文件、光盘镜像、原始结果和运行日志不提交到 Git。

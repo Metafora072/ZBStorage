@@ -205,6 +205,47 @@ bool ObjectAllocator::AllocateObjectDirectByType(uint32_t replica,
     return true;
 }
 
+bool ObjectAllocator::AllocateObjectDirect(
+    uint32_t replica,
+    const std::string& object_id,
+    std::vector<zb::rpc::ReplicaLocation>* out,
+    std::string* error) {
+    if (!out || replica == 0 || !cache_) {
+        if (error) *error = "invalid direct allocation arguments";
+        return false;
+    }
+    const auto selections = cache_->PickNodes(replica);
+    if (selections.size() < replica) {
+        if (error) *error = "insufficient CMS-authorized nodes for direct allocation";
+        return false;
+    }
+    out->clear();
+    out->reserve(replica);
+    for (const auto& selection : selections) {
+        if (selection.node_id.empty() || selection.disk_id.empty()) continue;
+        zb::rpc::ReplicaLocation location;
+        location.set_node_id(selection.node_id);
+        location.set_node_address(selection.address);
+        location.set_disk_id(selection.disk_id);
+        location.set_object_id(object_id);
+        location.set_group_id(selection.group_id);
+        location.set_epoch(selection.epoch);
+        location.set_primary_node_id(selection.node_id);
+        location.set_primary_address(selection.address);
+        location.set_secondary_node_id(selection.secondary_node_id);
+        location.set_secondary_address(selection.secondary_address);
+        location.set_sync_ready(selection.sync_ready);
+        location.set_storage_tier(zb::rpc::STORAGE_TIER_DISK);
+        location.set_replica_state(zb::rpc::REPLICA_READY);
+        out->push_back(std::move(location));
+    }
+    if (out->size() < replica) {
+        if (error) *error = "CMS-authorized direct allocation returned incomplete replicas";
+        return false;
+    }
+    return true;
+}
+
 bool ObjectAllocator::ResolveNodeAddress(const std::string& node_id, std::string* address) const {
     if (!cache_ || node_id.empty() || !address) {
         return false;

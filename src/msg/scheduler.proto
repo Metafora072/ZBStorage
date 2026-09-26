@@ -21,6 +21,7 @@ enum NodeType {
   NODE_REAL = 0;
   NODE_VIRTUAL_POOL = 1;
   NODE_OPTICAL = 2;
+  NODE_METADATA = 3;
 }
 
 enum NodeHealthState {
@@ -67,6 +68,10 @@ message DiskHeartbeat {
   uint64 capacity_bytes = 2;
   uint64 free_bytes = 3;
   bool is_healthy = 4;
+  ManagedDeviceKind device_kind = 5;
+  uint64 read_bandwidth_bytes_per_sec = 6;
+  uint64 write_bandwidth_bytes_per_sec = 7;
+  uint64 accumulated_write_bytes = 8;
 }
 
 message HeartbeatRequest {
@@ -82,6 +87,10 @@ message HeartbeatRequest {
   string peer_node_id = 10;
   string peer_address = 11;
   uint64 applied_lsn = 12;
+  bool readiness_reported = 13;
+  bool initialization_complete = 14;
+  bool metadata_ready = 15;
+  string readiness_message = 16;
 }
 
 message HeartbeatReply {
@@ -102,6 +111,12 @@ message NodeDiskView {
   uint64 free_bytes = 3;
   bool is_healthy = 4;
   uint64 last_update_ms = 5;
+  // Derived by Scheduler as max(capacity_bytes - free_bytes, 0).
+  uint64 used_bytes = 6;
+  ManagedDeviceKind device_kind = 7;
+  uint64 read_bandwidth_bytes_per_sec = 8;
+  uint64 write_bandwidth_bytes_per_sec = 9;
+  uint64 accumulated_write_bytes = 10;
 }
 
 message NodeView {
@@ -181,6 +196,453 @@ message GetOperationStatusRequest {
   string operation_id = 1;
 }
 
+enum ManagedNodeKind {
+  MANAGED_KIND_UNKNOWN = 0;
+  MANAGED_KIND_STORAGE = 1;
+  MANAGED_KIND_METADATA = 2;
+  MANAGED_KIND_OPTICAL_LIBRARY = 3;
+}
+
+enum ManagedExecutionMode {
+  MANAGED_EXECUTION_UNKNOWN = 0;
+  MANAGED_EXECUTION_PHYSICAL = 1;
+  MANAGED_EXECUTION_VIRTUAL = 2;
+  MANAGED_EXECUTION_SIMULATED = 3;
+}
+
+enum ManagedDeviceKind {
+  MANAGED_DEVICE_UNKNOWN = 0;
+  MANAGED_DEVICE_HDD = 1;
+  MANAGED_DEVICE_SSD = 2;
+  MANAGED_DEVICE_DISC = 3;
+  MANAGED_DEVICE_OPTICAL_DRIVE = 4;
+}
+
+enum ManagedLifecycleState {
+  MANAGED_LIFECYCLE_UNKNOWN = 0;
+  MANAGED_LIFECYCLE_JOINING = 1;
+  MANAGED_LIFECYCLE_WORKING = 2;
+  MANAGED_LIFECYCLE_DRAINING = 3;
+  MANAGED_LIFECYCLE_EXITING = 4;
+  MANAGED_LIFECYCLE_RETIRED = 5;
+}
+
+enum ManagedHealthState {
+  MANAGED_HEALTH_UNKNOWN = 0;
+  MANAGED_HEALTH_HEALTHY = 1;
+  MANAGED_HEALTH_SUSPECT = 2;
+  MANAGED_HEALTH_FAILED = 3;
+}
+
+enum ManagedPowerLevel {
+  MANAGED_POWER_UNKNOWN = 0;
+  MANAGED_POWER_OFF = 1;
+  MANAGED_POWER_STANDBY = 2;
+  MANAGED_POWER_MEDIUM = 3;
+  MANAGED_POWER_PEAK = 4;
+}
+
+enum ManagedAdministrativeState {
+  MANAGED_ADMIN_UNKNOWN = 0;
+  MANAGED_ADMIN_ENABLED = 1;
+  MANAGED_ADMIN_DRAINING = 2;
+  MANAGED_ADMIN_DISABLED = 3;
+}
+
+enum ManagedServiceMode {
+  MANAGED_SERVICE_UNKNOWN = 0;
+  MANAGED_SERVICE_READ_WRITE = 1;
+  MANAGED_SERVICE_READ_ONLY = 2;
+}
+
+enum ManagedFailureSource {
+  MANAGED_FAILURE_NONE = 0;
+  MANAGED_FAILURE_HEARTBEAT_TIMEOUT = 1;
+  MANAGED_FAILURE_RELIABILITY_MODEL = 2;
+  MANAGED_FAILURE_INJECTED = 3;
+}
+
+enum ManagedAccessPath {
+  MANAGED_ACCESS_DEFAULT = 0;
+  MANAGED_ACCESS_OPTICAL_CACHE_HIT = 1;
+  MANAGED_ACCESS_OPTICAL_DISC = 2;
+}
+
+enum ManagedOperationKind {
+  MANAGED_OPERATION_OTHER = 0;
+  MANAGED_OPERATION_READ = 1;
+  MANAGED_OPERATION_WRITE = 2;
+}
+
+message ManagedDeviceGroup {
+  string name = 1;
+  ManagedDeviceKind kind = 2;
+  uint64 device_capacity_bytes = 3;
+  uint32 device_count = 4;
+  uint64 per_device_bandwidth_bytes_per_sec = 5;
+  uint32 max_concurrency = 6;
+  uint64 per_device_read_bandwidth_bytes_per_sec = 7;
+  uint64 per_device_write_bandwidth_bytes_per_sec = 8;
+}
+
+message ManagedPowerProfile {
+  uint64 peak_milliwatts = 1;
+  uint64 medium_milliwatts = 2;
+  uint64 standby_milliwatts = 3;
+  uint64 off_milliwatts = 4;
+}
+
+message ManagedReliabilityProfile {
+  uint64 mean_lifetime_ms = 1;
+  uint64 lifetime_stddev_ms = 2;
+  uint64 minimum_lifetime_ms = 3;
+  uint64 mean_time_between_failures_ms = 4;
+  uint64 mean_repair_time_ms = 5;
+  enum Model {
+    NORMAL_LIFETIME = 0;
+    BATHTUB_CURVE = 1;
+  }
+  Model model = 6;
+  uint64 early_failure_window_ms = 7;
+  uint64 wearout_start_age_ms = 8;
+  uint64 early_failure_rate_fit = 9;
+  uint64 useful_life_failure_rate_fit = 10;
+  uint64 wearout_failure_rate_fit = 11;
+}
+
+message ManagedNodeSpec {
+  string node_id = 1;
+  ManagedNodeKind kind = 2;
+  ManagedExecutionMode execution_mode = 3;
+  uint32 logical_node_count = 4;
+  bool participates_in_placement = 5;
+  uint64 external_network_bandwidth_bytes_per_sec = 6;
+  uint64 fixed_access_latency_us = 7;
+  uint64 optical_load_latency_us = 8;
+  uint64 optical_seek_latency_us = 9;
+  repeated ManagedDeviceGroup device_groups = 10;
+  ManagedPowerProfile power = 11;
+  ManagedReliabilityProfile reliability = 12;
+  uint32 technology_generation = 13;
+  bool participates_in_placement_set = 14;
+}
+
+message ManagedDeviceInventory {
+  string device_id = 1;
+  ManagedDeviceKind kind = 2;
+  uint64 capacity_bytes = 3;
+  uint64 free_bytes = 4;
+  uint64 used_bytes = 5;
+  bool is_healthy = 6;
+  uint64 read_bandwidth_bytes_per_sec = 7;
+  uint64 write_bandwidth_bytes_per_sec = 8;
+  uint64 accumulated_write_bytes = 9;
+  uint64 last_update_ms = 10;
+}
+
+message ManagedOpticalLibraryStatus {
+  bool observed = 1;
+  uint32 total_slots = 2;
+  uint32 local_disc_count = 3;
+  uint32 blank_disc_count = 4;
+  uint32 recording_disc_count = 5;
+  uint32 recorded_disc_count = 6;
+  uint32 defective_disc_count = 7;
+  uint64 observed_at_ms = 8;
+  uint64 staging_capacity_bytes = 9;
+  uint64 staging_used_bytes = 10;
+  uint32 pending_write_tasks = 11;
+}
+
+message ManagedNodeReadiness {
+  bool observed = 1;
+  bool initialization_complete = 2;
+  bool inventory_ready = 3;
+  bool metadata_ready = 4;
+  uint64 observed_at_ms = 5;
+  string message = 6;
+}
+
+message ManagedNodeView {
+  ManagedNodeSpec spec = 1;
+  ManagedLifecycleState lifecycle = 2;
+  ManagedHealthState health = 3;
+  ManagedPowerLevel power_level = 4;
+  uint64 join_time_ms = 5;
+  uint64 sampled_lifetime_ms = 6;
+  uint64 planned_exit_time_ms = 7;
+  uint64 actual_exit_time_ms = 8;
+  uint64 last_access_ms = 9;
+  uint64 energy_microjoules = 10;
+  uint64 resident_data_bytes = 11;
+  double last_utilization = 12;
+  uint32 last_queue_depth = 13;
+  uint64 access_operation_count = 14;
+  string failure_reason = 15;
+  uint64 capacity_bytes = 16;
+  uint64 drain_remaining_objects = 17;
+  uint64 drain_remaining_bytes = 18;
+  uint32 drain_active_requests = 19;
+  uint64 drain_last_report_ms = 20;
+  ManagedPowerLevel actuated_power_level = 21;
+  uint64 last_power_actuation_ms = 22;
+  string last_power_actuation_error = 23;
+  uint64 next_failure_time_ms = 24;
+  uint64 repair_due_time_ms = 25;
+  uint64 failure_count = 26;
+  uint64 compact_id = 27;
+  string service_address = 28;
+  ManagedAdministrativeState administrative_state = 29;
+  ManagedServiceMode service_mode = 30;
+  uint64 last_heartbeat_ms = 31;
+  uint64 inventory_generation = 32;
+  uint64 inventory_observed_at_ms = 33;
+  repeated ManagedDeviceInventory inventory_devices = 34;
+  uint64 accumulated_write_bytes = 35;
+  ManagedFailureSource failure_source = 36;
+  ManagedOpticalLibraryStatus optical_library = 37;
+  uint64 wake_count = 38;
+  uint64 standby_transition_count = 39;
+  uint64 power_off_count = 40;
+  uint64 replacement_count = 41;
+  string predecessor_node_id = 42;
+  uint64 observed_capacity_bytes = 43;
+  uint64 observed_free_bytes = 44;
+  uint64 observed_used_bytes = 45;
+  uint64 actuated_energy_microjoules = 46;
+  uint64 last_actuated_energy_update_ms = 47;
+  ManagedNodeReadiness readiness = 48;
+}
+
+message RegisterManagedNodeRequest {
+  ManagedNodeSpec spec = 1;
+  uint64 join_time_ms = 2;
+  uint64 lifetime_seed = 3;
+  bool activate_immediately = 4;
+  string replaces_node_id = 5;
+}
+
+message RemoveManagedNodeRequest {
+  string node_id = 1;
+  uint64 request_ts_ms = 2;
+  bool finalize = 3;
+  bool force = 4;
+}
+
+message ReportNodeMetricsRequest {
+  string node_id = 1;
+  uint64 window_start_ms = 2;
+  uint64 window_end_ms = 3;
+  uint64 read_operations = 4;
+  uint64 write_operations = 5;
+  uint64 other_operations = 6;
+  uint64 read_bytes = 7;
+  uint64 write_bytes = 8;
+  uint32 active_requests = 9;
+  uint32 max_queue_depth = 10;
+  uint64 busy_time_ms = 11;
+  uint64 last_access_ms = 12;
+  ManagedAccessPath access_path = 13;
+  uint64 report_sequence = 14;
+  uint64 reporter_epoch = 15;
+}
+
+message ReportNodeAccessEventRequest {
+  string node_id = 1;
+  uint64 event_time_us = 2;
+  ManagedOperationKind operation = 3;
+  uint64 bytes = 4;
+  uint32 queue_depth = 5;
+  ManagedAccessPath access_path = 6;
+  string correlation_id = 7;
+}
+
+message ReportNodeDrainProgressRequest {
+  string node_id = 1;
+  uint64 report_ts_ms = 2;
+  uint64 remaining_objects = 3;
+  uint64 remaining_bytes = 4;
+  uint32 active_requests = 5;
+}
+
+message ReportOpticalLibraryStatusRequest {
+  string node_id = 1;
+  ManagedOpticalLibraryStatus status = 2;
+}
+
+message SetManagedNodeServiceModeRequest {
+  string node_id = 1;
+  ManagedServiceMode service_mode = 2;
+}
+
+message ReportManagedNodeReadinessRequest {
+  string node_id = 1;
+  ManagedNodeReadiness readiness = 2;
+}
+
+message ManagedNodeRuntimeSnapshot {
+  ManagedNodeView node = 1;
+  uint64 last_metrics_end_ms = 2;
+  uint64 power_state_enter_ms = 3;
+  uint64 last_energy_update_ms = 4;
+  uint32 transition_state = 5;
+  uint64 last_metrics_sequence = 6;
+  uint64 last_metrics_reporter_epoch = 7;
+  uint64 reliability_seed = 8;
+  uint64 last_actuated_energy_update_ms = 9;
+}
+
+message ManagedNodeCatalogSnapshot {
+  uint32 format_version = 1;
+  uint64 generation = 2;
+  uint64 saved_at_ms = 3;
+  repeated ManagedNodeRuntimeSnapshot nodes = 4;
+  repeated ManagedMetricsSample history = 5;
+}
+
+message AdvanceSimulationTimeRequest {
+  uint64 target_time_us = 1;
+}
+
+message AdvanceSimulationTimeReply {
+  SchedulerStatus status = 1;
+  uint64 generation = 2;
+  uint64 simulation_time_us = 3;
+}
+
+message ManagedNodeReply {
+  SchedulerStatus status = 1;
+  uint64 generation = 2;
+  ManagedNodeView node = 3;
+}
+
+message ListManagedNodesRequest {
+  bool include_retired = 1;
+  uint32 offset = 2;
+  uint32 limit = 3;
+  ManagedNodeKind kind = 4;
+  ManagedExecutionMode execution_mode = 5;
+  ManagedLifecycleState lifecycle = 6;
+  ManagedHealthState health = 7;
+  ManagedPowerLevel power_level = 8;
+}
+
+message GetManagedNodeRequest { string node_id = 1; }
+
+message ManagedPowerAndEnergySummary {
+  uint64 generation = 1;
+  uint64 total_nodes = 2;
+  uint64 joining_nodes = 3;
+  uint64 working_nodes = 4;
+  uint64 draining_nodes = 5;
+  uint64 failed_nodes = 6;
+  uint64 retired_nodes = 7;
+  uint64 peak_nodes = 8;
+  uint64 medium_nodes = 9;
+  uint64 standby_nodes = 10;
+  uint64 off_nodes = 11;
+  uint64 total_power_milliwatts = 12;
+  uint64 total_energy_microjoules = 13;
+  uint64 storage_nodes = 14;
+  uint64 metadata_nodes = 15;
+  uint64 optical_library_nodes = 16;
+  uint64 total_capacity_bytes = 17;
+  uint64 total_free_bytes = 18;
+  uint64 total_used_bytes = 19;
+  uint64 available_capacity_bytes = 20;
+  uint64 unavailable_capacity_bytes = 21;
+  uint64 accumulated_write_bytes = 22;
+  uint64 wake_count = 23;
+  uint64 standby_transition_count = 24;
+  uint64 power_off_count = 25;
+  uint64 replacement_count = 26;
+  uint64 total_actuated_power_milliwatts = 27;
+  uint64 total_actuated_energy_microjoules = 28;
+}
+
+message ListManagedNodesReply {
+  SchedulerStatus status = 1;
+  uint64 generation = 2;
+  ManagedPowerAndEnergySummary summary = 3;
+  repeated ManagedNodeView nodes = 4;
+  uint32 next_offset = 5;
+  bool has_more = 6;
+}
+
+enum DrainMigrationState {
+  DRAIN_MIGRATION_PENDING = 0;
+  DRAIN_MIGRATION_RUNNING = 1;
+  DRAIN_MIGRATION_RETRY_WAIT = 2;
+  DRAIN_MIGRATION_COMPLETED = 3;
+  DRAIN_MIGRATION_BLOCKED = 4;
+}
+
+message DrainMigrationTaskView {
+  string migration_id = 1;
+  string source_node_id = 2;
+  DrainMigrationState state = 3;
+  uint64 created_at_ms = 4;
+  uint64 updated_at_ms = 5;
+  uint64 total_objects = 6;
+  uint64 total_bytes = 7;
+  uint64 remaining_objects = 8;
+  uint64 remaining_bytes = 9;
+  uint64 migrated_objects = 10;
+  uint64 migrated_bytes = 11;
+  uint32 retry_count = 12;
+  uint64 next_retry_ms = 13;
+  string last_error = 14;
+}
+
+message GetDrainMigrationRequest {
+  string node_id = 1;
+}
+
+message GetDrainMigrationReply {
+  SchedulerStatus status = 1;
+  DrainMigrationTaskView task = 2;
+}
+
+message ManagedNodeFailureRequest {
+  string node_id = 1;
+  uint64 event_ts_ms = 2;
+  string reason = 3;
+}
+
+message BatchRegisterManagedNodesRequest { repeated RegisterManagedNodeRequest requests = 1; }
+message BatchManagedNodeReply { SchedulerStatus status = 1; repeated ManagedNodeReply results = 2; }
+message BatchRemoveManagedNodesRequest { repeated RemoveManagedNodeRequest requests = 1; }
+message BatchReportNodeAccessEventsRequest { repeated ReportNodeAccessEventRequest requests = 1; }
+
+message RunLongTermSimulationRequest {
+  uint64 target_time_us = 1;
+  uint64 step_us = 2;
+  uint32 max_steps = 3;
+}
+
+message RunLongTermSimulationReply {
+  SchedulerStatus status = 1;
+  uint64 final_time_us = 2;
+  uint64 steps = 3;
+  ManagedPowerAndEnergySummary summary = 4;
+}
+
+message ManagedMetricsSample {
+  uint64 timestamp_ms = 1;
+  ManagedPowerAndEnergySummary summary = 2;
+}
+
+message GetManagedMetricsHistoryRequest {
+  uint64 start_time_ms = 1;
+  uint64 end_time_ms = 2;
+  uint32 limit = 3;
+}
+
+message GetManagedMetricsHistoryReply {
+  SchedulerStatus status = 1;
+  repeated ManagedMetricsSample samples = 2;
+}
+
 service SchedulerService {
   rpc ReportHeartbeat(HeartbeatRequest) returns (HeartbeatReply);
   rpc GetClusterView(GetClusterViewRequest) returns (GetClusterViewReply);
@@ -189,4 +651,23 @@ service SchedulerService {
   rpc StopNode(StopNodeRequest) returns (NodeOperationReply);
   rpc RebootNode(RebootNodeRequest) returns (NodeOperationReply);
   rpc GetOperationStatus(GetOperationStatusRequest) returns (NodeOperationReply);
+  rpc RegisterManagedNode(RegisterManagedNodeRequest) returns (ManagedNodeReply);
+  rpc RemoveManagedNode(RemoveManagedNodeRequest) returns (ManagedNodeReply);
+  rpc ReportNodeMetrics(ReportNodeMetricsRequest) returns (ManagedNodeReply);
+  rpc ReportNodeAccessEvent(ReportNodeAccessEventRequest) returns (ManagedNodeReply);
+  rpc ReportNodeDrainProgress(ReportNodeDrainProgressRequest) returns (ManagedNodeReply);
+  rpc ReportOpticalLibraryStatus(ReportOpticalLibraryStatusRequest) returns (ManagedNodeReply);
+  rpc SetManagedNodeServiceMode(SetManagedNodeServiceModeRequest) returns (ManagedNodeReply);
+  rpc ReportManagedNodeReadiness(ReportManagedNodeReadinessRequest) returns (ManagedNodeReply);
+  rpc AdvanceSimulationTime(AdvanceSimulationTimeRequest) returns (AdvanceSimulationTimeReply);
+  rpc ListManagedNodes(ListManagedNodesRequest) returns (ListManagedNodesReply);
+  rpc GetManagedNode(GetManagedNodeRequest) returns (ManagedNodeReply);
+  rpc GetDrainMigration(GetDrainMigrationRequest) returns (GetDrainMigrationReply);
+  rpc InjectManagedNodeFailure(ManagedNodeFailureRequest) returns (ManagedNodeReply);
+  rpc RepairManagedNode(ManagedNodeFailureRequest) returns (ManagedNodeReply);
+  rpc BatchRegisterManagedNodes(BatchRegisterManagedNodesRequest) returns (BatchManagedNodeReply);
+  rpc BatchRemoveManagedNodes(BatchRemoveManagedNodesRequest) returns (BatchManagedNodeReply);
+  rpc BatchReportNodeAccessEvents(BatchReportNodeAccessEventsRequest) returns (BatchManagedNodeReply);
+  rpc RunLongTermSimulation(RunLongTermSimulationRequest) returns (RunLongTermSimulationReply);
+  rpc GetManagedMetricsHistory(GetManagedMetricsHistoryRequest) returns (GetManagedMetricsHistoryReply);
 }

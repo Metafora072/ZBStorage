@@ -14,6 +14,7 @@
 #include "../config/VirtualNodeConfig.h"
 #include "../service/BrpcVirtualStorageService.h"
 #include "../service/VirtualStorageServiceImpl.h"
+#include "common/metrics/SchedulerMetricsClient.h"
 #include "mds.pb.h"
 #include "scheduler.pb.h"
 
@@ -40,7 +41,10 @@ public:
                                uint32_t node_weight,
                                uint32_t virtual_node_count,
                                uint32_t interval_ms,
-                               zb::virtual_node::VirtualStorageServiceImpl* service)
+                               uint64_t read_bandwidth_bytes_per_sec,
+                               uint64_t write_bandwidth_bytes_per_sec,
+                               zb::virtual_node::VirtualStorageServiceImpl* service,
+                               zb::metrics::NodeMetricsCollector* metrics)
         : scheduler_addr_(std::move(scheduler_addr)),
           node_id_(std::move(node_id)),
           node_address_(std::move(node_address)),
@@ -51,7 +55,10 @@ public:
           node_weight_(node_weight == 0 ? 1 : node_weight),
           virtual_node_count_(virtual_node_count == 0 ? 1 : virtual_node_count),
           interval_ms_(interval_ms == 0 ? 2000 : interval_ms),
-          service_(service) {}
+          read_bandwidth_bytes_per_sec_(read_bandwidth_bytes_per_sec),
+          write_bandwidth_bytes_per_sec_(write_bandwidth_bytes_per_sec),
+          service_(service),
+          metrics_(metrics) {}
 
     bool Start() {
         if (scheduler_addr_.empty() || !service_) {
@@ -101,6 +108,10 @@ private:
             request.set_peer_node_id(peer_node_id_);
             request.set_peer_address(peer_address_);
             request.set_applied_lsn(service_->GetReplicationStatus().applied_lsn);
+            request.set_readiness_reported(true);
+            request.set_initialization_complete(true);
+            request.set_metadata_ready(true);
+            request.set_readiness_message("virtual node storage initialized");
 
             zb::msg::DiskReportReply reports = service_->GetDiskReport();
             for (const auto& disk : reports.reports) {
@@ -109,6 +120,9 @@ private:
                 out->set_capacity_bytes(disk.capacity_bytes);
                 out->set_free_bytes(disk.free_bytes);
                 out->set_is_healthy(disk.is_healthy);
+                out->set_device_kind(zb::rpc::MANAGED_DEVICE_HDD);
+                out->set_read_bandwidth_bytes_per_sec(read_bandwidth_bytes_per_sec_);
+                out->set_write_bandwidth_bytes_per_sec(write_bandwidth_bytes_per_sec_);
             }
 
             zb::rpc::HeartbeatReply response;
@@ -127,6 +141,15 @@ private:
                                                    response.primary_address(),
                                                    response.secondary_node_id(),
                                                    response.secondary_address());
+                std::string metrics_error;
+                if (!zb::metrics::ReportCollectedMetrics(channel.get(),
+                                                         node_id_,
+                                                         metrics_,
+                                                         zb::rpc::MANAGED_ACCESS_DEFAULT,
+                                                         NowMs(),
+                                                         &metrics_error)) {
+                    std::cerr << "Scheduler metrics report failed: " << metrics_error << std::endl;
+                }
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_));
@@ -143,7 +166,10 @@ private:
     uint32_t node_weight_{1};
     uint32_t virtual_node_count_{1};
     uint32_t interval_ms_{2000};
+    uint64_t read_bandwidth_bytes_per_sec_{0};
+    uint64_t write_bandwidth_bytes_per_sec_{0};
     zb::virtual_node::VirtualStorageServiceImpl* service_{};
+    zb::metrics::NodeMetricsCollector* metrics_{};
     std::atomic<bool> stop_{false};
     std::thread thread_;
 };
@@ -293,7 +319,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "Archive meta init failed: " << archive_meta_error << std::endl;
         return 1;
     }
-    zb::virtual_node::BrpcVirtualStorageService brpc_service(&storage_service);
+    zb::metrics::NodeMetricsCollector node_metrics;
+    zb::virtual_node::BrpcVirtualStorageService brpc_service(&storage_service, &node_metrics);
 
     brpc::Server server;
     if (server.AddService(&brpc_service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
@@ -327,10 +354,10 @@ int main(int argc, char* argv[]) {
                                         cfg.node_weight,
                                         cfg.virtual_node_count,
                                         cfg.heartbeat_interval_ms,
-                                        &storage_service);
-    if (!cfg.scheduler_addr.empty()) {
-        reporter.Start();
-    }
+                                        cfg.read_bytes_per_sec,
+                                        cfg.write_bytes_per_sec,
+                                        &storage_service,
+                                        &node_metrics);
     ArchiveCandidateReporter archive_reporter(cfg.mds_addr,
                                               node_id,
                                               node_address,
@@ -346,6 +373,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Failed to start brpc server on port " << FLAGS_port << std::endl;
         return 1;
     }
+    if (!cfg.scheduler_addr.empty()) reporter.Start();
 
     server.RunUntilAskedToQuit();
     std::string snapshot_error;

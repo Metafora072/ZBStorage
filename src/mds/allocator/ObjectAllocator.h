@@ -33,6 +33,10 @@ public:
                                     NodeType required_type,
                                     std::vector<zb::rpc::ReplicaLocation>* out,
                                     std::string* error);
+    bool AllocateObjectDirect(uint32_t replica,
+                              const std::string& object_id,
+                              std::vector<zb::rpc::ReplicaLocation>* out,
+                              std::string* error);
     bool ResolveNodeAddress(const std::string& node_id, std::string* address) const;
     bool ResolveDiskId(const std::string& node_id, uint32_t numeric_disk_id, std::string* disk_id) const;
     void SetPgManager(PGManager* pg_manager);

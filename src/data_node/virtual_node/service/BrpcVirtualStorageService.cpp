@@ -1,6 +1,8 @@
 #include "BrpcVirtualStorageService.h"
 
 #include <brpc/controller.h>
+#include <charconv>
+#include <algorithm>
 #include <iostream>
 
 #include "../../common/ObjectStore.h"
@@ -95,7 +97,9 @@ void FillFileObjectSlice(const zb::msg::FileObjectSlice& in, zb::rpc::FileObject
 
 } // namespace
 
-BrpcVirtualStorageService::BrpcVirtualStorageService(VirtualStorageServiceImpl* service) : service_(service) {}
+BrpcVirtualStorageService::BrpcVirtualStorageService(VirtualStorageServiceImpl* service,
+                                                     zb::metrics::NodeMetricsCollector* metrics)
+    : service_(service), metrics_(metrics) {}
 
 void BrpcVirtualStorageService::WriteObject(google::protobuf::RpcController* cntl_base,
                                             const zb::rpc::WriteObjectRequest* request,
@@ -111,6 +115,8 @@ void BrpcVirtualStorageService::WriteObject(google::protobuf::RpcController* cnt
         }
         return;
     }
+    auto metric = metrics_ ? metrics_->Start(zb::metrics::OperationKind::kWrite)
+                           : zb::metrics::NodeMetricsCollector::ScopedOperation{};
 
     zb::data_node::ObjectWriteRequest object_req;
     object_req.disk_id = request->disk_id();
@@ -124,6 +130,7 @@ void BrpcVirtualStorageService::WriteObject(google::protobuf::RpcController* cnt
     LogFailure("WriteObject", st, "disk_id=" + request->disk_id() + " object_id=" + request->object_id());
     if (st.ok()) {
         response->set_bytes(static_cast<uint64_t>(request->data().size()));
+        metric.SetBytes(static_cast<uint64_t>(request->data().size()));
     }
 }
 
@@ -141,6 +148,8 @@ void BrpcVirtualStorageService::ReadObject(google::protobuf::RpcController* cntl
         }
         return;
     }
+    auto metric = metrics_ ? metrics_->Start(zb::metrics::OperationKind::kRead)
+                           : zb::metrics::NodeMetricsCollector::ScopedOperation{};
 
     zb::data_node::ObjectReadRequest object_req;
     object_req.disk_id = request->disk_id();
@@ -153,6 +162,7 @@ void BrpcVirtualStorageService::ReadObject(google::protobuf::RpcController* cntl
     if (result.status.ok()) {
         response->set_bytes(static_cast<uint64_t>(result.data.size()));
         response->set_data(result.data);
+        metric.SetBytes(static_cast<uint64_t>(result.data.size()));
     }
 }
 
@@ -170,6 +180,8 @@ void BrpcVirtualStorageService::DeleteObject(google::protobuf::RpcController* cn
         }
         return;
     }
+    auto metric = metrics_ ? metrics_->Start(zb::metrics::OperationKind::kOther)
+                           : zb::metrics::NodeMetricsCollector::ScopedOperation{};
 
     zb::data_node::ObjectDeleteRequest object_req;
     object_req.disk_id = request->disk_id();
@@ -177,6 +189,63 @@ void BrpcVirtualStorageService::DeleteObject(google::protobuf::RpcController* cn
     const zb::msg::Status st = service_->DeleteObject(object_req);
     FillStatus(st, response->mutable_status());
     LogFailure("DeleteObject", st, "disk_id=" + request->disk_id() + " object_id=" + request->object_id());
+}
+
+void BrpcVirtualStorageService::ListObjects(google::protobuf::RpcController* cntl_base,
+                                            const zb::rpc::ListObjectsRequest* request,
+                                            zb::rpc::ListObjectsReply* response,
+                                            google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+    (void)cntl_base;
+    if (!service_ || !request || !response) {
+        if (response) {
+            response->mutable_status()->set_code(zb::rpc::STATUS_INTERNAL_ERROR);
+            response->mutable_status()->set_message("Service not initialized");
+        }
+        return;
+    }
+    uint64_t offset = 0;
+    const auto& token = request->page_token();
+    if (!token.empty()) {
+        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), offset);
+        if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size()) {
+            response->mutable_status()->set_code(zb::rpc::STATUS_INVALID_ARGUMENT);
+            response->mutable_status()->set_message("invalid page_token");
+            return;
+        }
+    }
+    std::vector<real_node::ArchiveObjectMeta> objects;
+    const auto status = service_->ListTrackedObjects(&objects);
+    if (!status.ok()) {
+        FillStatus(status, response->mutable_status());
+        return;
+    }
+    std::sort(objects.begin(), objects.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.disk_id == rhs.disk_id ? lhs.object_id < rhs.object_id : lhs.disk_id < rhs.disk_id;
+    });
+    uint64_t total_bytes = 0;
+    for (const auto& object : objects) {
+        total_bytes += object.size_bytes;
+    }
+    response->set_total_objects(objects.size());
+    response->set_total_bytes(total_bytes);
+    const uint64_t limit = std::min<uint64_t>(
+        request->max_objects() == 0 ? 1000 : request->max_objects(), 10000);
+    offset = std::min<uint64_t>(offset, objects.size());
+    const uint64_t end = offset + std::min<uint64_t>(limit, objects.size() - offset);
+    for (uint64_t i = offset; i < end; ++i) {
+        auto* out = response->add_objects();
+        out->set_disk_id(objects[i].disk_id);
+        out->set_object_id(objects[i].object_id);
+        out->set_size_bytes(objects[i].size_bytes);
+        out->set_checksum(objects[i].checksum);
+        out->set_last_access_ts_ms(objects[i].last_access_ts_ms);
+    }
+    if (end < objects.size()) {
+        response->set_next_page_token(std::to_string(end));
+    }
+    response->mutable_status()->set_code(zb::rpc::STATUS_OK);
+    response->mutable_status()->set_message("OK");
 }
 
 void BrpcVirtualStorageService::ResetNodeData(google::protobuf::RpcController* cntl_base,
@@ -219,6 +288,8 @@ void BrpcVirtualStorageService::ReadArchivedFile(google::protobuf::RpcController
         }
         return;
     }
+    auto metric = metrics_ ? metrics_->Start(zb::metrics::OperationKind::kRead)
+                           : zb::metrics::NodeMetricsCollector::ScopedOperation{};
 
     zb::msg::ReadArchivedFileRequest internal_req;
     internal_req.disc_id = request->disc_id();
@@ -231,6 +302,9 @@ void BrpcVirtualStorageService::ReadArchivedFile(google::protobuf::RpcController
     FillStatus(internal_reply.status, response->mutable_status());
     response->set_bytes(internal_reply.bytes);
     response->set_data(internal_reply.data);
+    if (internal_reply.status.ok()) {
+        metric.SetBytes(internal_reply.bytes);
+    }
 }
 
 void BrpcVirtualStorageService::UpdateArchiveState(google::protobuf::RpcController* cntl_base,

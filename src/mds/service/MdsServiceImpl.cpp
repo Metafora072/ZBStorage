@@ -867,10 +867,12 @@ MdsServiceImpl::MdsServiceImpl(RocksMetaStore* store,
                                uint64_t masstree_preload_memory_reserve_bytes,
                                double masstree_preload_estimate_multiplier,
                                bool masstree_preload_background,
+                               CmsNodeRegistry* node_registry,
                                FileArchiveCandidateQueue* candidate_queue,
                                ArchiveLeaseManager* lease_manager)
     : store_(store),
       allocator_(allocator),
+      node_registry_(node_registry),
       default_object_unit_size_(default_object_unit_size),
       archive_meta_root_(archive_meta_root),
       masstree_root_(masstree_root),
@@ -1047,6 +1049,7 @@ void MdsServiceImpl::Lookup(google::protobuf::RpcController* cntl_base,
                             google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)cntl_base;
+    auto metric = metrics_.Start(zb::metrics::OperationKind::kOther);
 
     if (!store_ || !request || !response) {
         FillStatus(response ? response->mutable_status() : nullptr,
@@ -1082,6 +1085,7 @@ void MdsServiceImpl::Getattr(google::protobuf::RpcController* cntl_base,
                              google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)cntl_base;
+    auto metric = metrics_.Start(zb::metrics::OperationKind::kOther);
 
     if (!store_ || !request || !response) {
         FillStatus(response ? response->mutable_status() : nullptr,
@@ -1116,6 +1120,7 @@ void MdsServiceImpl::Open(google::protobuf::RpcController* cntl_base,
                           google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)cntl_base;
+    auto metric = metrics_.Start(zb::metrics::OperationKind::kOther);
 
     if (!store_ || !request || !response) {
         FillStatus(response ? response->mutable_status() : nullptr,
@@ -1180,6 +1185,7 @@ void MdsServiceImpl::Close(google::protobuf::RpcController* cntl_base,
                            google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)cntl_base;
+    auto metric = metrics_.Start(zb::metrics::OperationKind::kOther);
 
     if (!store_ || !request || !response) {
         FillStatus(response ? response->mutable_status() : nullptr,
@@ -1210,6 +1216,7 @@ void MdsServiceImpl::Create(google::protobuf::RpcController* cntl_base,
                             google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)cntl_base;
+    auto metric = metrics_.Start(zb::metrics::OperationKind::kOther);
 
     if (!store_ || !allocator_ || !request || !response) {
         FillStatus(response ? response->mutable_status() : nullptr,
@@ -1222,6 +1229,11 @@ void MdsServiceImpl::Create(google::protobuf::RpcController* cntl_base,
         FillStatus(response->mutable_status(), zb::rpc::MDS_INVALID_ARGUMENT, "path is empty");
         return;
     }
+
+    // A CMS catalog commit that closes node admission, and the final
+    // zero-reference scan, take this lock exclusively. Thus no Create can
+    // select an old node and publish its inode across the retirement barrier.
+    std::shared_lock<std::shared_mutex> placement_guard(placement_transaction_mu_);
 
     std::string error;
     uint64_t parent_inode = 0;
@@ -1359,6 +1371,7 @@ void MdsServiceImpl::Mkdir(google::protobuf::RpcController* cntl_base,
                            google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)cntl_base;
+    auto metric = metrics_.Start(zb::metrics::OperationKind::kOther);
 
     if (!store_ || !request || !response) {
         FillStatus(response ? response->mutable_status() : nullptr,
@@ -1453,6 +1466,7 @@ void MdsServiceImpl::Readdir(google::protobuf::RpcController* cntl_base,
                              google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)cntl_base;
+    auto metric = metrics_.Start(zb::metrics::OperationKind::kOther);
 
     if (!store_ || !request || !response) {
         FillStatus(response ? response->mutable_status() : nullptr,
@@ -1499,6 +1513,7 @@ void MdsServiceImpl::Rename(google::protobuf::RpcController* cntl_base,
                             google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)cntl_base;
+    auto metric = metrics_.Start(zb::metrics::OperationKind::kOther);
 
     if (!store_ || !request || !response) {
         FillStatus(response ? response->mutable_status() : nullptr,
@@ -1610,6 +1625,7 @@ void MdsServiceImpl::Unlink(google::protobuf::RpcController* cntl_base,
                             google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)cntl_base;
+    auto metric = metrics_.Start(zb::metrics::OperationKind::kOther);
 
     if (!store_ || !request || !response) {
         FillStatus(response ? response->mutable_status() : nullptr,
@@ -1691,6 +1707,7 @@ void MdsServiceImpl::Rmdir(google::protobuf::RpcController* cntl_base,
                            google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)cntl_base;
+    auto metric = metrics_.Start(zb::metrics::OperationKind::kOther);
 
     if (!store_ || !request || !response) {
         FillStatus(response ? response->mutable_status() : nullptr,
@@ -1767,6 +1784,7 @@ void MdsServiceImpl::GetFileLocation(google::protobuf::RpcController* cntl_base,
                                    google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)cntl_base;
+    auto metric = metrics_.Start(zb::metrics::OperationKind::kOther);
 
     if (!store_ || !request || !response) {
         FillStatus(response ? response->mutable_status() : nullptr,
@@ -1804,12 +1822,195 @@ void MdsServiceImpl::GetFileLocation(google::protobuf::RpcController* cntl_base,
     FillStatus(response->mutable_status(), zb::rpc::MDS_OK, "OK");
 }
 
+void MdsServiceImpl::CommitFileMigration(
+    google::protobuf::RpcController* cntl_base,
+    const zb::rpc::CommitFileMigrationRequest* request,
+    zb::rpc::CommitFileMigrationReply* response,
+    google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+    (void)cntl_base;
+    auto metric = metrics_.Start(zb::metrics::OperationKind::kOther);
+    if (!store_ || !request || !response || request->migration_id().empty() ||
+        request->inode_id() == 0 || !request->has_expected_source() || !request->has_target() ||
+        request->target().node_id().empty() || request->target().disk_id().empty()) {
+        FillStatus(response ? response->mutable_status() : nullptr,
+                   zb::rpc::MDS_INVALID_ARGUMENT,
+                   "invalid file migration commit request");
+        return;
+    }
+
+    // Migration changes an inode reference and therefore participates in the
+    // same transaction boundary as allocation and the final retirement scan.
+    std::shared_lock<std::shared_mutex> placement_guard(placement_transaction_mu_);
+    if (!node_registry_ || !node_registry_->IsWriteAdmitted(request->target().node_id())) {
+        FillStatus(response->mutable_status(), zb::rpc::MDS_STALE_EPOCH,
+                   "migration target is no longer admitted by CMS");
+        return;
+    }
+    std::lock_guard<std::mutex> lock(file_migration_mu_);
+    std::string expected_inode_payload;
+    std::string error;
+    if (!store_->Get(InodeKey(request->inode_id()), &expected_inode_payload, &error)) {
+        FillStatus(response->mutable_status(),
+                   error.empty() ? zb::rpc::MDS_NOT_FOUND : zb::rpc::MDS_INTERNAL_ERROR,
+                   error.empty() ? "inode not found" : error);
+        return;
+    }
+    zb::rpc::DiskFileLocation current;
+    if (!LoadDiskFileLocation(request->inode_id(), &current, &error)) {
+        FillStatus(response->mutable_status(),
+                   error.empty() ? zb::rpc::MDS_NOT_FOUND : zb::rpc::MDS_INTERNAL_ERROR,
+                   error.empty() ? "disk file location not found" : error);
+        return;
+    }
+    const auto same_location = [](const zb::rpc::DiskFileLocation& lhs,
+                                  const zb::rpc::DiskFileLocation& rhs) {
+        return lhs.node_id() == rhs.node_id() && lhs.disk_id() == rhs.disk_id();
+    };
+    if (same_location(current, request->target())) {
+        *response->mutable_location() = current;
+        response->set_already_committed(true);
+        FillStatus(response->mutable_status(), zb::rpc::MDS_OK, "already committed");
+        return;
+    }
+    if (!same_location(current, request->expected_source())) {
+        *response->mutable_location() = current;
+        FillStatus(response->mutable_status(),
+                   zb::rpc::MDS_STALE_EPOCH,
+                   "file location changed while migration was in progress");
+        return;
+    }
+
+    rocksdb::WriteBatch batch;
+    bool matched = false;
+    if (!SaveDiskFileLocation(request->inode_id(), request->target(), &batch) ||
+        !store_->WriteBatchIfValueEquals(InodeKey(request->inode_id()), expected_inode_payload,
+                                         &batch, &matched, &error)) {
+        FillStatus(response->mutable_status(),
+                   zb::rpc::MDS_INTERNAL_ERROR,
+                   error.empty() ? "failed to persist migrated file location" : error);
+        return;
+    }
+    if (!matched) {
+        FillStatus(response->mutable_status(), zb::rpc::MDS_STALE_EPOCH,
+                   "inode changed while migration commit was in progress");
+        return;
+    }
+    *response->mutable_location() = request->target();
+    FillStatus(response->mutable_status(), zb::rpc::MDS_OK, "OK");
+}
+
+void MdsServiceImpl::CommitCmsNodeCatalog(
+    google::protobuf::RpcController* cntl_base,
+    const zb::rpc::CommitCmsNodeCatalogRequest* request,
+    zb::rpc::CommitCmsNodeCatalogReply* response,
+    google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+    (void)cntl_base;
+    if (!node_registry_ || !request || !response || request->scheduler_generation() == 0) {
+        FillStatus(response ? response->mutable_status() : nullptr,
+                   zb::rpc::MDS_INVALID_ARGUMENT,
+                   "CMS node registry is unavailable or request is invalid");
+        return;
+    }
+    std::vector<zb::rpc::CmsNodeCatalogEntry> proposed;
+    proposed.reserve(static_cast<size_t>(request->nodes_size()));
+    for (const auto& node : request->nodes()) proposed.push_back(node);
+    uint64_t cms_generation = 0;
+    std::vector<zb::rpc::CmsNodeCompactIdAssignment> assignments;
+    std::string error;
+    std::unique_lock<std::shared_mutex> placement_guard(placement_transaction_mu_);
+    if (!node_registry_->Commit(request->scheduler_generation(), proposed,
+                                &cms_generation, &assignments, &error)) {
+        FillStatus(response->mutable_status(), zb::rpc::MDS_STALE_EPOCH,
+                   error.empty() ? "CMS rejected node catalog proposal" : error);
+        return;
+    }
+    response->set_cms_generation(cms_generation);
+    response->set_scheduler_generation(request->scheduler_generation());
+    for (const auto& assignment : assignments) *response->add_assignments() = assignment;
+    FillStatus(response->mutable_status(), zb::rpc::MDS_OK, "CMS catalog committed");
+}
+
+void MdsServiceImpl::GetCmsNodeCatalog(
+    google::protobuf::RpcController* cntl_base,
+    const zb::rpc::GetCmsNodeCatalogRequest* request,
+    zb::rpc::GetCmsNodeCatalogReply* response,
+    google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+    (void)cntl_base;
+    if (!node_registry_ || !request || !response) {
+        FillStatus(response ? response->mutable_status() : nullptr,
+                   zb::rpc::MDS_INTERNAL_ERROR, "CMS node registry is unavailable");
+        return;
+    }
+    uint64_t cms_generation = 0;
+    uint64_t scheduler_generation = 0;
+    const auto nodes = node_registry_->Snapshot(&cms_generation, &scheduler_generation);
+    response->set_cms_generation(cms_generation);
+    response->set_scheduler_generation(scheduler_generation);
+    for (const auto& node : nodes) *response->add_nodes() = node;
+    FillStatus(response->mutable_status(), zb::rpc::MDS_OK, "OK");
+}
+
+void MdsServiceImpl::VerifyNodeReferences(
+    google::protobuf::RpcController* cntl_base,
+    const zb::rpc::VerifyNodeReferencesRequest* request,
+    zb::rpc::VerifyNodeReferencesReply* response,
+    google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+    (void)cntl_base;
+    if (!store_ || !store_->db() || !request || !response || request->node_id().empty()) {
+        FillStatus(response ? response->mutable_status() : nullptr,
+                   zb::rpc::MDS_INVALID_ARGUMENT, "invalid node reference verification request");
+        return;
+    }
+    uint64_t disk_references = 0;
+    uint64_t optical_references = 0;
+    std::unique_lock<std::shared_mutex> placement_guard(placement_transaction_mu_);
+    std::unique_ptr<rocksdb::Iterator> it(store_->db()->NewIterator(rocksdb::ReadOptions()));
+    const std::string prefix = "I/";
+    for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
+        UnifiedInodeRecord inode;
+        std::string decode_error;
+        if (!MetaCodec::DecodeUnifiedInodeRecord(it->value().ToString(), &inode, &decode_error)) {
+            FillStatus(response->mutable_status(), zb::rpc::MDS_INTERNAL_ERROR,
+                       "cannot verify node references: invalid inode " +
+                           it->key().ToString() + ": " + decode_error);
+            return;
+        }
+        if (inode.inode_type != static_cast<uint8_t>(zb::rpc::INODE_FILE)) {
+            continue;
+        }
+        zb::rpc::DiskFileLocation disk;
+        if (PopulateDiskFileLocationFromUnifiedRecord(inode, &disk) &&
+            disk.node_id() == request->node_id()) {
+            ++disk_references;
+        }
+        zb::rpc::OpticalFileLocation optical;
+        if (PopulateOpticalFileLocationFromUnifiedRecord(inode, &optical) &&
+            optical.node_id() == request->node_id()) {
+            ++optical_references;
+        }
+    }
+    if (!it->status().ok()) {
+        FillStatus(response->mutable_status(), zb::rpc::MDS_INTERNAL_ERROR,
+                   "failed to scan CMS inode references: " + it->status().ToString());
+        return;
+    }
+    response->set_disk_inode_references(disk_references);
+    response->set_optical_inode_references(optical_references);
+    response->set_zero_references(disk_references == 0 && optical_references == 0);
+    FillStatus(response->mutable_status(), zb::rpc::MDS_OK, "OK");
+}
+
 void MdsServiceImpl::UpdateInodeStat(google::protobuf::RpcController* cntl_base,
                                      const zb::rpc::UpdateInodeStatRequest* request,
                                      zb::rpc::UpdateInodeStatReply* response,
                                      google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)cntl_base;
+    auto metric = metrics_.Start(zb::metrics::OperationKind::kOther);
 
     if (!store_ || !request || !response) {
         FillStatus(response ? response->mutable_status() : nullptr,
@@ -2790,33 +2991,23 @@ bool MdsServiceImpl::SelectFilePrimaryLocationWithPreference(uint64_t inode_id,
     std::vector<zb::rpc::ReplicaLocation> replicas;
     std::string local_error;
     if (strict_type) {
-        const bool ok = strict_tier_bypass_pg_
-                            ? allocator_->AllocateObjectDirectByType(1,
-                                                                     object_id,
-                                                                     preferred_type,
-                                                                     &replicas,
-                                                                     &local_error)
-                            : allocator_->AllocateObjectByPgWithType(1,
-                                                                     object_id,
-                                                                     0,
-                                                                     preferred_type,
-                                                                     true,
-                                                                     &replicas,
-                                                                     &local_error);
+        const bool ok = allocator_->AllocateObjectDirectByType(1,
+                                                               object_id,
+                                                               preferred_type,
+                                                               &replicas,
+                                                               &local_error);
         if (!ok || replicas.empty()) {
             if (error) {
                 *error = local_error.empty() ? "no replica matches strict placement policy" : local_error;
             }
             return false;
         }
-    } else if (!ResolveObjectReplicas(1, object_id, 0, &replicas, &local_error) || replicas.empty()) {
-        replicas.clear();
-        if (!allocator_->AllocateObject(1, object_id, &replicas) || replicas.empty()) {
-            if (error) {
-                *error = local_error.empty() ? "failed to allocate file primary location" : local_error;
-            }
-            return false;
+    } else if (!allocator_->AllocateObjectDirect(1, object_id, &replicas, &local_error) ||
+               replicas.empty()) {
+        if (error) {
+            *error = local_error.empty() ? "failed CMS-authorized I/O placement" : local_error;
         }
+        return false;
     }
 
     for (const auto& replica : replicas) {

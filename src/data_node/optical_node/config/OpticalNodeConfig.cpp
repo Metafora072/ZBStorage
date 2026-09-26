@@ -186,6 +186,20 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
                 return {};
             }
             cfg.available_volume_id_count = static_cast<uint8_t>(count);
+        } else if (key == "DISC_CAPACITY_BYTES") {
+            if (!ParseUint64(value, &cfg.disc_capacity_bytes)) {
+                if (error) {
+                    *error = "Invalid DISC_CAPACITY_BYTES at line " + std::to_string(line_no);
+                }
+                return {};
+            }
+        } else if (key == "STANDARD_IMAGES_PER_DISC") {
+            if (!ParseUint32(value, &cfg.standard_images_per_disc)) {
+                if (error) {
+                    *error = "Invalid STANDARD_IMAGES_PER_DISC at line " + std::to_string(line_no);
+                }
+                return {};
+            }
         }
     }
 
@@ -215,6 +229,12 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
     }
     if (cfg.available_volume_id_count == 0) {
         cfg.available_volume_id_count = 5;
+    }
+    if (cfg.disc_capacity_bytes == 0) {
+        cfg.disc_capacity_bytes = 1099511627776ULL;
+    }
+    if (cfg.standard_images_per_disc == 0) {
+        cfg.standard_images_per_disc = 100;
     }
     return cfg;
 }

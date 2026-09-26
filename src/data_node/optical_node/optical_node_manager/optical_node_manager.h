@@ -14,7 +14,7 @@
 
 #include <cd_manager_sim/cd_manager.h>
 #include <optical_node_manager_structs.h>
-#include <space_manager/image_dir_manager.h>
+#include <space_manager/space_manager.h>
 #include <volume_manager/volume_manager.h>
 
 // 仅用于 scheduler 出站 channel 的不透明持有，避免在头文件引入 brpc 依赖。
@@ -28,12 +28,16 @@ public:
     // volume_size / size_threshold 透传给 volume_manager；同时构建 cd_manager 调度组件。
     // root_dir / capacity_in_images / available_volume_id_count 为启动所需的工作目录、
     // image_dir 镜像数上限与 volume_id 队列容量上限。
+    // disc_capacity_bytes / standard_images_per_disc 为光盘打包参数（单张光盘容量上限
+    // 与标准镜像数基线）。
     // scheduler_addr 为 scheduler 服务地址，供归档线程查询全量节点视图（node_id→address）。
     OpticalNodeManager(uint64_t volume_size,
                        double size_threshold,
                        const std::string& root_dir,
                        uint64_t capacity_in_images,
                        uint8_t available_volume_id_count,
+                       uint64_t disc_capacity_bytes,
+                       uint32_t standard_images_per_disc,
                        const std::string& scheduler_addr);
     ~OpticalNodeManager();
 
@@ -114,8 +118,8 @@ private:
     // 启动 cd_manager 与后台工作线程；任一失败回滚并返回 false。
     bool StartBackgroundWorkers();
 
-    // 规范化 root_dir_，派生七个子目录并下发到 volume_manager；
-    // 构造 cd_manager_ / image_dir_manager_；失败回滚已建目录与路径下发。
+    // 规范化 root_dir_，派生八个子目录并下发到 volume_manager；
+    // 构造 cd_manager_ / space_manager_；失败回滚已建目录与路径下发。
     bool InitializeDir();
 
     // 倒序删除 InitializeDir 内部本次新建的目录；非空 / 无权限时静默跳过。
@@ -135,7 +139,7 @@ private:
     std::string VolumeImagePath(const std::string& volume_id) const;
 
     // 把 volume_id 对应读镜像的 LRU 访问时间推前（命中后推迟淘汰）。
-    // 解析失败 / 未登记时静默跳过（best-effort）；调用方需已持有 image_dir_manager_ 的读锁。
+    // 解析失败 / 未登记时静默跳过（best-effort）；调用方需已持有 space_manager_ 的读锁。
     void TouchVolume(const std::string& volume_id);
 
     // cd_manager 读完成回调（对应 CD_READ 任务）：镜像转移 + 触发按卷批量读。
@@ -230,7 +234,7 @@ private:
     std::unique_ptr<cd_manager_sim::CDManager> cd_manager_;
 
     // 卷镜像目录的容量管理 + LRU 淘汰；InitializeDir 阶段构造。
-    std::unique_ptr<space_manager::ImageDirManager> image_dir_manager_;
+    std::unique_ptr<space_manager::SpaceManager> space_manager_;
 
     // 后台工作线程：光盘库读 / 压缩 / 刻录 / 归档。
     std::thread cd_read_task_thread_;
@@ -270,20 +274,24 @@ private:
     std::unordered_set<uint64_t> pending_pack_inode_ids_;
     std::mutex pending_pack_inode_ids_mutex_;
 
-    // InitializeDir 派生的七个子目录路径。
+    // InitializeDir 派生的八个子目录路径。
     std::string root_dir_;
     std::string input_file_dir_;
     std::string temp_dir_;
     std::string image_dir_;
     std::string read_dir_;
     std::string disc_sim_dir_;
-    // 持久化元数据目录：用于存放本节点需要跨重启保留的信息。
     std::string meta_dir_;
-    // 任务日志目录：用于存放已完成 / 进行中任务等信息。
     std::string log_dir_;
+    std::string write_buffer_dir_;
 
-    // 构造函数给出的 image_dir 镜像数上限，InitializeDir 时下发给 image_dir_manager_。
+    // 构造函数给出的 image_dir 镜像数上限，InitializeDir 时下发给 space_manager_。
     uint64_t capacity_in_images_{0};
+
+    // 构造函数给出的光盘打包参数：单张光盘容量上限（字节）与单张光盘标准镜像数基线。
+    // 当前仅完成配置透传，待光盘打包逻辑接入后由打包 / 刻录路径消费。
+    uint64_t disc_capacity_bytes_{0};
+    uint32_t standard_images_per_disc_{0};
 
     // 原子地更新 status_ 与 last_status_reason_；提供稳定的字符串生命周期。
     void SetStatus(const std::string& new_status, const std::string& reason = std::string());

@@ -36,6 +36,11 @@ struct OpticalNodeConfig {
     // available_volume_ids 队列容量上限
     uint8_t available_volume_id_count{5};
 
+    // 光盘打包：单张光盘容量上限（字节）与单张光盘标准镜像数。
+    // 标准镜像数为基线口径，实际单张光盘按容量可能容纳更多镜像。
+    uint64_t disc_capacity_bytes{1099511627776ULL};
+    uint32_t standard_images_per_disc{100};
+
     static OpticalNodeConfig LoadFromFile(const std::string& path, std::string* error);
 };
 

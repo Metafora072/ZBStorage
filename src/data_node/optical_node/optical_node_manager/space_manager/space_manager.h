@@ -11,7 +11,7 @@
 #include <volume_manager/error_codes.h>
 
 /**
- * @file image_dir_manager.h
+ * @file space_manager.h
  * @brief image_dir 空间管理器
  *
  * 该模块负责管理 image_dir_ 目录下卷镜像的元信息与容量约束。
@@ -68,7 +68,7 @@ struct ImageDirStats {
  * 与 VolumeManager::PackVolume 的 output_path 格式保持一致：
  *     output_path = temp_dir_ + "volume_" + std::to_string(volume_id) + ".vimg"
  */
-class ImageDirManager {
+class SpaceManager {
 public:
     /**
      * @brief 构造函数
@@ -81,22 +81,22 @@ public:
      * 会确保 SetDiscSimDir() 在 RebuildManagementTable 之后、首次
      * MoveFrom / RemoveSingleReadImage / RemoveWriteImage 之前调用。
      */
-    explicit ImageDirManager(std::string image_dir_path);
+    explicit SpaceManager(std::string image_dir_path);
 
     /**
      * @brief 析构函数
      */
-    ~ImageDirManager();
+    ~SpaceManager();
 
-    ImageDirManager(const ImageDirManager&) = delete;
-    ImageDirManager& operator=(const ImageDirManager&) = delete;
+    SpaceManager(const SpaceManager&) = delete;
+    SpaceManager& operator=(const SpaceManager&) = delete;
 
     /**
      * @brief 设置模拟光盘库目录（disc_sim_dir）
      *
      * disc_sim_dir 是当前系统为适配"模拟光盘库（cd_manager_sim）"而引入的特殊目录：
      * 模拟光盘库不会真正销毁/弹出光盘——为了与"真实光盘库把光盘放回库位"的物理行为
-     * 保持一致，ImageDirManager 的释放路径（RemoveSingleReadImage / RemoveWriteImage
+     * 保持一致，SpaceManager 的释放路径（RemoveSingleReadImage / RemoveWriteImage
      * / MoveFrom 容量满时换出 victim）不再是简单的 unlink，而是把镜像文件 rename(2)
      * 到 disc_sim_dir/ 下，让后续的 OnCDReadComplete 重新"从光盘库加载"时能够找到。
      *

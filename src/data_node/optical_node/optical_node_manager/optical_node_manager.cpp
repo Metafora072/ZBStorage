@@ -114,6 +114,8 @@ namespace optical_node_manager {
                                            const std::string& root_dir,
                                            uint64_t capacity_in_images,
                                            uint8_t available_volume_id_count,
+                                           uint64_t disc_capacity_bytes,
+                                           uint32_t standard_images_per_disc,
                                            const std::string& scheduler_addr)
         : volume_manager_(volume_size, size_threshold),
           cd_read_task_queue_(new WR_task::WRTaskQueue()),
@@ -126,6 +128,8 @@ namespace optical_node_manager {
         root_dir_ = root_dir;
         capacity_in_images_ = capacity_in_images;
         available_volume_id_count_ = available_volume_id_count;
+        disc_capacity_bytes_ = disc_capacity_bytes;
+        standard_images_per_disc_ = standard_images_per_disc;
     }
 
     // 把字符串先拷到成员变量再发布指针，避免栈上临时 string 析构导致悬空。
@@ -252,18 +256,19 @@ namespace optical_node_manager {
             return false;
         }
 
-        // 规范化 root_dir_ 并派生七个子目录。
+        // 规范化 root_dir_ 并派生八个子目录。
         if (root_dir_.back() != '/') {
             root_dir_ += '/';
         }
 
-        input_file_dir_ = root_dir_ + "input/";
-        temp_dir_       = root_dir_ + "temp/";
-        image_dir_      = root_dir_ + "image/";
-        read_dir_       = root_dir_ + "read/";
-        disc_sim_dir_   = root_dir_ + "disc_sim/";
-        meta_dir_       = root_dir_ + "meta/";
-        log_dir_        = root_dir_ + "log/";
+        input_file_dir_   = root_dir_ + "input/";
+        temp_dir_         = root_dir_ + "temp/";
+        image_dir_        = root_dir_ + "image/";
+        read_dir_         = root_dir_ + "read/";
+        disc_sim_dir_     = root_dir_ + "disc_sim/";
+        meta_dir_         = root_dir_ + "meta/";
+        log_dir_          = root_dir_ + "log/";
+        write_buffer_dir_ = root_dir_ + "write_buffer/";
 
         const std::string dirs[] = {
             root_dir_,
@@ -274,6 +279,7 @@ namespace optical_node_manager {
             disc_sim_dir_,
             meta_dir_,
             log_dir_,
+            write_buffer_dir_,
         };
 
         // 记录本次新创建的目录，失败回滚时只删这些。
@@ -341,7 +347,7 @@ namespace optical_node_manager {
             return false;
         }
 
-        // 每次 InitializeDir 入口强制重建 cd_manager_ / image_dir_manager_：
+        // 每次 InitializeDir 入口强制重建 cd_manager_ / space_manager_：
         // 旧对象（若存在）先 Stop / reset，注入本轮 disc_sim_dir_。
         if (cd_manager_ != nullptr) {
             cd_manager_->Stop();
@@ -366,53 +372,53 @@ namespace optical_node_manager {
             return false;
         }
 
-        if (image_dir_manager_ != nullptr) {
-            image_dir_manager_.reset();
+        if (space_manager_ != nullptr) {
+            space_manager_.reset();
         }
         try {
-            image_dir_manager_ = std::make_unique<space_manager::ImageDirManager>(image_dir_);
+            space_manager_ = std::make_unique<space_manager::SpaceManager>(image_dir_);
             const volumemanager::ErrorCode rebuild_ret =
-                image_dir_manager_->RebuildManagementTable();
+                space_manager_->RebuildManagementTable();
             if (rebuild_ret != volumemanager::ErrorCode::SUCCESS) {
-                last_failure_reason_buf_ = std::string("ImageDirManager_Rebuild_failed code=")
+                last_failure_reason_buf_ = std::string("SpaceManager_Rebuild_failed code=")
                     + std::to_string(static_cast<int>(rebuild_ret));
-                image_dir_manager_.reset();
+                space_manager_.reset();
                 rollback_volume_manager();
                 RollbackCreatedDirs(created_dirs);
                 return false;
             }
             const volumemanager::ErrorCode cap_ret =
-                image_dir_manager_->SetCapacityInImages(capacity_in_images_);
+                space_manager_->SetCapacityInImages(capacity_in_images_);
             if (cap_ret != volumemanager::ErrorCode::SUCCESS) {
-                last_failure_reason_buf_ = std::string("ImageDirManager_SetCapacity_failed code=")
+                last_failure_reason_buf_ = std::string("SpaceManager_SetCapacity_failed code=")
                     + std::to_string(static_cast<int>(cap_ret))
                     + " capacity=" + std::to_string(capacity_in_images_);
-                image_dir_manager_.reset();
+                space_manager_.reset();
                 rollback_volume_manager();
                 RollbackCreatedDirs(created_dirs);
                 return false;
             }
             // 注入模拟光盘库目录：Release / LRU 换出 / 刻录释放时 rename 到此处。
             const volumemanager::ErrorCode disc_sim_ret =
-                image_dir_manager_->SetDiscSimDir(disc_sim_dir_);
+                space_manager_->SetDiscSimDir(disc_sim_dir_);
             if (disc_sim_ret != volumemanager::ErrorCode::SUCCESS) {
-                last_failure_reason_buf_ = std::string("ImageDirManager_SetDiscSimDir_failed code=")
+                last_failure_reason_buf_ = std::string("SpaceManager_SetDiscSimDir_failed code=")
                     + std::to_string(static_cast<int>(disc_sim_ret))
                     + " disc_sim_dir=" + disc_sim_dir_;
-                image_dir_manager_.reset();
+                space_manager_.reset();
                 rollback_volume_manager();
                 RollbackCreatedDirs(created_dirs);
                 return false;
             }
         } catch (const std::exception& e) {
-            last_failure_reason_buf_ = std::string("ImageDirManager_init_failed what=") + e.what();
-            image_dir_manager_.reset();
+            last_failure_reason_buf_ = std::string("SpaceManager_init_failed what=") + e.what();
+            space_manager_.reset();
             rollback_volume_manager();
             RollbackCreatedDirs(created_dirs);
             return false;
         } catch (...) {
-            last_failure_reason_buf_ = "ImageDirManager_init_failed what=<unknown>";
-            image_dir_manager_.reset();
+            last_failure_reason_buf_ = "SpaceManager_init_failed what=<unknown>";
+            space_manager_.reset();
             rollback_volume_manager();
             RollbackCreatedDirs(created_dirs);
             return false;
@@ -973,19 +979,19 @@ namespace optical_node_manager {
             return;
         }
 
-        // 镜像从 disc_sim_dir_ 转移到 image_dir_/ 并登记到 image_dir_manager_（扇平布局）。
+        // 镜像从 disc_sim_dir_ 转移到 image_dir_/ 并登记到 space_manager_（扇平布局）。
         // 与 WRITE 链路 (PackVolume + MoveFrom) 形成对称；失败走 sidecar，不阻塞 CD_READ 收尾。
-        if (image_dir_manager_ != nullptr) {
+        if (space_manager_ != nullptr) {
             const std::string src_image_path =
                 disc_sim_dir_ + "volume_" + event.volume_id + ".vimg";
 
             uint64_t read_volume_id = 0;
             std::string read_basename;
             const volumemanager::ErrorCode parse_ret =
-                image_dir_manager_->ParseVolumeFile(src_image_path, read_volume_id, read_basename);
+                space_manager_->ParseVolumeFile(src_image_path, read_volume_id, read_basename);
             if (parse_ret == volumemanager::ErrorCode::SUCCESS) {
                 const volumemanager::ErrorCode move_ret =
-                    image_dir_manager_->MoveFrom(src_image_path,
+                    space_manager_->MoveFrom(src_image_path,
                                                  space_manager::ImageCategory::READ);
                 if (move_ret != volumemanager::ErrorCode::SUCCESS) {
                     // 副作用失败：不影响 CD_READ 收尾，sidecar 记录便于运维排查。
@@ -1014,8 +1020,8 @@ namespace optical_node_manager {
                     std::to_string(event.task_id));
             }
         } else {
-            // image_dir_manager_ 未就绪：后续 MountVolume 大概率 FILE_NOT_FOUND；仅 sidecar。
-            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDReadComplete, "image_dir_manager_null",
+            // space_manager_ 未就绪：后续 MountVolume 大概率 FILE_NOT_FOUND；仅 sidecar。
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDReadComplete, "space_manager_null",
                 "task_id=" + std::to_string(event.task_id));
         }
 
@@ -1100,16 +1106,16 @@ namespace optical_node_manager {
     }
 
     void OpticalNodeManager::TouchVolume(const std::string& volume_id) {
-        if (image_dir_manager_ == nullptr) {
+        if (space_manager_ == nullptr) {
             return;
         }
         uint64_t parsed_volume_id = 0;
         std::string parsed_basename;
-        if (image_dir_manager_->ParseVolumeFile(VolumeImagePath(volume_id),
+        if (space_manager_->ParseVolumeFile(VolumeImagePath(volume_id),
                                                 parsed_volume_id,
                                                 parsed_basename)
                 == volumemanager::ErrorCode::SUCCESS) {
-            image_dir_manager_->Touch(parsed_volume_id);
+            space_manager_->Touch(parsed_volume_id);
         }
     }
 
@@ -1673,14 +1679,14 @@ namespace optical_node_manager {
                     continue;
                 }
 
-                // 读互斥区间：与 ImageDirManager 的写路径（LRU 换出 / MoveFrom）互斥。
+                // 读互斥区间：与 SpaceManager 的写路径（LRU 换出 / MoveFrom）互斥。
                 struct ReadLockGuard {
-                    space_manager::ImageDirManager* mgr;
+                    space_manager::SpaceManager* mgr;
                     ~ReadLockGuard() { if (mgr) mgr->ReadUnlock(); }
                 };
-                ReadLockGuard read_lock_guard{image_dir_manager_.get()};
-                if (image_dir_manager_ != nullptr) {
-                    image_dir_manager_->ReadLock();
+                ReadLockGuard read_lock_guard{space_manager_.get()};
+                if (space_manager_ != nullptr) {
+                    space_manager_->ReadLock();
                 }
 
                 std::string output_path;
@@ -1759,8 +1765,8 @@ namespace optical_node_manager {
                     std::string parsed_basename;
                     const std::string volume_image_path = VolumeImagePath(full_task->volume_id);
                     const volumemanager::ErrorCode parse_ret =
-                        image_dir_manager_ != nullptr
-                            ? image_dir_manager_->ParseVolumeFile(volume_image_path,
+                        space_manager_ != nullptr
+                            ? space_manager_->ParseVolumeFile(volume_image_path,
                                                                   parsed_volume_id,
                                                                   parsed_basename)
                             : volumemanager::ErrorCode::INVALID_PATH;
@@ -1817,12 +1823,12 @@ namespace optical_node_manager {
                 }
 
                 struct ReadLockGuard {
-                    space_manager::ImageDirManager* mgr;
+                    space_manager::SpaceManager* mgr;
                     ~ReadLockGuard() { if (mgr) mgr->ReadUnlock(); }
                 };
-                ReadLockGuard read_lock_guard{image_dir_manager_.get()};
-                if (image_dir_manager_ != nullptr) {
-                    image_dir_manager_->ReadLock();
+                ReadLockGuard read_lock_guard{space_manager_.get()};
+                if (space_manager_ != nullptr) {
+                    space_manager_->ReadLock();
                 }
 
                 const volumemanager::ErrorCode mount_ret =
@@ -1987,8 +1993,8 @@ namespace optical_node_manager {
 
                 // 6. 镜像从 temp_dir_ 转移到 image_dir_/（扇平布局）并登记管理表。
                 //    失败统一 PACK_FAILED 暴露；各失败细节走 detail。
-                if (image_dir_manager_ == nullptr) {
-                    const std::string detail = FormatFailureDetail(start_failure_phase::kZipTaskProcessor, "image_dir_manager_null",
+                if (space_manager_ == nullptr) {
+                    const std::string detail = FormatFailureDetail(start_failure_phase::kZipTaskProcessor, "space_manager_null",
                         "ret=" +
                         std::to_string(static_cast<int>(volumemanager::ErrorCode::PACK_FAILED)) +
                         " code=" +
@@ -2001,7 +2007,7 @@ namespace optical_node_manager {
                 uint64_t packed_volume_id = 0;
                 std::string packed_basename;
                 const volumemanager::ErrorCode parse_ret =
-                    image_dir_manager_->ParseVolumeFile(packed_volume_path, packed_volume_id, packed_basename);
+                    space_manager_->ParseVolumeFile(packed_volume_path, packed_volume_id, packed_basename);
                 if (parse_ret != volumemanager::ErrorCode::SUCCESS) {
                     const std::string detail = FormatFailureDetail(start_failure_phase::kZipTaskProcessor, "ParseVolumeFile_failed",
                         "ret=" +
@@ -2016,7 +2022,7 @@ namespace optical_node_manager {
                     continue;
                 }
                 const volumemanager::ErrorCode move_ret =
-                    image_dir_manager_->MoveFrom(packed_volume_path,
+                    space_manager_->MoveFrom(packed_volume_path,
                                                  space_manager::ImageCategory::WRITE);
                 if (move_ret != volumemanager::ErrorCode::SUCCESS) {
                     const std::string detail = FormatFailureDetail(start_failure_phase::kZipTaskProcessor, "MoveFrom_failed",
@@ -2124,8 +2130,8 @@ namespace optical_node_manager {
         }
 
         // 烧录完成 → 释放对应写镜像；副作用失败不影响 FINISH 主语义。
-        if (image_dir_manager_ == nullptr) {
-            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "image_dir_manager_null",
+        if (space_manager_ == nullptr) {
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "space_manager_null",
                 "task_id=" + std::to_string(event.task_id));
             return;
         }
@@ -2137,7 +2143,7 @@ namespace optical_node_manager {
         uint64_t burned_volume_id = 0;
         std::string basename;
         const volumemanager::ErrorCode parse_ret =
-            image_dir_manager_->ParseVolumeFile(event.image_path, burned_volume_id, basename);
+            space_manager_->ParseVolumeFile(event.image_path, burned_volume_id, basename);
         if (parse_ret != volumemanager::ErrorCode::SUCCESS) {
             last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "ParseVolumeFile_failed",
                 std::string("code=") +
@@ -2151,7 +2157,7 @@ namespace optical_node_manager {
             return;
         }
         const volumemanager::ErrorCode remove_ret =
-            image_dir_manager_->RemoveWriteImage(burned_volume_id);
+            space_manager_->RemoveWriteImage(burned_volume_id);
         if (remove_ret != volumemanager::ErrorCode::SUCCESS) {
             // 副作用失败走 sidecar，不改 CD_BURN 主语义。
             last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kOnCDBurnComplete, "RemoveWriteImage_failed",

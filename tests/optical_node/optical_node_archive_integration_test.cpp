@@ -14,7 +14,6 @@
 //           [PASS] 读回数据与语料逐字节一致（inode=1000，共 8388608 字节，耗时 21043ms）
 //         [CASE-END] A3.1 result=PASS checks=5 failed=0
 //       末尾输出"测试点汇总"表与各测试点目标清单；测试点编号见 README.md。
-// 参见 .trae/documents/optical_node_integration_test_plan.md
 
 #include "fake_client.h"
 #include "fake_services.h"

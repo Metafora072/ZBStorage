@@ -1,4 +1,4 @@
-#include "space_manager/image_dir_manager.h"
+#include "space_manager/space_manager.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -118,7 +118,7 @@ void EnsureImageDir(const std::string& path) {
 
 }  // namespace
 
-ImageDirManager::ImageDirManager(std::string image_dir_path)
+SpaceManager::SpaceManager(std::string image_dir_path)
     : image_dir_path_(std::move(image_dir_path)),
       disc_sim_dir_path_(),  // 必须由 SetDiscSimDir() 显式注入，未注入时 DeleteFileAndEntry
                              // 会兜底 unlink——见 DeleteFileAndEntry 实现。
@@ -127,11 +127,11 @@ ImageDirManager::ImageDirManager(std::string image_dir_path)
     EnsureImageDir(image_dir_path_);
 }
 
-ImageDirManager::~ImageDirManager() = default;
+SpaceManager::~SpaceManager() = default;
 
-volumemanager::ErrorCode ImageDirManager::SetDiscSimDir(std::string disc_sim_dir_path) {
+volumemanager::ErrorCode SpaceManager::SetDiscSimDir(std::string disc_sim_dir_path) {
     // 不做"已注入"守门——上层 OpticalNodeManager::InitializeDir() 每次 Run()
-    // 都会重新构造 ImageDirManager 并 SetDiscSimDir(disc_sim_dir_)，所以重复
+    // 都会重新构造 SpaceManager 并 SetDiscSimDir(disc_sim_dir_)，所以重复
     // 调用是预期的合法语义（同 SetCapacityInImages 的"重 Run() 重新注入"模式
     // 不同——capacity 是只能设一次的硬约束，disc_sim_dir 是每次 Run() 都重置）。
     //
@@ -144,15 +144,15 @@ volumemanager::ErrorCode ImageDirManager::SetDiscSimDir(std::string disc_sim_dir
     return volumemanager::ErrorCode::SUCCESS;
 }
 
-void ImageDirManager::ReadLock() {
+void SpaceManager::ReadLock() {
     mutex_.lock_shared();
 }
 
-void ImageDirManager::ReadUnlock() {
+void SpaceManager::ReadUnlock() {
     mutex_.unlock_shared();
 }
 
-volumemanager::ErrorCode ImageDirManager::SetCapacityInImages(uint64_t capacity_in_images) {
+volumemanager::ErrorCode SpaceManager::SetCapacityInImages(uint64_t capacity_in_images) {
     if (capacity_in_images == 0) {
         return volumemanager::ErrorCode::INVALID_PARAMETER;
     }
@@ -166,7 +166,7 @@ volumemanager::ErrorCode ImageDirManager::SetCapacityInImages(uint64_t capacity_
     return volumemanager::ErrorCode::SUCCESS;
 }
 
-volumemanager::ErrorCode ImageDirManager::ParseVolumeFile(const std::string& abs_path,
+volumemanager::ErrorCode SpaceManager::ParseVolumeFile(const std::string& abs_path,
                                                            uint64_t& volume_id,
                                                            std::string& basename) const {
     if (abs_path.empty()) {
@@ -179,11 +179,11 @@ volumemanager::ErrorCode ImageDirManager::ParseVolumeFile(const std::string& abs
     return volumemanager::ErrorCode::SUCCESS;
 }
 
-bool ImageDirManager::HasImage(uint64_t volume_id) const {
+bool SpaceManager::HasImage(uint64_t volume_id) const {
     return entries_.find(volume_id) != entries_.end();
 }
 
-void ImageDirManager::Touch(uint64_t volume_id) {
+void SpaceManager::Touch(uint64_t volume_id) {
     auto idx_it = lru_index_.find(volume_id);
     if (idx_it == lru_index_.end()) {
         return;
@@ -195,7 +195,7 @@ void ImageDirManager::Touch(uint64_t volume_id) {
     (*entry_it)->second.last_access = std::chrono::steady_clock::now();
 }
 
-void ImageDirManager::RemoveLRU(uint64_t volume_id) {
+void SpaceManager::RemoveLRU(uint64_t volume_id) {
     auto idx_it = lru_index_.find(volume_id);
     if (idx_it == lru_index_.end()) {
         return;
@@ -204,7 +204,7 @@ void ImageDirManager::RemoveLRU(uint64_t volume_id) {
     lru_index_.erase(idx_it);
 }
 
-volumemanager::ErrorCode ImageDirManager::DeleteFileAndEntry(uint64_t volume_id) {
+volumemanager::ErrorCode SpaceManager::DeleteFileAndEntry(uint64_t volume_id) {
     auto it = entries_.find(volume_id);
     if (it == entries_.end()) {
         return volumemanager::ErrorCode::VOLUME_NOT_FOUND;
@@ -268,7 +268,7 @@ volumemanager::ErrorCode ImageDirManager::DeleteFileAndEntry(uint64_t volume_id)
     return volumemanager::ErrorCode::SUCCESS;
 }
 
-void ImageDirManager::InsertEntryLocked(const ImageEntry& entry) {
+void SpaceManager::InsertEntryLocked(const ImageEntry& entry) {
     // 不变量：entries_ / lru_list_ / lru_index_ 三件套同步更新。
     // entries_.emplace 在 volume_id 已存在时不会替换；但 MoveFrom / RebuildManagementTable
     // 已在调用本方法前保证 volume_id 是新的（前者通过 entries_.find 检查，后者从空表起步）。
@@ -277,7 +277,7 @@ void ImageDirManager::InsertEntryLocked(const ImageEntry& entry) {
     lru_index_.emplace(entry.volume_id, lru_list_.begin());
 }
 
-volumemanager::ErrorCode ImageDirManager::MoveFrom(const std::string& abs_path,
+volumemanager::ErrorCode SpaceManager::MoveFrom(const std::string& abs_path,
                                                     ImageCategory category) {
     // 入口：上一次 MoveFrom 留下的 rollback 状态在本次入口被覆盖（语义等价于
     // 上次 MoveFrom 已经结束）。这避免上次 rollback 状态泄漏到本次。
@@ -402,12 +402,12 @@ volumemanager::ErrorCode ImageDirManager::MoveFrom(const std::string& abs_path,
     return volumemanager::ErrorCode::SUCCESS;
 }
 
-volumemanager::ErrorCode ImageDirManager::RemoveSingleReadImage() {
+volumemanager::ErrorCode SpaceManager::RemoveSingleReadImage() {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     return RemoveSingleReadImageLocked();
 }
 
-volumemanager::ErrorCode ImageDirManager::RemoveSingleReadImageLocked() {
+volumemanager::ErrorCode SpaceManager::RemoveSingleReadImageLocked() {
     // 倒序找最久未访问的 READ（链表 back 是最久未访问的）。
     auto victim_it = lru_list_.end();
     for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
@@ -425,7 +425,7 @@ volumemanager::ErrorCode ImageDirManager::RemoveSingleReadImageLocked() {
     return DeleteFileAndEntry(victim_id);
 }
 
-volumemanager::ErrorCode ImageDirManager::RemoveWriteImage(uint64_t volume_id) {
+volumemanager::ErrorCode SpaceManager::RemoveWriteImage(uint64_t volume_id) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto it = entries_.find(volume_id);
     if (it == entries_.end() || it->second.category != ImageCategory::WRITE) {
@@ -436,7 +436,7 @@ volumemanager::ErrorCode ImageDirManager::RemoveWriteImage(uint64_t volume_id) {
     return DeleteFileAndEntry(volume_id);
 }
 
-volumemanager::ErrorCode ImageDirManager::GetStats(ImageDirStats& out_stats) const {
+volumemanager::ErrorCode SpaceManager::GetStats(ImageDirStats& out_stats) const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     out_stats.capacity_images = capacity_in_images_;
     out_stats.used_images = entries_.size();
@@ -456,7 +456,7 @@ volumemanager::ErrorCode ImageDirManager::GetStats(ImageDirStats& out_stats) con
     return volumemanager::ErrorCode::SUCCESS;
 }
 
-volumemanager::ErrorCode ImageDirManager::RebuildManagementTable() {
+volumemanager::ErrorCode SpaceManager::RebuildManagementTable() {
     std::unique_lock<std::shared_mutex> lock(mutex_);
 
     entries_.clear();

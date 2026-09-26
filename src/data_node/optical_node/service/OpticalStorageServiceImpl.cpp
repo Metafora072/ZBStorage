@@ -33,6 +33,8 @@ OpticalStorageServiceImpl::OpticalStorageServiceImpl(const OpticalNodeConfig& co
                             config.archive_root,
                             config.capacity_in_images,
                             config.available_volume_id_count,
+                            config.disc_capacity_bytes,
+                            config.standard_images_per_disc,
                             config.scheduler_addr) {
     optical_node_manager_.Run();
 }

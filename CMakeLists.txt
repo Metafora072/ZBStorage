@@ -147,7 +147,7 @@ endif()
 add_library(optical_node_manager STATIC
     src/data_node/optical_node/optical_node_manager/optical_node_manager.cpp
     src/data_node/optical_node/optical_node_manager/cd_manager_sim/cd_manager.cpp
-    src/data_node/optical_node/optical_node_manager/space_manager/image_dir_manager.cpp
+    src/data_node/optical_node/optical_node_manager/space_manager/space_manager.cpp
     src/data_node/optical_node/optical_node_manager/volume_manager/volume_manager.cpp
     src/data_node/optical_node/optical_node_manager/volume_manager/serializer.cpp
     src/data_node/optical_node/optical_node_manager/volume_manager/compression_utils.cpp

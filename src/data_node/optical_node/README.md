@@ -13,7 +13,7 @@ images, burns them to optical discs, and reports archive progress to MDS.
 
 ## Implementation status
 - Archive engine is wired in: constructing `OpticalStorageServiceImpl(config)` immediately runs
-  `OpticalNodeManager::Run`, which creates `input/temp/image/read/disc_sim/meta/log` under
+  `OpticalNodeManager::Run`, which creates `input/temp/image/read/disc_sim/meta/log/write_buffer` under
   `ARCHIVE_ROOT` and starts the background workers. A failure makes the node exit at startup
   (fail fast). `meta/` is reserved for node information that must survive restarts; `log/` is
   reserved for task records (completed / in-flight).
@@ -45,6 +45,8 @@ images, burns them to optical discs, and reports archive progress to MDS.
 | `SIZE_THRESHOLD` | `0.9` | packing trigger ratio (0.0-1.0) |
 | `CAPACITY_IN_IMAGES` | `10` | max images kept in `image/` |
 | `AVAILABLE_VOLUME_ID_COUNT` | `5` | capacity of the `volume_id` queue |
+| `DISC_CAPACITY_BYTES` | `1099511627776` | max size of one optical disc (bytes, 1 TiB) |
+| `STANDARD_IMAGES_PER_DISC` | `100` | baseline number of images per disc (actual disc may hold more, bounded by capacity) |
 
 Cluster deployment renders `deploy/multi_host/templates/optical_node.conf.tpl`;
 `config/optical_node.conf` is a ready-to-run local sample.

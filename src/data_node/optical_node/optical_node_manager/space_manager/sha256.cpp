@@ -1,6 +1,7 @@
 #include "sha256.h"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <fcntl.h>
 #include <unistd.h>

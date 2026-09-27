@@ -1,15 +1,17 @@
-// optical_node 单模块集成测试：
+// optical_node 单模块集成测试（单一综合场景，ctest 用例名 optical_node）：
 //   进程内起真光节点 server（OpticalStorageServiceImpl + BrpcOpticalNodeService），
 //   配合假 real_node / scheduler 两个 brpc server，以及假 MDS / client 两个 brpc 客户端，
 //   在小规模参数（卷镜像 10MiB、每文件 1MiB 按 256KiB 切成 4 个对象分片、光盘容量 100MiB、
-//   image_dir 上限 100 / 背压上限 30；evict 档位改为 14 / 12）下仿真完整链路：
+//   image_dir 上限 14 / 背压上限 12）下仿真完整生命周期：
 //     归档下发（四种批次形态）→ （下载侧背压节流）从 real_node 按分片下载 → 压缩封装
 //     → 打包汇报（控制台）→ 按容量积攒 → 装满封印为一张光盘（disc_sim/disc_<id>.vdisc）→ 刻录
 //     → 逐个释放 image_dir 中的镜像副本 → 刻录汇报（控制台）
 //     数据面读 → 镜像被释放时按元数据偏移从 vdisc 提取回 image_dir（CD_READ）
-//     → 分片读到 FINISH → 满载后的 LRU 淘汰与重新提取（evict 档位）
+//     → 分片读到 FINISH → 满载后的 LRU 淘汰与重新提取
+//     → 正常关机落盘（log/runtime_state_snapshot）→ 以同一 archive_root 重启恢复
+//       → 在途读任务继续推进到终态
 //
-// 用法: optical_node_archive_integration_test --corpus <dir> --work-dir <dir> --scenario smoke|full|evict
+// 用法: optical_node_archive_integration_test --corpus <dir> --work-dir <dir>
 // 输出: 全程日志写到 stderr（由 run_optical_node_archive_test.py 落盘为 <work-dir>/output.log）。
 //       日志按"测试点"组织：
 //         [CASE] A3.1 第 1/12 卷：数据面读 + CD_READ 重载
@@ -34,6 +36,7 @@
 #include <cstring>
 #include <ctime>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -60,42 +63,29 @@ constexpr uint64_t kObjectUnitBytes = 256ull * 1024;
 constexpr uint64_t kFileSizeBytes = 1024ull * 1024;
 constexpr size_t kShardsPerFile = static_cast<size_t>(kFileSizeBytes / kObjectUnitBytes);
 
-constexpr uint8_t kAvailableVolumeIdCount = 5;
+constexpr uint8_t kAvailableIdCount = 5;
 constexpr uint64_t kReadShardBytes = 4ull * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// 测试档位（profile）：容量约束参数按场景区分，让「写链路顺跑」与「容量满载边界」各有场地。
+// 单一综合档位：容量约束参数只有一个取值，覆盖「写链路顺跑」与「容量满载边界」两类观察面。
 // 不变式：单盘镜像数(10) < 背压上限(MAX_WRITE_IMAGES) < image_dir 容量(CAPACITY_IN_IMAGES)。
-//   normal（smoke / full）：容量 100 / 背压上限 30 —— 缓存充足，写链路在充足余量下连续跨越
-//       多张光盘；LRU 淘汰在此不可达（需先堆满 100 个镜像），故由 evict 档位单独覆盖。
-//   evict：容量 14 / 背压上限 12 —— 小容量缓存，读入若干已刻录卷后必然满载并触发淘汰与重载。
+//   容量 14 / 背压上限 12 —— 小容量缓存：写阶段占用低（背压生效），读入若干已刻录卷后
+//   必然满载并触发 LRU 淘汰与 CD_READ 重载；背压触发/恢复也在同一档位内被观测到。
 // ---------------------------------------------------------------------------
-constexpr uint64_t kCapacityInImages = 100;
-constexpr uint32_t kMaxWriteImages = 30;
-constexpr uint64_t kSmallCapacityInImages = 14;
-constexpr uint32_t kSmallMaxWriteImages = 12;
+constexpr uint64_t kCapacityInImages = 14;
+constexpr uint32_t kMaxWriteImages = 12;
 
-// full / evict 档位下 A3 读取的卷数：读够即停，把「满载后淘汰」留给 A5（避免 A3 阶段就触发淘汰）。
+// A3 读取的已刻录卷数：读够即停，把「满载后淘汰」留给测试点 A5（避免 A3 阶段就触发淘汰）。
 constexpr size_t kA3ReadVolumes = 12;
 
 struct Profile {
-    std::string name;              // 档位名（写入运行头部日志）
+    const char* name;              // 档位名（写入运行头部日志）
     uint64_t capacity_in_images;   // image_dir 硬上限（CAPACITY_IN_IMAGES）
     uint32_t max_write_images;     // 下载背压阈值（MAX_WRITE_IMAGES）
     size_t a3_read_volumes;        // 测试点 A3 读取的已刻录卷数
-    bool check_eviction;           // 是否执行测试点 A5（满载淘汰与重载）
-    bool check_backpressure;       // 是否执行测试点 B2（背压触发与恢复）
 };
 
-Profile ProfileFor(const std::string& scenario) {
-    if (scenario == "evict") {
-        return {"evict", kSmallCapacityInImages, kSmallMaxWriteImages, kA3ReadVolumes, true, true};
-    }
-    if (scenario == "full") {
-        return {"normal", kCapacityInImages, kMaxWriteImages, kA3ReadVolumes, false, true};
-    }
-    return {"normal", kCapacityInImages, kMaxWriteImages, 1, false, false};
-}
+constexpr Profile kProfile{"comprehensive", kCapacityInImages, kMaxWriteImages, kA3ReadVolumes};
 
 // 仿真时长：单次光盘操作（装盘 12s + 读/刻录 + 退盘 3s + 机械臂）约 20~30s，
 // 且产线不建议为测试改动仿真参数，故超时留足余量。
@@ -146,8 +136,10 @@ constexpr const char* kCaseA7Expectation =
     "每张盘都有对应 vdisc 文件且体积不超过盘容量；已刻录镜像已从 image_dir 释放；尾盘镜像仍在 image_dir。";
 constexpr const char* kCaseA7Method =
     "抓取节点 stdout 的 [ReportImagesBurnedToDisc] 行解析 disc_id/count/image_ids；"
-    "以 meta/disc_<id>_meta 数量作为「已封印盘数」确定性上界等待刻录完成；"
-    "枚举 disc_sim 与 image_dir 的文件系统事实交叉验证（不使用固定 sleep）。";
+    "以「meta/ 无残留 disc_<id>_meta」+「disc_sim 的 vdisc 数等于汇报行数」作为"
+    "「所有已封印盘都已完成刻录与索引」的确定性判据等待（不使用固定 sleep）；"
+    "并解析 meta/node_discs_meta 的追加块数交叉验证已登记盘数；"
+    "枚举 disc_sim 与 image_dir 的文件系统事实交叉验证。";
 
 constexpr const char* kCaseA2Objective =
     "验证节点没有漏读或重复读 real_node 的对象——下载完整性只能靠跨卷汇总计数证明。"
@@ -198,6 +190,22 @@ constexpr const char* kCaseA6Expectation =
 constexpr const char* kCaseA6Method =
     "枚举 input/ 目录列表；stat log/；若测试期内意外生成了任务日志则打印提示。";
 
+constexpr const char* kCaseA8Objective =
+    "验证正常关机的状态持久化与重启恢复：Shutdown() 应把运行期内存态（任务表 / 队列 / ID 计数器"
+    "与可用 ID 池 / 归档断点 / 未封盘文件集 / 镜像管理表）落到 log/runtime_state_snapshot，"
+    "重启后读回并让关机前未完成的任务继续推进到终态——这是「节点重启不丢在途工作」的核心保证。";
+constexpr const char* kCaseA8Expectation =
+    "关机快照文件生成且非空；重启后节点状态为 RUNNING 且状态原因标明已恢复；"
+    "快照被消费为 runtime_state_snapshot.loaded（不会重复重放）；"
+    "image/ 与 disc_sim/ 的目录内容在重启前后完全一致（恢复不搬移、不删除物理镜像）；"
+    "node_discs_meta 的追加块数与字节数在重启前后一致（未重复追加、未改写索引），"
+    "且 meta/ 不出现残留的 disc_<id>_meta（封印定稿元数据不因重启被复原）；"
+    "关机前提交的读任务（READ + 其 CD_READ 装载）在重启后仍能读回完整数据"
+    "并与语料逐字节一致，末片读完后任务进入 FINISH。";
+constexpr const char* kCaseA8Method =
+    "先提交一次读请求拿到 task_id（不等待结果）后立即 Shutdown()，再以同一 archive_root 重建节点；"
+    "断言快照文件状态，并以该 task_id 继续分片读取直到读通（超时与单次 CD_READ 同量级）。";
+
 constexpr const char* kCaseB1Objective =
     "验证「MDS 批次切分」与「卷镜像分组」解耦：节点按文件顺序逐个压缩累加，因此批次边界"
     "（单文件批次、跨卷边界批次、大小混合批次）不应改变卷分组，也不应造成文件遗漏或重复。"
@@ -231,7 +239,6 @@ std::string NowString() {
 struct Options {
     std::string corpus_dir;
     std::string work_dir;
-    std::string scenario = "smoke";
 };
 
 // 被测节点的工作目录（与 OpticalNodeManager::InitializeDir 的派生规则保持一致）。
@@ -254,15 +261,13 @@ Options ParseArgs(int argc, char** argv) {
     Options options;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--corpus" || arg == "--work-dir" || arg == "--scenario") {
+        if (arg == "--corpus" || arg == "--work-dir") {
             Require(i + 1 < argc, "参数缺少取值: " + arg);
             const std::string value = argv[++i];
             if (arg == "--corpus") {
                 options.corpus_dir = value;
-            } else if (arg == "--work-dir") {
-                options.work_dir = value;
             } else {
-                options.scenario = value;
+                options.work_dir = value;
             }
         } else {
             std::cerr << "未知参数: " << arg << std::endl;
@@ -271,9 +276,6 @@ Options ParseArgs(int argc, char** argv) {
     }
     Require(!options.corpus_dir.empty(), "必须指定 --corpus");
     Require(!options.work_dir.empty(), "必须指定 --work-dir");
-    Require(options.scenario == "smoke" || options.scenario == "full" ||
-                options.scenario == "evict",
-            "--scenario 只能是 smoke / full / evict");
     return options;
 }
 
@@ -313,8 +315,9 @@ std::vector<std::string> DiscFiles(const Env& env) {
     return ListDirBySuffix(env.disc_sim_dir, ".vdisc");
 }
 
-// meta/ 下已封印光盘的元数据文件数（disc_<id>_meta；排除 pending_disc_meta）。
-// 封印时即刻生成该文件，因此可作为「已封印盘数」的确定性上界。
+// meta/ 下「已封印但尚未完成刻录 + 索引聚合」的光盘元数据文件数（disc_<id>_meta）。
+// 封印时即刻生成；刻录完成且索引登记进 node_discs_meta 后会被节点删除。
+// 因此正常稳态应为 0，非 0 即表示有封印残留（对应 ReconcileAndReplay 的处理对象）。
 size_t SealedDiscMetaCount(const Env& env) {
     size_t count = 0;
     for (const std::string& name : ListDirBySuffix(env.meta_dir, "_meta")) {
@@ -323,6 +326,35 @@ size_t SealedDiscMetaCount(const Env& env) {
         }
     }
     return count;
+}
+
+// meta/node_discs_meta 的追加块数（= 已完成刻录并登记索引的光盘数）。
+// 文件是「DISC_INDEX_HEADER_SIZE 块头 + entry_count × DISC_IMAGE_RECORD_SIZE 记录」
+// 的纯追加序列（每张盘追加一块），逐块走到尾即得块数；头部损坏则只计入此前已解析的块。
+size_t NodeDiscsMetaBlockCount(const Env& env) {
+    std::string content;
+    if (!ReadWholeFile(env.meta_dir + "node_discs_meta", &content)) {
+        return 0;
+    }
+    size_t blocks = 0;
+    size_t cursor = 0;
+    while (cursor + optical_node_manager::DISC_INDEX_HEADER_SIZE <= content.size()) {
+        optical_node_manager::DiscIndexHeader header;
+        if (!optical_node_manager::DiscIndexHeader::Parse(
+                reinterpret_cast<const uint8_t*>(content.data() + cursor),
+                content.size() - cursor, header)) {
+            break;
+        }
+        const size_t block = optical_node_manager::DISC_INDEX_HEADER_SIZE +
+                             static_cast<size_t>(header.entry_count) *
+                                 optical_node_manager::DISC_IMAGE_RECORD_SIZE;
+        if (cursor + block > content.size()) {
+            break;
+        }
+        cursor += block;
+        ++blocks;
+    }
+    return blocks;
 }
 
 // 从 volume_<id>.vimg 取出 <id>。
@@ -439,14 +471,42 @@ struct ReadOutcome {
     std::string error;
 };
 
-// 读某卷下某个 inode 的全部分片，并与语料原始字节比对。
-ReadOutcome ReadInode(FakeReadClient* client,
-                      const Corpus& corpus,
-                      const Env& env,
-                      uint64_t volume_id,
-                      uint64_t inode_id,
-                      int ready_timeout_ms) {
+// 提交异步读请求并返回 task_id（0 表示未被受理）；不等待读结果。
+// 单独暴露出来是为了让重启用例能在「任务刚建立、结果尚未就绪」时关机。
+uint64_t RequestReadTask(FakeReadClient* client,
+                         uint64_t volume_id,
+                         uint64_t inode_id,
+                         std::string* error) {
+    zb::rpc::MdsStatusCode status = zb::rpc::MDS_INTERNAL_ERROR;
+    std::string err;
+    uint64_t task_id = 0;
+    const std::string image_id = "img-" + std::to_string(volume_id);
+    if (!client->RequestRead("optical-disk-1", image_id, inode_id, &task_id, &status, &err)) {
+        if (error != nullptr) {
+            *error = "RequestAsyncReadFile 传输失败: " + err;
+        }
+        return 0;
+    }
+    if (status != zb::rpc::MDS_OK || task_id == 0) {
+        if (error != nullptr) {
+            *error = "RequestAsyncReadFile 未受理, status=" +
+                     std::to_string(static_cast<int>(status)) + " message=" + err;
+        }
+        return 0;
+    }
+    return task_id;
+}
+
+// 按 task_id 取完该 inode 的全部分片并与语料原始字节比对。
+// task_id 由节点的任务表服务，因此可以跨「节点重启」使用（重启后任务表由快照恢复）。
+ReadOutcome ReadByTaskId(FakeReadClient* client,
+                         const Corpus& corpus,
+                         const Env& env,
+                         uint64_t inode_id,
+                         uint64_t task_id,
+                         int ready_timeout_ms) {
     ReadOutcome outcome;
+    outcome.task_id = task_id;
     const CorpusFile* file = corpus.Find(inode_id);
     if (file == nullptr) {
         outcome.error = "语料中不存在 inode=" + std::to_string(inode_id);
@@ -454,18 +514,6 @@ ReadOutcome ReadInode(FakeReadClient* client,
     }
 
     zb::rpc::MdsStatusCode status = zb::rpc::MDS_INTERNAL_ERROR;
-    std::string err;
-    const std::string image_id = "img-" + std::to_string(volume_id);
-    if (!client->RequestRead("optical-disk-1", image_id, inode_id, &outcome.task_id, &status, &err)) {
-        outcome.error = "RequestAsyncReadFile 传输失败: " + err;
-        return outcome;
-    }
-    if (status != zb::rpc::MDS_OK || outcome.task_id == 0) {
-        outcome.error = "RequestAsyncReadFile 未受理, status=" + std::to_string(static_cast<int>(status)) +
-                        " message=" + err;
-        return outcome;
-    }
-
     const auto begin = std::chrono::steady_clock::now();
     std::string data;
     // 首片轮询：镜像装载期间返回 MDS_INTERNAL_ERROR（TASK_NOT_FINISH 的映射），
@@ -474,7 +522,7 @@ ReadOutcome ReadInode(FakeReadClient* client,
         [&] {
             data.clear();
             std::string read_err;
-            if (!client->ReadByTask(outcome.task_id, 0, kReadShardBytes, &data, &status, &read_err)) {
+            if (!client->ReadByTask(task_id, 0, kReadShardBytes, &data, &status, &read_err)) {
                 return false;
             }
             return status == zb::rpc::MDS_OK;
@@ -490,7 +538,7 @@ ReadOutcome ReadInode(FakeReadClient* client,
         const uint64_t read_size = std::min(kReadShardBytes, file->file_size - offset);
         std::string piece;
         std::string read_err;
-        if (!client->ReadByTask(outcome.task_id, offset, read_size, &piece, &status, &read_err)) {
+        if (!client->ReadByTask(task_id, offset, read_size, &piece, &status, &read_err)) {
             outcome.error = "分片读传输失败 offset=" + std::to_string(offset) + ": " + read_err;
             return outcome;
         }
@@ -519,6 +567,23 @@ ReadOutcome ReadInode(FakeReadClient* client,
     }
     outcome.ok = true;
     return outcome;
+}
+
+// 读某卷下某个 inode 的全部分片，并与语料原始字节比对（提交 + 等待一体）。
+ReadOutcome ReadInode(FakeReadClient* client,
+                      const Corpus& corpus,
+                      const Env& env,
+                      uint64_t volume_id,
+                      uint64_t inode_id,
+                      int ready_timeout_ms) {
+    ReadOutcome outcome;
+    std::string error;
+    const uint64_t task_id = RequestReadTask(client, volume_id, inode_id, &error);
+    if (task_id == 0) {
+        outcome.error = error;
+        return outcome;
+    }
+    return ReadByTaskId(client, corpus, env, inode_id, task_id, ready_timeout_ms);
 }
 
 // 末片读完后任务应进入 FINISH：inode→task 索引被清除，故 ReadObjectByInodeId 返回 MDS_NOT_FOUND。
@@ -741,6 +806,9 @@ public:
     BackpressureWatch(OpticalStorageServiceImpl* service, const Profile& profile)
         : service_(service), profile_(profile) {}
 
+    // 重启后指向新构造的节点实例（旧实例已销毁，继续持有会悬空）。
+    void Rebind(OpticalStorageServiceImpl* service) { service_ = service; }
+
     void Sample() {
         if (service_ == nullptr) {
             return;
@@ -793,10 +861,10 @@ private:
     bool saw_input_overloaded_{false};
 };
 
-int RunScenario(const Options& options) {
+int RunOpticalNodeTest(const Options& options) {
     const auto run_begin = std::chrono::steady_clock::now();
     const std::string started_at = NowString();
-    const Profile profile = ProfileFor(options.scenario);
+    const Profile& profile = kProfile;
 
     Corpus corpus;
     std::string error;
@@ -814,8 +882,8 @@ int RunScenario(const Options& options) {
 
     // 运行头部：让日志本身可自解释（含场景、路径、被测参数与超时设置）。
     std::cerr << std::string(96, '=') << std::endl;
-    std::cerr << "optical_node 归档集成测试：scenario=" << options.scenario << "，档位="
-              << profile.name << std::endl;
+    std::cerr << "optical_node 归档集成测试（综合场景：写链路 + 封盘刻录 + 读回/淘汰 + 重启恢复）"
+              << "，档位=" << profile.name << std::endl;
     std::cerr << "开始时间: " << started_at << std::endl;
     std::cerr << "工作目录: " << options.work_dir << std::endl;
     std::cerr << "语料目录: " << options.corpus_dir << "（" << corpus.plan().size() << " 卷 / "
@@ -823,7 +891,7 @@ int RunScenario(const Options& options) {
     std::cerr << "被测参数: 卷镜像=" << kVolumeSizeBytes << " 字节; 打包阈值=" << kSizeThreshold
               << "; image_dir 容量=" << profile.capacity_in_images
               << "; 最大写镜像数(背压上限)=" << profile.max_write_images
-              << "; available_volume_id_count=" << static_cast<int>(kAvailableVolumeIdCount)
+              << "; available_id_count=" << static_cast<int>(kAvailableIdCount)
               << "; 光盘容量=" << kDiscCapacityBytes
               << " 字节; 单盘标准镜像数=" << kStandardImagesPerDisc
               << "; 对象分片=" << kObjectUnitBytes << " 字节/片（每文件 " << kShardsPerFile << " 片）"
@@ -844,6 +912,7 @@ int RunScenario(const Options& options) {
     LocalServer scheduler_server(&scheduler);
 
     // 3. 进程内真光节点（构造即 Run；不链接含 main 的 optical_node_server.cpp）。
+    //    用 unique_ptr 持有：重启用例需要先销毁旧实例（触发 Shutdown + 释放端口），再重建。
     OpticalNodeConfig config;
     config.node_id = "optical-1";
     config.node_address = "127.0.0.1:0";
@@ -852,22 +921,23 @@ int RunScenario(const Options& options) {
     config.volume_size_bytes = kVolumeSizeBytes;
     config.size_threshold = kSizeThreshold;
     config.capacity_in_images = profile.capacity_in_images;
-    config.available_volume_id_count = kAvailableVolumeIdCount;
+    config.available_id_count = kAvailableIdCount;
     config.max_write_images = profile.max_write_images;
     config.disc_capacity_bytes = kDiscCapacityBytes;
     config.standard_images_per_disc = kStandardImagesPerDisc;
-    OpticalStorageServiceImpl service(config);
-    BrpcOpticalNodeService node_service(&service);
-    LocalServer node_server(&node_service);
+    auto service = std::make_unique<OpticalStorageServiceImpl>(config);
+    auto node_service = std::make_unique<BrpcOpticalNodeService>(service.get());
+    auto node_server = std::make_unique<LocalServer>(node_service.get());
 
-    // 4. 假 MDS / 假 client（brpc 客户端）。
-    FakeMdsDriver mds(node_server.Address());
-    FakeReadClient client(node_server.Address());
+    // 4. 假 MDS / 假 client（brpc 客户端）。节点重启后端口会变（监听端口 0 由内核分配），
+    //    故同样用 unique_ptr 持有，重启后按新地址重建。
+    auto mds = std::make_unique<FakeMdsDriver>(node_server->Address());
+    auto client = std::make_unique<FakeReadClient>(node_server->Address());
 
     // 测试点 A0：环境与配置就绪。
     {
         CaseScope scope("A0", "环境与配置就绪", kCaseA0Objective, kCaseA0Expectation, kCaseA0Method);
-        Step("光节点=" + node_server.Address() + "；假 real_node=" + real_node_server.Address() +
+        Step("光节点=" + node_server->Address() + "；假 real_node=" + real_node_server.Address() +
              "；假 scheduler=" + scheduler_server.Address() + "；假 MDS/client 已连到光节点");
         ExpectWithDetail(!corpus.plan().empty(),
                          "语料预测打包分组非空（expected_pack_plan.tsv 已就绪）",
@@ -878,11 +948,11 @@ int RunScenario(const Options& options) {
                          "单盘镜像数=" + std::to_string(kStandardImagesPerDisc) + " 背压上限=" +
                              std::to_string(profile.max_write_images) + " 容量=" +
                              std::to_string(profile.capacity_in_images));
-        const bool ready = service.IsArchiveEngineReady();
+        const bool ready = service->IsArchiveEngineReady();
         ExpectWithDetail(ready, "被测光节点 Run() 成功且状态为 RUNNING",
-                         service.GetArchiveStatusDetail());
+                         service->GetArchiveStatusDetail());
         Require(ready, "被测光节点处于 RUNNING 状态（后续全部步骤依赖它）");
-        Expect(!node_server.Address().empty() && !real_node_server.Address().empty() &&
+        Expect(!node_server->Address().empty() && !real_node_server.Address().empty() &&
                    !scheduler_server.Address().empty(),
                "三个 brpc server 均已监听（光节点 / 假 real_node / 假 scheduler）");
         Expect(FileExists(env.input_dir) && FileExists(env.temp_dir) && FileExists(env.image_dir) &&
@@ -933,13 +1003,13 @@ int RunScenario(const Options& options) {
     std::set<uint64_t> sent_inodes;
     size_t peak_write_images = 0;
     size_t plan_cursor = 0;
-    BackpressureWatch watch(&service, profile);
+    BackpressureWatch watch(service.get(), profile);
     for (size_t b = 0; b < batches.size(); ++b) {
         Step("假 MDS 下发第 " + std::to_string(b + 1) + "/" + std::to_string(batches.size()) +
              " 个批次（形态=" + batches[b].shape + "，文件数=" +
              std::to_string(batches[b].inodes.size()) + "，覆盖卷 " +
              JoinVolumes(volumes_of_batch[b]) + "）");
-        SendArchiveBatch(&mds, corpus, batches[b], static_cast<uint64_t>(b + 1));
+        SendArchiveBatch(mds.get(), corpus, batches[b], static_cast<uint64_t>(b + 1));
         for (uint64_t inode_id : batches[b].inodes) {
             sent_inodes.insert(inode_id);
         }
@@ -1041,8 +1111,8 @@ int RunScenario(const Options& options) {
                          "重复=" + std::to_string(duplicated) + " 遗漏=" + std::to_string(missing));
     }
 
-    // 测试点 B2：下载背压的触发与恢复（背压上限低于硬上限的档位才有意义）。
-    if (profile.check_backpressure) {
+    // 测试点 B2：下载背压的触发与恢复。
+    {
         CaseScope scope("B2", "背压触发与恢复（写镜像达上限 → 暂停下载 → 刻录释放唤醒）",
                         kCaseB2Objective, kCaseB2Expectation, kCaseB2Method);
         Step("写阶段背压采样：" + watch.Describe());
@@ -1093,16 +1163,19 @@ int RunScenario(const Options& options) {
                          "峰值=" + std::to_string(peak_write_images) + " 硬上限=" +
                              std::to_string(profile.capacity_in_images));
 
-        // 封印时即生成 meta/disc_<id>_meta，故「已封印盘数」是确定性的；等刻录汇报行数追平它，
-        // 说明所有已封印的盘都已完成刻录（无需固定 sleep）。
-        Step("等待刻录汇报行（控制台替代 MDS ReportImagesBurnedToDisc）：已封印盘数=" +
+        // 封印时即生成 meta/disc_<id>_meta，刻录 + 索引完成后被节点删除；因此
+        // 「无残留 disc_<id>_meta」+「vdisc 数等于刻录汇报行数」就是「所有已封印盘都已完成」
+        // 的确定性判据（无需固定 sleep，也不依赖已删除的中间态文件计数）。
+        Step("等待所有已封印光盘完成刻录与索引：当前残留 disc_<id>_meta=" +
              std::to_string(SealedDiscMetaCount(env)));
         const bool burned = WaitFor(
             [&] {
-                const size_t sealed = SealedDiscMetaCount(env);
-                return sealed > 0 && capture.CountLinesWithPrefix(kBurnReportPrefix) >= sealed;
+                const size_t reports = capture.CountLinesWithPrefix(kBurnReportPrefix);
+                return reports > 0 && SealedDiscMetaCount(env) == 0 &&
+                       DiscFiles(env).size() == reports;
             },
-            kBurnTimeoutMs, "所有已封印光盘的刻录汇报行到齐", env.dirs());
+            kBurnTimeoutMs, "所有已封印光盘完成刻录并登记索引（meta/ 无残留 disc_<id>_meta）",
+            env.dirs());
         Require(burned, "至少封印并刻录了 1 张光盘（否则后续 CD_READ 重载无法验证）");
 
         const std::vector<std::string> burn_lines = capture.CollectLinesWithPrefix(kBurnReportPrefix);
@@ -1125,8 +1198,10 @@ int RunScenario(const Options& options) {
              std::to_string(disc_outcome.burned_count) + " 个镜像（已打包卷数=" +
              std::to_string(packed_volumes.size()) + "）");
 
-        ExpectEqualU64(static_cast<uint64_t>(SealedDiscMetaCount(env)), disc_outcome.disc_count,
-                       "已封印盘数等于刻录汇报的盘数");
+        ExpectEqualU64(static_cast<uint64_t>(NodeDiscsMetaBlockCount(env)), disc_outcome.disc_count,
+                       "node_discs_meta 的追加块数等于刻录汇报的盘数（索引已登记）");
+        ExpectEqualU64(static_cast<uint64_t>(SealedDiscMetaCount(env)), 0,
+                       "meta/ 无残留 disc_<id>_meta（封印定稿元数据在刻录 + 索引完成后被删除）");
         Expect(disc_outcome.burned_count > 0, "至少 1 个镜像已刻录到光盘");
         Expect(disc_outcome.burned_count < packed_volumes.size(),
                "存在未装满的尾盘（刻录只覆盖被封印的盘，尾盘继续留在 pending）");
@@ -1232,12 +1307,120 @@ int RunScenario(const Options& options) {
                        "每个文件的分片数均为 4（1 MiB / 256 KiB）");
     }
 
-    // 6. 读链路：镜像已被刻录（已从 image_dir 释放）⇒ 触发 CD_READ，
-    // 按元数据记录的偏移从 vdisc 复制回 image_dir。
     // 只读已刻录卷的前若干个：把「满载后淘汰」留给测试点 A5（避免 A3 阶段就触发淘汰）。
     const size_t read_total =
         std::min<size_t>(disc_outcome.burned_count, profile.a3_read_volumes);
     Require(read_total > 0, "至少存在一个已刻录卷可供读回（CD_READ 前置条件）");
+
+    // 测试点 A8：正常关机落盘与重启恢复（在途读任务继续推进）。
+    // 位置刻意放在 A3 之前：此处的 image_dir 只装未刻录尾盘，容量有余量，
+    // 重启恢复后的读回不会与 A3 的 CD_READ 预期相互干扰。
+    {
+        CaseScope scope("A8", "正常关机落盘与重启恢复（在途任务继续推进）", kCaseA8Objective,
+                        kCaseA8Expectation, kCaseA8Method);
+        // 选一个「已刻录、且 A3/A5 都不会读到」的卷：已刻录前缀中跳过 A3 读取区间的那一个。
+        // 重启前只提交读请求、不取结果，于是关机时必然存在在途的 READ（及其 CD_READ 装载）任务。
+        Require(disc_outcome.burned_count > read_total,
+                "存在第 " + std::to_string(read_total + 1) +
+                    " 个已刻录卷可用于在途读任务（已刻录 " +
+                    std::to_string(disc_outcome.burned_count) + " 个）");
+        const PackedVolume& probe = packed_volumes[read_total];
+        const uint64_t probe_inode = probe.inodes.front();
+        Step("提交读请求但不取结果：volume_" + std::to_string(probe.volume_id) +
+             " inode=" + std::to_string(probe_inode) + "（制造在途 READ + CD_READ 任务）");
+        std::string request_error;
+        const uint64_t in_flight_task_id =
+            RequestReadTask(client.get(), probe.volume_id, probe_inode, &request_error);
+        Require(in_flight_task_id != 0,
+                "在途读任务已受理（task_id=" + std::to_string(in_flight_task_id) + "）" +
+                    (request_error.empty() ? std::string() : "；失败详情: " + request_error));
+        Step("在途任务 task_id=" + std::to_string(in_flight_task_id) +
+             "；不等待结果，立即进入关机流程");
+
+        const std::vector<std::string> images_before = ListDirBySuffix(env.image_dir, ".vimg");
+        const std::vector<std::string> discs_before = DiscFiles(env);
+        // 重启前的已刻录索引证据：块数 + 字节数。重启恢复不得重复追加或截断。
+        const size_t discs_meta_blocks_before = NodeDiscsMetaBlockCount(env);
+        uint64_t discs_meta_size_before = 0;
+        (void)GetFileSize(env.meta_dir + "node_discs_meta", &discs_meta_size_before);
+        const std::string snapshot_path = env.log_dir + "runtime_state_snapshot";
+        Expect(!FileExists(snapshot_path), "关机前不存在历史快照（log/runtime_state_snapshot）");
+
+        Step("Shutdown()：停后台线程 + 停 cd_manager + 落盘运行期状态");
+        Require(service->Shutdown(), "Shutdown() 返回成功");
+        ExpectWithDetail(service->GetArchiveStatusDetail().find("STOPPED") != std::string::npos,
+                         "关机后节点状态切到 STOPPED", service->GetArchiveStatusDetail());
+        uint64_t snapshot_size = 0;
+        const bool snapshot_sized = GetFileSize(snapshot_path, &snapshot_size);
+        ExpectWithDetail(snapshot_sized && snapshot_size > 0,
+                         "关机快照已生成且非空（" + snapshot_path + "）",
+                         "stat 成功=" + std::string(snapshot_sized ? "true" : "false") +
+                             " size=" + std::to_string(snapshot_size));
+
+        // 销毁旧实例（含 brpc server 端口释放）后以同一 archive_root 重建。
+        Step("销毁旧节点实例并以同一 archive_root 重建（模拟进程重启）");
+        client.reset();
+        mds.reset();
+        node_server.reset();
+        node_service.reset();
+        service.reset();
+
+        service = std::make_unique<OpticalStorageServiceImpl>(config);
+        node_service = std::make_unique<BrpcOpticalNodeService>(service.get());
+        node_server = std::make_unique<LocalServer>(node_service.get());
+        mds = std::make_unique<FakeMdsDriver>(node_server->Address());
+        client = std::make_unique<FakeReadClient>(node_server->Address());
+        watch.Rebind(service.get());
+
+        ExpectWithDetail(service->IsArchiveEngineReady(),
+                         "重启后节点重新处于 RUNNING（Run() 成功）",
+                         service->GetArchiveStatusDetail());
+        ExpectWithDetail(service->GetArchiveStatusDetail().find("runtime state restored") !=
+                             std::string::npos,
+                         "重启时确实从快照恢复了运行期状态（状态原因含 runtime state restored）",
+                         service->GetArchiveStatusDetail());
+        Expect(FileExists(env.log_dir + "runtime_state_snapshot.loaded"),
+               "快照已被消费为 runtime_state_snapshot.loaded（不会重复重放）");
+        Expect(!FileExists(snapshot_path), "重启后不再留有未消费的快照文件");
+
+        // 恢复不搬移/删除物理镜像：两处目录内容在重启前后应完全一致。
+        const std::vector<std::string> images_after = ListDirBySuffix(env.image_dir, ".vimg");
+        const std::vector<std::string> discs_after = DiscFiles(env);
+        ExpectWithDetail(images_after == images_before,
+                         "image/ 目录内容在重启前后完全一致（恢复不搬移、不删除镜像）",
+                         "前=[" + JoinNames(images_before) + "] 后=[" + JoinNames(images_after) + "]");
+        ExpectWithDetail(discs_after == discs_before,
+                         "disc_sim/ 目录内容在重启前后完全一致（vdisc 持久保留）",
+                         "前=[" + JoinNames(discs_before) + "] 后=[" + JoinNames(discs_after) + "]");
+        ExpectEqualU64(static_cast<uint64_t>(SealedDiscMetaCount(env)), 0,
+                       "重启后 meta/ 无残留 disc_<id>_meta（封印定稿元数据不因重启被复原）");
+        uint64_t discs_meta_size_after = 0;
+        (void)GetFileSize(env.meta_dir + "node_discs_meta", &discs_meta_size_after);
+        ExpectEqualU64(static_cast<uint64_t>(NodeDiscsMetaBlockCount(env)),
+                       discs_meta_blocks_before,
+                       "node_discs_meta 追加块数在重启前后一致（恢复未重复追加）");
+        ExpectEqualU64(discs_meta_size_after, discs_meta_size_before,
+                       "node_discs_meta 字节数在重启前后一致（恢复未改写已刻录索引）");
+
+        // 在途读任务继续推进：用原 task_id 取完数据（超时与单次 CD_READ 同量级）。
+        Step("以原 task_id=" + std::to_string(in_flight_task_id) +
+             " 继续读取：验证在途任务在重启后被恢复并推进到终态");
+        const ReadOutcome resumed = ReadByTaskId(client.get(), corpus, env, probe_inode,
+                                                in_flight_task_id, kCdReadTimeoutMs);
+        ExpectWithDetail(resumed.ok,
+                         "在途读任务在重启后仍能读回完整数据并与语料逐字节一致（inode=" +
+                             std::to_string(probe_inode) + "，共 " +
+                             std::to_string(resumed.data.size()) + " 字节，耗时 " +
+                             std::to_string(static_cast<uint64_t>(resumed.elapsed_ms)) + "ms）",
+                         resumed.error);
+        ExpectReadFinished(client.get(), probe_inode);
+        Expect(FileExists(ImagePath(env, probe.volume_id)),
+               "重启后完成读回的卷镜像落在 image_dir（volume_" +
+                   std::to_string(probe.volume_id) + "）");
+    }
+
+    // 读链路：镜像已被刻录（已从 image_dir 释放）⇒ 触发 CD_READ，
+    // 按元数据记录的偏移从 vdisc 复制回 image_dir。
     for (size_t i = 0; i < read_total; ++i) {
         const PackedVolume& packed = packed_volumes[i];
         const uint64_t first_inode = packed.inodes.front();
@@ -1251,13 +1434,13 @@ int RunScenario(const Options& options) {
             Step("读 volume_" + std::to_string(packed.volume_id) + " inode=" +
                  std::to_string(first_inode) + "（镜像在光盘库，预期触发一次 CD_READ 装载）");
             const ReadOutcome outcome =
-                ReadInode(&client, corpus, env, packed.volume_id, first_inode, kCdReadTimeoutMs);
+                ReadInode(client.get(), corpus, env, packed.volume_id, first_inode, kCdReadTimeoutMs);
             ExpectWithDetail(outcome.ok,
                              "读回数据与语料逐字节一致（inode=" + std::to_string(first_inode) +
                                  "，共 " + std::to_string(outcome.data.size()) + " 字节，耗时 " +
                                  std::to_string(static_cast<uint64_t>(outcome.elapsed_ms)) + "ms）",
                              outcome.error);
-            ExpectReadFinished(&client, first_inode);
+            ExpectReadFinished(client.get(), first_inode);
             Expect(FileExists(ImagePath(env, packed.volume_id)),
                    "CD_READ 后镜像回到 image_dir（volume_" + std::to_string(packed.volume_id) + "）");
             ExpectEqualU64(static_cast<uint64_t>(DiscFiles(env).size()), disc_outcome.disc_count,
@@ -1280,7 +1463,7 @@ int RunScenario(const Options& options) {
                  "，读前快照 image=[" + JoinNames(images_before) + "] disc_sim=[" +
                  JoinNames(discs_before) + "]");
             const ReadOutcome hit =
-                ReadInode(&client, corpus, env, packed.volume_id, second_inode, kCacheHitTimeoutMs);
+                ReadInode(client.get(), corpus, env, packed.volume_id, second_inode, kCacheHitTimeoutMs);
             ExpectWithDetail(hit.ok,
                              "缓存命中读回数据与语料一致（inode=" + std::to_string(second_inode) + "）",
                              hit.error);
@@ -1299,11 +1482,11 @@ int RunScenario(const Options& options) {
         }
     }
 
-    // 测试点 A5：满载后的 LRU 淘汰与重新提取（evict 档位：容量 14 / 背压上限 12）。
+    // 测试点 A5：满载后的 LRU 淘汰与重新提取（容量 14 / 背压上限 12）。
     // 前置：A3 已读入若干卷，叠加「尾盘未刻录镜像」后 image_dir 恰好满载。
     // 选一个「已刻录但不在 image_dir」的卷（= 已刻录前缀的最后一个，不在 A3 读取范围内），
     // 其读回必然走 CD_READ 并从 vdisc 提取，从而触发一次淘汰。
-    if (profile.check_eviction && disc_outcome.burned_count > read_total &&
+    if (disc_outcome.burned_count > read_total &&
         packed_volumes.size() > profile.capacity_in_images) {
         CaseScope scope("A5", "LRU 淘汰与重载（image_dir 满载后读入新卷）", kCaseA5Objective,
                         kCaseA5Expectation, kCaseA5Method);
@@ -1323,7 +1506,7 @@ int RunScenario(const Options& options) {
         Step("读 volume_" + std::to_string(last.volume_id) + " inode=" + std::to_string(last_inode) +
              "（image_dir 已满，预期淘汰一个 READ 受害者）");
         const ReadOutcome outcome =
-            ReadInode(&client, corpus, env, last.volume_id, last_inode, kCdReadTimeoutMs);
+            ReadInode(client.get(), corpus, env, last.volume_id, last_inode, kCdReadTimeoutMs);
         ExpectWithDetail(outcome.ok, "满载后读入新卷仍可读通（字节与语料一致）", outcome.error);
 
         const std::vector<std::string> images_after = ImageFiles(env);
@@ -1369,7 +1552,7 @@ int RunScenario(const Options& options) {
                     "可定位被淘汰卷的 inode（victim=" + std::to_string(victim) + "）");
             Step("被淘汰的镜像 volume_" + std::to_string(victim) + "，重新读以验证可从 vdisc 重新提取");
             const ReadOutcome reload =
-                ReadInode(&client, corpus, env, victim, victim_inode, kCdReadTimeoutMs);
+                ReadInode(client.get(), corpus, env, victim, victim_inode, kCdReadTimeoutMs);
             ExpectWithDetail(reload.ok, "被淘汰卷重载后可读通（字节与语料一致）", reload.error);
             Expect(FileExists(ImagePath(env, victim)),
                    "重载后被淘汰卷回到 image_dir（volume_" + std::to_string(victim) + "）");
@@ -1386,7 +1569,7 @@ int RunScenario(const Options& options) {
 
     const uint64_t elapsed_s = static_cast<uint64_t>(
         std::chrono::duration<double>(std::chrono::steady_clock::now() - run_begin).count());
-    std::cerr << "\n[RUN] 结束时间: " << NowString() << "，scenario=" << options.scenario
+    std::cerr << "\n[RUN] 结束时间: " << NowString()
               << "，总耗时 " << elapsed_s << "s" << std::endl;
     DumpCaseSummary();
     return FailureCounter() == 0 ? 0 : 1;
@@ -1396,12 +1579,11 @@ int RunScenario(const Options& options) {
 
 int main(int argc, char** argv) {
     const Options options = ParseArgs(argc, argv);
-    const int rc = RunScenario(options);
+    const int rc = RunOpticalNodeTest(options);
     if (rc == 0) {
-        std::cerr << "[PASS] optical_node 归档集成测试通过（scenario=" << options.scenario << "）" << std::endl;
+        std::cerr << "[PASS] optical_node 归档集成测试通过" << std::endl;
     } else {
-        std::cerr << "[FAIL] 共 " << FailureCounter() << " 项断言失败（scenario=" << options.scenario << "）"
-                  << std::endl;
+        std::cerr << "[FAIL] 共 " << FailureCounter() << " 项断言失败" << std::endl;
     }
     return rc;
 }

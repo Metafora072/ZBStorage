@@ -170,7 +170,7 @@ class LocalCluster:
                     "NODE_ID": "t03-optical", "NODE_ADDRESS": "", "SCHEDULER_ADDR": self.scheduler,
                     "HEARTBEAT_INTERVAL_MS": 200, "ARCHIVE_ROOT": self.output / "optical/archive",
                     "VOLUME_SIZE_BYTES": 10485760, "CAPACITY_IN_IMAGES": 2,
-                    "AVAILABLE_VOLUME_ID_COUNT": 1})
+                    "AVAILABLE_ID_COUNT": 1})
             binaries = ["scheduler_server", "mds_server"]
             if not self.simulated:
                 binaries.append("real_node_server")

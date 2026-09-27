@@ -177,15 +177,15 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
                 }
                 return {};
             }
-        } else if (key == "AVAILABLE_VOLUME_ID_COUNT") {
+        } else if (key == "AVAILABLE_ID_COUNT") {
             uint32_t count = 0;
             if (!ParseUint32(value, &count) || count > 255) {
                 if (error) {
-                    *error = "Invalid AVAILABLE_VOLUME_ID_COUNT at line " + std::to_string(line_no);
+                    *error = "Invalid AVAILABLE_ID_COUNT at line " + std::to_string(line_no);
                 }
                 return {};
             }
-            cfg.available_volume_id_count = static_cast<uint8_t>(count);
+            cfg.available_id_count = static_cast<uint8_t>(count);
         } else if (key == "DISC_CAPACITY_BYTES") {
             if (!ParseUint64(value, &cfg.disc_capacity_bytes)) {
                 if (error) {
@@ -241,8 +241,8 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
     if (cfg.capacity_in_images == 0) {
         cfg.capacity_in_images = 1000;
     }
-    if (cfg.available_volume_id_count == 0) {
-        cfg.available_volume_id_count = 5;
+    if (cfg.available_id_count == 0) {
+        cfg.available_id_count = 5;
     }
     if (cfg.disc_capacity_bytes == 0) {
         cfg.disc_capacity_bytes = 1099511627776ULL;

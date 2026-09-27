@@ -75,6 +75,14 @@ inline constexpr const char* kZipTaskProcessor  = "ZipTaskProcessor";
 inline constexpr const char* kCDReadTaskProcessor = "CDReadTaskProcessor";
 inline constexpr const char* kCDBurnTaskProcessor = "CDBurnTaskProcessor";
 inline constexpr const char* kCleanupTaskProcessor = "CleanupTaskProcessor";
+// 封印待打包光盘（分配 disk_id、定稿盘元数据、提交 DISC_BURN）。
+inline constexpr const char* kSealPendingDiscAndSubmitBurn = "SealPendingDiscAndSubmitBurn";
+
+// 运行期状态快照：关机落盘 / 重启恢复 / 恢复后幂等补齐。
+inline constexpr const char* kPersistRuntimeState  = "PersistRuntimeState";
+inline constexpr const char* kLoadRuntimeState     = "LoadRuntimeState";
+inline constexpr const char* kLoadPendingDiscMeta  = "LoadPendingDiscMeta";
+inline constexpr const char* kReconcileAndReplay   = "ReconcileAndReplay";
 
 }  // namespace start_failure_phase
 
@@ -498,6 +506,36 @@ public:
         return queue_.size();
     }
 
+    // 按 FIFO 顺序导出当前队列内容的副本，供关机快照落盘。
+    // 只读语义：不移动队首、不修改队列状态；调用方负责先把队列静止（Shutdown 在
+    // 全部后台线程 join 之后调用）。
+    std::vector<WRTaskShort> SnapshotAll() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<WRTaskShort> out;
+        out.reserve(queue_.size());
+        std::queue<WRTaskShort> copy = queue_;
+        while (!copy.empty()) {
+            out.push_back(copy.front());
+            copy.pop();
+        }
+        return out;
+    }
+
+    // 批量按序入队（重启恢复用）：单次加锁，保持 tasks 的给定顺序。
+    // 队列已 Close 时静默丢弃，语义与 Push 一致。
+    void PushAll(const std::vector<WRTaskShort>& tasks) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (closed_) {
+                return;
+            }
+            for (const WRTaskShort& task : tasks) {
+                queue_.push(task);
+            }
+        }
+        condition_variable_.notify_all();
+    }
+
 private:
     mutable std::mutex mutex_;
     std::condition_variable condition_variable_;
@@ -580,6 +618,21 @@ public:
     bool Contains(uint64_t task_id) const {
         std::lock_guard<std::mutex> lock(mutex_);
         return task_map_.find(task_id) != task_map_.end();
+    }
+
+    // 导出全部任务的副本，按 task_id 升序（保证同一份输入的结果可复现），
+    // 供关机快照落盘。返回副本，调用方自行筛掉终态任务。
+    std::vector<WRTask> SnapshotAll() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<WRTask> out;
+        out.reserve(task_map_.size());
+        for (const auto& kv : task_map_) {
+            out.push_back(kv.second);
+        }
+        std::sort(out.begin(), out.end(), [](const WRTask& lhs, const WRTask& rhs) {
+            return lhs.task_id < rhs.task_id;
+        });
+        return out;
     }
 
     void Clear() {
@@ -714,6 +767,45 @@ public:
         map_.clear();
     }
 
+    /**
+     * @brief 导出整张表的副本（volume_id → task_id 集合），供关机快照落盘。
+     *
+     * 返回的 vector 按 map_ 的遍历顺序排列；恢复时不依赖该顺序（每个 volume_id
+     * 内部的 task_id 顺序被保留，决定批量推进的先后）。
+     */
+    std::vector<std::pair<std::string, std::vector<uint64_t>>> SnapshotAll() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::pair<std::string, std::vector<uint64_t>>> out;
+        out.reserve(map_.size());
+        for (const auto& kv : map_) {
+            out.emplace_back(kv.first, kv.second);
+        }
+        return out;
+    }
+
+    /**
+     * @brief 恢复整张表（重启恢复用）：直接覆盖当前内容。
+     *
+     * 与逐条 AddTask 的区别：AddTask 对已存在的 task_id 返回 false，而恢复场景下
+     * 表应被快照内容整体替换，因此这里先 Clear 再批量写入。
+     * 重复的 task_id（同一 volume_id 下）会被去重，空 task_id 列表的 volume 不登记。
+     */
+    void RestoreAll(const std::vector<std::pair<std::string, std::vector<uint64_t>>>& entries) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        map_.clear();
+        for (const auto& kv : entries) {
+            if (kv.first.empty() || kv.second.empty()) {
+                continue;
+            }
+            auto& vec = map_[kv.first];
+            for (uint64_t task_id : kv.second) {
+                if (std::find(vec.begin(), vec.end(), task_id) == vec.end()) {
+                    vec.push_back(task_id);
+                }
+            }
+        }
+    }
+
 private:
     mutable std::mutex mutex_;
     std::unordered_map<std::string, std::vector<uint64_t>> map_;
@@ -814,6 +906,34 @@ public:
     std::size_t Size() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return queue_.size();
+    }
+
+    // 按 FIFO 顺序导出当前归档批次的副本，供关机快照落盘（只读语义，同 WRTaskQueue）。
+    std::vector<SendArchiveMetadataRequest> SnapshotAll() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<SendArchiveMetadataRequest> out;
+        out.reserve(queue_.size());
+        std::queue<SendArchiveMetadataRequest> copy = queue_;
+        while (!copy.empty()) {
+            out.push_back(copy.front());
+            copy.pop();
+        }
+        return out;
+    }
+
+    // 批量按序入队（重启恢复用）：单次加锁，保持 requests 的给定顺序。
+    // 队列已 Close 时静默丢弃，语义与 Push 一致。
+    void PushAll(const std::vector<SendArchiveMetadataRequest>& requests) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (closed_) {
+                return;
+            }
+            for (const SendArchiveMetadataRequest& request : requests) {
+                queue_.push(request);
+            }
+        }
+        condition_variable_.notify_all();
     }
 
 private:
@@ -1130,5 +1250,390 @@ struct DiscSuperblock {
                out.format_version == DISC_FORMAT_VERSION;
     }
 };
+
+// ============================================================================
+// 运行期状态快照：log/runtime_state_snapshot
+//
+// 正常关机（Shutdown）时把 task_map_、各任务队列、任务计数、可用 ID 池与打包中间态
+// 写入 log/runtime_state_snapshot；进程重启（Run）时读回，继续关机前未完成的任务。
+//
+// 文件布局：
+//   [RuntimeStateMetaHeader]                       // 定长 24B
+//   [section 0][section 1]...                      // 每段 [tag u32][payload_len u64][payload]
+//
+// 编码约定与 volume_manager/Serializer、DiscMetaHeader 一致：定长字段按本机字节序
+// memcpy，变长字符串用「u32 长度 + 字节」；解析侧全部带边界检查，截断 / 越界一律
+// 返回 false（不抛异常、不读越界），由调用方按「放弃该段」处理，不阻塞启动。
+//
+// 段缺失即表示对应状态为空，因此新增段天然向后兼容；字段布局变化时递增
+// RUNTIME_STATE_FORMAT_VERSION。
+// ============================================================================
+
+// 快照文件魔数标识 "ZBRS"。
+constexpr uint32_t RUNTIME_STATE_MAGIC = 0x5A425253u;
+// 快照格式版本；字段布局或编码方式变化时必须递增。
+constexpr uint32_t RUNTIME_STATE_FORMAT_VERSION = 1;
+// 快照文件头固定大小（字节），须与 RuntimeStateMetaHeader::Serialize 的写入顺序一致。
+constexpr uint32_t RUNTIME_STATE_HEADER_SIZE = 4 + 4 + 4 + 4 + 8;
+// 单个 section 头固定大小（字节）：[tag u32][payload_len u64]。
+constexpr uint32_t RUNTIME_STATE_SECTION_HEADER_SIZE = 4 + 8;
+
+// section 标识：每段承载一类相互独立的状态，便于按需扩展与容错降级。
+enum class RuntimeStateSectionTag : uint32_t {
+    kCounters = 1,         // next_task_id_ / next_volume_id_ / next_disk_id_
+    kAvailableIds = 2,     // available_volume_ids + available_disk_ids
+    kTasks = 3,            // task_map_ 中的非终态任务（WRTask blob 序列）
+    kQueues = 4,           // zip / cd_read / cd_burn 三个任务队列的 FIFO 内容
+    kArchiveQueue = 5,     // archive_task_queue_ + 归档下载断点
+    kVolumeReadIndex = 6,  // volume_read_index_（volume_id → task_id 集合）
+    kPendingFiles = 7,     // volume_manager_ 的 pending_files_ / pending_size_
+    kImages = 8,           // space_manager_ 管理表全量快照（volume_id + category，按 LRU 由旧到新）
+};
+
+/**
+ * @brief 快照文件头：固定 RUNTIME_STATE_HEADER_SIZE 字节，后跟 section_count 个 section
+ */
+struct RuntimeStateMetaHeader {
+    uint32_t magic_number{RUNTIME_STATE_MAGIC};        // 魔数 "ZBRS"
+    uint32_t format_version{RUNTIME_STATE_FORMAT_VERSION};  // 格式版本
+    uint32_t section_count{0};                         // section 数量
+    uint32_t reserved{0};                              // 保留（补零）
+    uint64_t created_at_ms{0};                         // 快照生成时刻（epoch 毫秒）
+
+    // 序列化为固定 RUNTIME_STATE_HEADER_SIZE 字节。
+    void Serialize(std::vector<uint8_t>& out) const {
+        out.assign(RUNTIME_STATE_HEADER_SIZE, 0);
+        uint8_t* p = out.data();
+        std::memcpy(p, &magic_number, sizeof(magic_number));
+        p += sizeof(magic_number);
+        std::memcpy(p, &format_version, sizeof(format_version));
+        p += sizeof(format_version);
+        std::memcpy(p, &section_count, sizeof(section_count));
+        p += sizeof(section_count);
+        std::memcpy(p, &reserved, sizeof(reserved));
+        p += sizeof(reserved);
+        std::memcpy(p, &created_at_ms, sizeof(created_at_ms));
+    }
+
+    // 反序列化；缓冲区过短或魔数 / 格式版本不符时返回 false。
+    static bool Parse(const uint8_t* header, size_t header_size, RuntimeStateMetaHeader& out) {
+        if (header == nullptr || header_size < RUNTIME_STATE_HEADER_SIZE) {
+            return false;
+        }
+        const uint8_t* p = header;
+        std::memcpy(&out.magic_number, p, sizeof(out.magic_number));
+        p += sizeof(out.magic_number);
+        std::memcpy(&out.format_version, p, sizeof(out.format_version));
+        p += sizeof(out.format_version);
+        std::memcpy(&out.section_count, p, sizeof(out.section_count));
+        p += sizeof(out.section_count);
+        std::memcpy(&out.reserved, p, sizeof(out.reserved));
+        p += sizeof(out.reserved);
+        std::memcpy(&out.created_at_ms, p, sizeof(out.created_at_ms));
+
+        return out.magic_number == RUNTIME_STATE_MAGIC &&
+               out.format_version == RUNTIME_STATE_FORMAT_VERSION;
+    }
+};
+
+// ---- 编码原语：写入侧 ----
+
+inline void AppendU8(std::vector<uint8_t>& out, uint8_t value) {
+    out.push_back(value);
+}
+
+inline void AppendU32(std::vector<uint8_t>& out, uint32_t value) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&value);
+    out.insert(out.end(), p, p + sizeof(value));
+}
+
+inline void AppendU64(std::vector<uint8_t>& out, uint64_t value) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&value);
+    out.insert(out.end(), p, p + sizeof(value));
+}
+
+inline void AppendI32(std::vector<uint8_t>& out, int32_t value) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&value);
+    out.insert(out.end(), p, p + sizeof(value));
+}
+
+// 变长字符串：[u32 长度][字节]（不写结尾 '\0'）。
+inline void AppendString(std::vector<uint8_t>& out, const std::string& value) {
+    AppendU32(out, static_cast<uint32_t>(value.size()));
+    out.insert(out.end(), value.begin(), value.end());
+}
+
+// 追加一个 section：[tag u32][payload_len u64][payload]
+inline void AppendSection(std::vector<uint8_t>& out,
+                          RuntimeStateSectionTag tag,
+                          const std::vector<uint8_t>& payload) {
+    AppendU32(out, static_cast<uint32_t>(tag));
+    AppendU64(out, static_cast<uint64_t>(payload.size()));
+    out.insert(out.end(), payload.begin(), payload.end());
+}
+
+// ---- 编码原语：读取侧 ----
+
+/**
+ * @brief 快照字节流读取游标
+ *
+ * 所有读取都做边界检查：数据不足 / 越界一律返回 false，不抛异常、不读越界。
+ * 解析侧据此把「截断的尾部记录」判为失败并放弃，而不是崩溃。
+ */
+class RuntimeStateReader {
+public:
+    // 默认构造：空视图（remaining() == 0）。供 SubReader 的目标对象与调用方局部变量使用。
+    RuntimeStateReader() = default;
+
+    RuntimeStateReader(const uint8_t* data, size_t size)
+        : data_(data), size_(size) {
+    }
+
+    bool ReadU8(uint8_t* out) {
+        return ReadRaw(out, sizeof(*out));
+    }
+
+    bool ReadU32(uint32_t* out) {
+        return ReadRaw(out, sizeof(*out));
+    }
+
+    bool ReadU64(uint64_t* out) {
+        return ReadRaw(out, sizeof(*out));
+    }
+
+    bool ReadI32(int32_t* out) {
+        return ReadRaw(out, sizeof(*out));
+    }
+
+    // 读取变长字符串；长度超出剩余字节时返回 false。
+    bool ReadString(std::string* out) {
+        if (out == nullptr) {
+            return false;
+        }
+        uint32_t len = 0;
+        if (!ReadU32(&len)) {
+            return false;
+        }
+        if (static_cast<size_t>(len) > size_ - cursor_) {
+            return false;
+        }
+        out->assign(reinterpret_cast<const char*>(data_ + cursor_), len);
+        cursor_ += len;
+        return true;
+    }
+
+    // 从当前位置切出长度为 len 的子读取器（用于 section payload / 单条记录）。
+    bool SubReader(uint64_t len, RuntimeStateReader* out) {
+        if (out == nullptr || len > static_cast<uint64_t>(size_ - cursor_)) {
+            return false;
+        }
+        *out = RuntimeStateReader(data_ + cursor_, static_cast<size_t>(len));
+        cursor_ += static_cast<size_t>(len);
+        return true;
+    }
+
+    // 剩余可读字节数。
+    size_t remaining() const {
+        return size_ - cursor_;
+    }
+
+    // 当前未读字节的只读起始地址（不移动游标）。
+    // 用于把「已按长度切出的子段」直接交给更专门的解析函数（如 ParseWRTaskBlob）。
+    const uint8_t* remaining_data() const {
+        return data_ + cursor_;
+    }
+
+private:
+    bool ReadRaw(void* out, size_t len) {
+        if (out == nullptr || len > size_ - cursor_) {
+            return false;
+        }
+        std::memcpy(out, data_ + cursor_, len);
+        cursor_ += len;
+        return true;
+    }
+
+    const uint8_t* data_{nullptr};
+    size_t size_{0};
+    size_t cursor_{0};
+};
+
+// ---- 单条记录编解码 ----
+
+/**
+ * @brief 把单个 WRTask 编码为自描述 blob
+ *
+ * 故意**不**落盘 inode_id_num：解析时由 inode_id 重新推导（WRTask::ParseInodeId），
+ * 避免冗余字段在恢复后与 inode_id 不一致。
+ * 通用字段（state）与失败字段（last_error_code / detail）全量落盘，
+ * 以便恢复后既知道任务做什么，也知道上次失败在哪一步。
+ */
+inline std::vector<uint8_t> SerializeWRTaskBlob(const WR_task::WRTask& task) {
+    std::vector<uint8_t> out;
+    out.reserve(160);
+    AppendU64(out, task.task_id);
+    AppendU32(out, static_cast<uint32_t>(task.type));
+    AppendU32(out, static_cast<uint32_t>(task.state));
+    AppendString(out, task.disk_id);
+    AppendString(out, task.volume_id);
+    AppendString(out, task.inode_id);
+    AppendString(out, task.file_path);
+    AppendU64(out, task.state_changed_at_ms);
+    AppendU32(out, static_cast<uint32_t>(task.volume_ids.size()));
+    for (const std::string& id : task.volume_ids) {
+        AppendString(out, id);
+    }
+    AppendU64(out, task.expected_image_size_bytes);
+    AppendI32(out, static_cast<int32_t>(task.last_error_code));
+    AppendString(out, task.last_error_detail);
+    AppendU32(out, task.attempt_count);
+    AppendU8(out, task.is_failed_terminal ? 1 : 0);
+    return out;
+}
+
+/**
+ * @brief 反序列化 WRTask blob
+ *
+ * 任一步数据不足、尾部有多余字节、type / state 超出枚举范围都返回 false。
+ * 成功时 out 的每个字段都被显式赋值（WRTask 默认构造并不初始化全部字段）。
+ */
+inline bool ParseWRTaskBlob(const uint8_t* data, size_t size, WR_task::WRTask& out) {
+    RuntimeStateReader reader(data, size);
+
+    uint64_t task_id = 0;
+    uint32_t type = 0;
+    uint32_t state = 0;
+    std::string disk_id;
+    std::string volume_id;
+    std::string inode_id;
+    std::string file_path;
+    uint64_t state_changed_at_ms = 0;
+    uint32_t volume_ids_count = 0;
+    uint64_t expected_image_size_bytes = 0;
+    int32_t last_error_code = 0;
+    std::string last_error_detail;
+    uint32_t attempt_count = 0;
+    uint8_t is_failed_terminal = 0;
+
+    if (!reader.ReadU64(&task_id) ||
+        !reader.ReadU32(&type) ||
+        !reader.ReadU32(&state) ||
+        !reader.ReadString(&disk_id) ||
+        !reader.ReadString(&volume_id) ||
+        !reader.ReadString(&inode_id) ||
+        !reader.ReadString(&file_path) ||
+        !reader.ReadU64(&state_changed_at_ms) ||
+        !reader.ReadU32(&volume_ids_count)) {
+        return false;
+    }
+    if (type > static_cast<uint32_t>(WR_task::WRTaskType::CD_READ) ||
+        state > static_cast<uint32_t>(WR_task::WRTaskState::FAILED)) {
+        return false;
+    }
+
+    // 计数合理性校验：每条 volume_id 至少占 4 字节（u32 长度前缀）。
+    // 截断数据会把后续字段的字节误读成巨大的计数，若不先按剩余字节收紧，
+    // reserve 会抛 std::length_error / std::bad_alloc —— 解析必须只返回 false。
+    if (volume_ids_count > reader.remaining() / 4) {
+        return false;
+    }
+
+    std::vector<std::string> volume_ids;
+    volume_ids.reserve(volume_ids_count);
+    for (uint32_t i = 0; i < volume_ids_count; ++i) {
+        std::string volume_id_item;
+        if (!reader.ReadString(&volume_id_item)) {
+            return false;
+        }
+        volume_ids.push_back(std::move(volume_id_item));
+    }
+
+    if (!reader.ReadU64(&expected_image_size_bytes) ||
+        !reader.ReadI32(&last_error_code) ||
+        !reader.ReadString(&last_error_detail) ||
+        !reader.ReadU32(&attempt_count) ||
+        !reader.ReadU8(&is_failed_terminal) ||
+        reader.remaining() != 0) {
+        return false;
+    }
+
+    WR_task::WRTask parsed;
+    parsed.task_id = task_id;
+    parsed.type = static_cast<WR_task::WRTaskType>(type);
+    parsed.disk_id = std::move(disk_id);
+    parsed.volume_id = std::move(volume_id);
+    parsed.inode_id = std::move(inode_id);
+    parsed.inode_id_num = WR_task::WRTask::ParseInodeId(parsed.inode_id);
+    parsed.state = static_cast<WR_task::WRTaskState>(state);
+    parsed.state_changed_at_ms = state_changed_at_ms;
+    parsed.file_path = std::move(file_path);
+    parsed.volume_ids = std::move(volume_ids);
+    parsed.expected_image_size_bytes = expected_image_size_bytes;
+    parsed.last_error_code = static_cast<volumemanager::ErrorCode>(last_error_code);
+    parsed.last_error_detail = std::move(last_error_detail);
+    parsed.attempt_count = attempt_count;
+    parsed.is_failed_terminal = (is_failed_terminal != 0);
+
+    out = std::move(parsed);
+    return true;
+}
+
+// 编码一批归档文件元数据（对应 SendArchiveMetadataRequest）：batch_id + files 全量字段。
+// target_node_id / target_disk_id 是恢复后重新下载文件的唯一定位依据，必须落盘。
+inline std::vector<uint8_t> SerializeArchiveRequestBlob(const SendArchiveMetadataRequest& request) {
+    std::vector<uint8_t> out;
+    out.reserve(64 + request.files.size() * 80);
+    AppendU64(out, request.batch_id);
+    AppendU32(out, static_cast<uint32_t>(request.files.size()));
+    for (const ArchiveFileInfo& file : request.files) {
+        AppendU64(out, file.inode_id);
+        AppendU64(out, file.size);
+        AppendU64(out, file.object_unit_size);
+        AppendString(out, file.target_node_id);
+        AppendString(out, file.target_disk_id);
+    }
+    return out;
+}
+
+// 反序列化归档批次 blob；数据不足 / 尾部有多余字节返回 false。
+inline bool ParseArchiveRequestBlob(const uint8_t* data,
+                                    size_t size,
+                                    SendArchiveMetadataRequest& out) {
+    RuntimeStateReader reader(data, size);
+
+    uint64_t batch_id = 0;
+    uint32_t file_count = 0;
+    if (!reader.ReadU64(&batch_id) || !reader.ReadU32(&file_count)) {
+        return false;
+    }
+
+    // 计数合理性校验：每个文件至少占 3 个 u64 定长字段（24 字节）+ 两个字符串
+    // 长度前缀（8 字节）= 32 字节。截断数据误读出的巨大计数必须先被拒绝，
+    // 否则 reserve 会抛 std::length_error / std::bad_alloc。
+    if (file_count > reader.remaining() / 32) {
+        return false;
+    }
+
+    SendArchiveMetadataRequest parsed;
+    parsed.batch_id = batch_id;
+    parsed.files.reserve(file_count);
+    for (uint32_t i = 0; i < file_count; ++i) {
+        ArchiveFileInfo file;
+        if (!reader.ReadU64(&file.inode_id) ||
+            !reader.ReadU64(&file.size) ||
+            !reader.ReadU64(&file.object_unit_size) ||
+            !reader.ReadString(&file.target_node_id) ||
+            !reader.ReadString(&file.target_disk_id)) {
+            return false;
+        }
+        parsed.files.push_back(std::move(file));
+    }
+    if (reader.remaining() != 0) {
+        return false;
+    }
+
+    out = std::move(parsed);
+    return true;
+}
 
 }  // namespace optical_node_manager

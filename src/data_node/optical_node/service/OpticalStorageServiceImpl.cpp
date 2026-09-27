@@ -32,7 +32,7 @@ OpticalStorageServiceImpl::OpticalStorageServiceImpl(const OpticalNodeConfig& co
                             config.size_threshold,
                             config.archive_root,
                             config.capacity_in_images,
-                            config.available_volume_id_count,
+                            config.available_id_count,
                             config.disc_capacity_bytes,
                             config.standard_images_per_disc,
                             config.disc_block_size_bytes,
@@ -132,6 +132,10 @@ volumemanager::ErrorCode OpticalStorageServiceImpl::ReadObjectByInodeId(const st
 
 bool OpticalStorageServiceImpl::IsArchiveEngineReady() const {
     return optical_node_manager_.IsReady();
+}
+
+bool OpticalStorageServiceImpl::Shutdown() {
+    return optical_node_manager_.Shutdown();
 }
 
 std::string OpticalStorageServiceImpl::GetArchiveStatusDetail() const {

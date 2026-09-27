@@ -404,6 +404,23 @@ uint64_t SpaceManager::GetWriteImageCount() const {
     return CountEntriesByCategory(ImageCategory::WRITE);
 }
 
+std::vector<ImageSnapshotEntry> SpaceManager::SnapshotImageEntries() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::vector<ImageSnapshotEntry> out;
+    out.reserve(entries_.size());
+    // lru_list_：front = 最近访问，back = 最久未访问。
+    // 逆序遍历即「由旧到新」，与 RebuildManagementTable 的插入顺序约定一致
+    // （插入方逐个 push_front，最后插入的最新，正好落在 front）。
+    for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
+        const ImageEntry& entry = (*it)->second;
+        ImageSnapshotEntry snapshot_entry;
+        snapshot_entry.volume_id = entry.volume_id;
+        snapshot_entry.category = entry.category;
+        out.push_back(snapshot_entry);
+    }
+    return out;
+}
+
 uint64_t SpaceManager::CountEntriesByCategory(ImageCategory category) const {
     uint64_t count = 0;
     for (const auto& pair : entries_) {
@@ -415,6 +432,12 @@ uint64_t SpaceManager::CountEntriesByCategory(ImageCategory category) const {
 }
 
 volumemanager::ErrorCode SpaceManager::RebuildManagementTable() {
+    return RebuildManagementTable(std::vector<ImageSnapshotEntry>(), nullptr);
+}
+
+volumemanager::ErrorCode SpaceManager::RebuildManagementTable(
+    const std::vector<ImageSnapshotEntry>& snapshot,
+    RebuildReport* out_report) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
 
     entries_.clear();
@@ -422,38 +445,87 @@ volumemanager::ErrorCode SpaceManager::RebuildManagementTable() {
     lru_index_.clear();
     capacity_set_ = false;
 
-    // 扇平布局（2026-08-15）：扫描 image_dir_ 单层目录。
-    // 已知遗留（用户接受）：扇平后无法从"所在子目录"反推 category，
-    // 当前把所有扫描到的镜像统一登记为 ImageCategory::READ。区分读写镜像的问题
-    // 后续另说——参见头文件中 RebuildManagementTable 文档。
+    if (out_report != nullptr) {
+        out_report->snapshot_only.clear();
+        out_report->disk_only.clear();
+    }
+
+    // ① 目录扫描 = 存在性基线（扇平布局：扫描 image_dir_ 单层目录）。
+    //    只有磁盘上确实存在的镜像才可能被登记；快照里有、磁盘上没有的镜像
+    //    其物理数据已丢失，不登记（避免 HasImage 说谎、MoveFrom/RemoveWriteImage
+    //    对不存在的文件操作）。
     const std::string flat_dir = NormalizeImageDir(image_dir_path_);
     DIR* dir = opendir(flat_dir.c_str());
     if (dir == nullptr) {
         return volumemanager::ErrorCode::IO_ERROR;
     }
+    std::unordered_map<uint64_t, std::string> on_disk;  // volume_id -> basename
     struct dirent* entry = nullptr;
     while ((entry = readdir(dir)) != nullptr) {
         const std::string name(entry->d_name);
         if (name == "." || name == "..") {
             continue;
         }
-        // 跳过隐藏目录 / 临时残留（如 ".tmp" / ".stale" 之类），仅取 volume_*.vimg。
-        // 当前没有别的子目录需要担心（扇平后 read/ write/ 子目录都不应存在），
-        // 但若用户曾运行过旧版残留 read/write 子目录，本循环会把它们当成条目
-        // ——所以这里额外跳过没有体积文件名格式的目录项。
+        // 跳过非 volume_<id>.vimg 项：隐藏文件 / 临时残留，以及旧版可能遗留的
+        // read/ write/ 子目录项（扇平后不应存在，但不做假设）。
         uint64_t volume_id = 0;
         if (!TryParseVolumeId(name, volume_id)) {
             continue;
         }
-        ImageEntry img_entry;
-        img_entry.volume_id = volume_id;
-        img_entry.category = ImageCategory::READ;   // 见上文：扇平后统一标 READ
-        img_entry.filename = name;
-        img_entry.last_access = std::chrono::steady_clock::now()
-                               - std::chrono::hours(1);
-        InsertEntryLocked(img_entry);
+        // 同名文件不会重复出现；emplace 保证首次（也是唯一一次）写入。
+        on_disk.emplace(volume_id, name);
     }
     closedir(dir);
+
+    // ② 按「快照由旧到新」的顺序插入：InsertEntryLocked 逐个 push_front，
+    //    因此最后插入的最新镜像落在队首，恰好还原原 LRU 顺序。
+    const std::chrono::steady_clock::time_point restored_at = std::chrono::steady_clock::now();
+    auto insert_from_disk = [&](uint64_t volume_id, const std::string& basename,
+                                ImageCategory category) {
+        ImageEntry img_entry;
+        img_entry.volume_id = volume_id;
+        img_entry.category = category;
+        img_entry.filename = basename;
+        // LRU 顺序由 lru_list_ 承载（淘汰时逆序取第一个 READ），last_access 仅供参考。
+        img_entry.last_access = restored_at;
+        InsertEntryLocked(img_entry);
+    };
+
+    for (const ImageSnapshotEntry& snapshot_entry : snapshot) {
+        // 快照内重复的 volume_id 只取首次：entries_.emplace 不会替换，
+        // 若继续 push_front 会让 lru_list_ 与 entries_ 长度不一致，破坏三件套不变量。
+        // 该判断必须在磁盘查找之前——首次出现已把 id 从 on_disk 中移除，
+        // 若放在之后，重复项会因为「磁盘上找不到」而被误报为 snapshot_only。
+        if (entries_.find(snapshot_entry.volume_id) != entries_.end()) {
+            continue;
+        }
+        auto disk_it = on_disk.find(snapshot_entry.volume_id);
+        if (disk_it == on_disk.end()) {
+            // 快照有记录但磁盘已无该文件（物理镜像已被换出 / 删除）。
+            if (out_report != nullptr) {
+                out_report->snapshot_only.push_back(snapshot_entry.volume_id);
+            }
+            continue;
+        }
+        insert_from_disk(snapshot_entry.volume_id, disk_it->second, snapshot_entry.category);
+        on_disk.erase(disk_it);
+    }
+
+    // ③ 磁盘独有（快照未记录）：无 category 依据 → READ；置于 LRU 最新端
+    //    （最后插入 ⇒ 队首），避免未刻录的写镜像被立刻当作 victim 删除。
+    //    按 volume_id 升序插入，保证同一份输入的结果可复现。
+    std::vector<uint64_t> disk_only_ids;
+    disk_only_ids.reserve(on_disk.size());
+    for (const auto& kv : on_disk) {
+        disk_only_ids.push_back(kv.first);
+    }
+    std::sort(disk_only_ids.begin(), disk_only_ids.end());
+    for (uint64_t volume_id : disk_only_ids) {
+        if (out_report != nullptr) {
+            out_report->disk_only.push_back(volume_id);
+        }
+        insert_from_disk(volume_id, on_disk.at(volume_id), ImageCategory::READ);
+    }
 
     return volumemanager::ErrorCode::SUCCESS;
 }

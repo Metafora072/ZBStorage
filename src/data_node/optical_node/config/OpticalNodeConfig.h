@@ -34,8 +34,9 @@ struct OpticalNodeConfig {
     // image_dir 可容纳的镜像数上限（硬上限，READ + WRITE 共用；默认盘 1TiB / 卷 10GiB
     // 下单盘约 113 个镜像，故取值需远大于单盘镜像数）。
     uint64_t capacity_in_images{1000};
-    // available_volume_ids 队列容量上限
-    uint8_t available_volume_id_count{5};
+    // 可用 ID 池的容量上限（AVAILABLE_ID_COUNT）：volume_id（MDS image_id）与
+    // disk_id（MDS disc_id）两个池共用同一容量，取用时按需向各自计数器补齐。
+    uint8_t available_id_count{5};
 
     // 光盘打包：单张光盘容量上限（字节）与单张光盘标准镜像数。
     // 标准镜像数为基线口径，实际单张光盘按容量可能容纳更多镜像。

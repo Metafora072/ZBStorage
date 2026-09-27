@@ -226,6 +226,10 @@ int main(int argc, char* argv[]) {
     if (!cfg.scheduler_addr.empty()) reporter.Start();
 
     server.RunUntilAskedToQuit();
+
+    // 正常关机（SIGINT / SIGTERM 由 brpc 处理）：先停心跳上报，避免调度器在节点
+    // 停止期间继续派发归档任务，再把归档引擎的运行期状态落盘，供下次启动恢复。
     reporter.Stop();
+    storage_service.Shutdown();
     return 0;
 }

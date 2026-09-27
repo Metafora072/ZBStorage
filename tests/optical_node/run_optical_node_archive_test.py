@@ -7,24 +7,21 @@
     2. 运行 C++ 测试二进制（由 --driver 指定），把 stdout+stderr 合并落盘为 output.log；
     3. 回显日志末尾的「测试点汇总」区块，并按需清理工作目录。
 
-场景（--scenario）：
-    smoke  14 卷 140 文件（1 MiB/文件，按 256 KiB 切成 4 片，镜像 ≈ 10.1 MiB）：走完
-           归档→压缩→封装→打包汇报→封盘（生成 vdisc）→刻录释放→光盘读回；
-           墙钟约 1~2 分钟。
-    full   56 卷 560 文件：在 smoke 基础上覆盖多张光盘共存（5 张）、四种 MDS 批次形态
-           （逐文件小批次 / 整卷单批次 / 跨卷边界批次 / 大小混合批次）与下载背压的
-           触发与恢复（image_dir 容量 100 / 背压上限 30）；墙钟 10~20 分钟
-           （光盘仿真时长不可压缩，产线未提供测试旋钮）。
-    evict  26 卷 260 文件：小容量档位（image_dir 容量 14 / 背压上限 12），覆盖
-           image_dir 满载后的 LRU 淘汰、CD_READ 重载与背压触发恢复；墙钟 6~10 分钟。
+单一综合场景（56 卷 560 文件，1 MiB/文件按 256 KiB 切成 4 片，镜像 ≈ 10.1 MiB）：
+    一次运行覆盖「MDS 批次形态 → 归档下载 → 压缩封装 → 打包汇报 → 封盘（生成 vdisc）→
+    刻录释放 → 光盘读回 → image_dir 满载淘汰与重载 → 正常关机落盘与重启恢复（在途任务
+    继续推进）」。档位为小容量缓存（image_dir 容量 14 / 背压上限 12），因此背压触发与
+    恢复（多轮触发-解除）、LRU 淘汰、以及 5 张光盘共存下的元数据索引规模都在同一次
+    运行内被观测到。
+    墙钟约 20~35 分钟（光盘仿真时长不可压缩，产线未提供测试旋钮）。
 
 语料来源：--input-dir，其次环境变量 ZBSTORAGE_OPTICAL_CORPUS，缺省 ~/WR/testWrite。
-工作目录：默认 tests/optical_node/results/<scenario>-<时间戳>/（见 tests/README.md 结果保存约定），
+工作目录：默认 tests/optical_node/results/optical_node-<时间戳>/（见 tests/README.md 结果保存约定），
         其中 corpus/ 为脚本产出的语料、archive/ 为光节点工作目录、
         output.log 为本次运行的完整日志（按测试点记录目标 / 期望 / 验证方法 / 逐项检查结论）。
 
-产物保留约定（实测占用：smoke 约 0.5GB、evict 约 1GB、full 约 1.5GB
-（56 卷语料 0.55GB + 5 张 vdisc 0.5GB + image_dir 峰值 0.3GB），含语料与 vdisc 光盘文件）：
+产物保留约定（实测占用约 1.5GB：56 卷语料 + 5 张 vdisc + image_dir 峰值，
+含语料与 vdisc 光盘文件）：
     默认（成功）          删除 corpus/ 与 archive/，保留 output.log 作为可追溯的测试记录；
     失败                  全部保留以便排查；
     --keep                无论成败全部保留。
@@ -55,10 +52,10 @@ def resolve_corpus_src(input_dir):
     )
 
 
-def default_work_dir(scenario):
+def default_work_dir():
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     return os.path.join(REPO_ROOT, "tests", "optical_node", "results",
-                        "%s-%s" % (scenario, ts))
+                        "optical_node-%s" % ts)
 
 
 def run_tee(cmd, log, cwd=None):
@@ -108,8 +105,6 @@ def print_case_summary(log_path):
 def main():
     parser = argparse.ArgumentParser(description="光存储节点归档集成测试驱动")
     parser.add_argument("--driver", required=True, help="C++ 测试二进制路径")
-    parser.add_argument("--scenario", required=True, choices=["smoke", "full", "evict"],
-                        help="测试场景")
     parser.add_argument("--work-dir", default=None, help="工作目录")
     parser.add_argument("--input-dir", default=None, help="语料来源目录")
     parser.add_argument("--keep", action="store_true",
@@ -122,26 +117,24 @@ def main():
               "或 --input-dir 指定）" % corpus_src, file=sys.stderr)
         sys.exit(SKIP_RETURN_CODE)
 
-    work_dir = args.work_dir or default_work_dir(args.scenario)
+    work_dir = args.work_dir or default_work_dir()
     work_dir = os.path.abspath(work_dir)
     os.makedirs(work_dir, exist_ok=True)
-    print("[info] 场景=%s 语料来源=%s 工作目录=%s"
-          % (args.scenario, corpus_src, work_dir))
+    print("[info] 语料来源=%s 工作目录=%s" % (corpus_src, work_dir))
 
     corpus_out = os.path.join(work_dir, "corpus")
     # 卷数必须大于「单盘可容纳的镜像数」才会触发封印（生成 vdisc 并刻录）：
     # 10 MiB 卷 → 镜像 ≈ 10.1 MiB；100 MiB 盘恰好容纳 10 个，故至少要 11 卷才封出第一张盘。
-    #   smoke 14 卷：1 张完整盘 + 尾盘；
-    #   full  56 卷：5 张完整盘 + 尾盘（容量 100 的档位不触发淘汰，专注写链路与背压）；
-    #   evict 26 卷：2 张完整盘 + 尾盘，叠加容量 14 的小缓存触发 LRU 淘汰。
-    volumes = {"smoke": 14, "full": 56, "evict": 26}[args.scenario]
+    # 56 卷：5 张完整光盘 + 尾盘；叠加「容量 14 的小缓存」即可触发 LRU 淘汰与 CD_READ 重载，
+    # 并让 node_discs_meta / disc_image_index_ 达到多盘规模（重启恢复索引的验证更有力度）。
+    volumes = 56
     log_path = os.path.join(work_dir, LOG_NAME)
 
     with open(log_path, "w", encoding="utf-8") as log:
         log.write("=" * 96 + "\n")
         log.write("optical_node 归档集成测试运行日志\n")
         log.write("开始时间: %s\n" % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        log.write("场景: %s（%d 卷）\n" % (args.scenario, volumes))
+        log.write("场景: 综合场景（%d 卷）\n" % volumes)
         log.write("语料来源: %s\n" % corpus_src)
         log.write("工作目录: %s\n" % work_dir)
         log.write("=" * 96 + "\n")
@@ -168,7 +161,6 @@ def main():
             args.driver,
             "--corpus", corpus_out,
             "--work-dir", work_dir,
-            "--scenario", args.scenario,
         ]
         rc = run_tee(driver_cmd, log, cwd=work_dir)
 
@@ -177,7 +169,7 @@ def main():
 
     # 步骤 4：结果摘要与产物清理
     print("=" * 60)
-    print("[summary] scenario=%s exit_code=%d" % (args.scenario, rc))
+    print("[summary] exit_code=%d" % rc)
     print("[summary] 完整日志：%s" % log_path)
     if rc == 0 and not args.keep:
         for heavy in ("corpus", "archive"):

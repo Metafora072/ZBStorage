@@ -7,6 +7,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <volume_manager/error_codes.h>
 
@@ -38,13 +39,40 @@ enum class ImageCategory {
  * 与 VolumeManager::PackVolume 的 output_path basename 约定保持一致。
  * 镜像在物理上全部平铺在 image_dir_/<basename>（2026-08-15 起改为扇平布局）：
  *   - 不再区分 read/ write/ 子目录；
- *   - category 仅作为语义标签（READ/WRITE），重建区分的问题后续再说。
+ *   - category 仅作为语义标签（READ/WRITE），扇平后无法从目录布局反推，
+ *     因此重启恢复时必须由快照回填（见 RebuildManagementTable 的 snapshot 参数）。
  */
 struct ImageEntry {
     uint64_t volume_id;                 // 卷镜像 ID（与文件名 volume_<id>.vimg 一致）
     ImageCategory category;             // 镜像类别（语义标签，物理上不再区分）
     std::string filename;               // 在 image_dir_ 下的文件名（basename，不带路径）
-    std::chrono::steady_clock::time_point last_access;  // 最近一次访问时间（LRU 依据）
+    std::chrono::steady_clock::time_point last_access;  // 最近一次访问时间（仅参考，LRU 以 lru_list_ 顺序为准）
+};
+
+/**
+ * @brief 管理表快照的一条记录（跨重启持久化用）
+ *
+ * 只需 volume_id + category：LRU 顺序由「记录在快照中的先后」承载
+ * （快照按 LRU 由旧到新排列），不落盘 steady_clock 时间点——该时钟的 epoch
+ * 在进程间 / 重启后没有可比性。
+ */
+struct ImageSnapshotEntry {
+    uint64_t volume_id{0};
+    ImageCategory category{ImageCategory::READ};
+};
+
+/**
+ * @brief 重建管理表的一致性报告：快照与目录文件的两侧差集
+ *
+ * 供上层记录 sidecar 与做幂等补齐（例如把快照里已消失的 WRITE 镜像对应的
+ * 任务补判为失败、把目录独有镜像纳入待打包光盘）。
+ */
+struct RebuildReport {
+    // 快照中有记录、但 image_dir_ 中没有对应文件（物理镜像已被换出 / 删除，不再登记）。
+    std::vector<uint64_t> snapshot_only;
+    // image_dir_ 中有文件、但快照未记录（崩溃未落快照，或快照后有新增）；
+    // 无 category 依据，按 READ 登记并置于 LRU 最新端（见 RebuildManagementTable 说明）。
+    std::vector<uint64_t> disk_only;
 };
 
 /**
@@ -100,17 +128,10 @@ public:
     volumemanager::ErrorCode SetCapacityInImages(uint64_t capacity_in_images);
 
     /**
-     * @brief 从磁盘重建管理表
+     * @brief 从磁盘重建管理表（无快照：等价于空快照，全部按 READ 登记）
      *
      * 系统启动时调用一次。扫描 image_dir_ 单层目录（2026-08-15 起改为扇平布局，
      * 不再有 read/ write/ 子目录），从文件名（volume_<id>.vimg）重建管理表。
-     *
-     * **已知遗留（用户接受）**：扇平后无法从目录布局反推 category，当前实现把
-     * 扫描到的所有镜像统一登记为 ImageCategory::READ（语义标签丢失）。区分读写
-     * 镜像的问题后续另外处理（可能是 sidecar 元数据库 / mtime 启发式 / 上层
-     * 注入分类表等）。WRITE 镜像若被错误标为 READ，下一次容量满时换出仍能正常
-     * 执行（LRU evict 不区分读写外的语义），刻录完成后被 RemoveWriteImage 拒绝
-     * (category mismatch → VOLUME_NOT_FOUND) 是已接受的临时缺陷。
      *
      * 调用前应保证 image_dir_ 已存在（构造函数已 EnsureImageDir）。
      * 若管理表已有数据，将被清空重建。
@@ -120,6 +141,41 @@ public:
      *         IO_ERROR        - image_dir_ 无法访问
      */
     volumemanager::ErrorCode RebuildManagementTable();
+
+    /**
+     * @brief 结合「磁盘文件 + 快照」重建管理表
+     *
+     * 扇平布局无法从目录反推 category，LRU 顺序也无法从文件名恢复，
+     * 因此重启恢复需要快照补足；两者按以下优先级合并：
+     *
+     *   1. **目录扫描是存在性基线**：只有 image_dir_ 中确实存在 volume_<id>.vimg
+     *      的镜像才会被登记。快照里有、磁盘上没有的镜像**不登记**（其物理数据
+     *      已丢失），收集到 report->snapshot_only。
+     *   2. **快照是元数据来源**：磁盘存在且快照有记录时，category 取快照值；
+     *      LRU 位置按快照的排列顺序（由旧到新）恢复。
+     *   3. **磁盘独有镜像（快照未记录）** 默认按 READ 登记，并置于 LRU 的
+     *      **最新端**（队首），收集到 report->disk_only：
+     *        - 默认 READ 是因为没有任何依据判定它是写镜像；
+     *        - 置于最新端是安全性的关键——未刻录的写镜像**只存在于 image_dir_**
+     *          （vdisc 要到刻录完成回调才物化，压缩中间产物已被 PackVolume 删除），
+     *          若把它放在 LRU 最旧端，下次 MoveFrom 容量满时会把它 unlink 造成
+     *          不可恢复的数据丢失。放在最新端可保证它不会成为第一个 victim，
+     *          留出上层（ReconcileAndReplay）补判 category 的窗口。
+     *
+     * 幂等性：同一份输入重复调用结果相同；快照为空时退化为 RebuildManagementTable()。
+     * 快照中重复的 volume_id 只取首次出现，避免破坏三件套不变量。
+     *
+     * 锁语义：内部加写锁。与 GetStats 等查询接口不重叠。
+     *
+     * @param snapshot   管理表快照，**按 LRU 由旧到新**排列；空表示无快照信息
+     * @param out_report 可空；非空时回填两侧差集（见 RebuildReport）
+     * @return volumemanager::ErrorCode
+     *         SUCCESS  - 重建成功（image_dir_ 为空也算成功）
+     *         IO_ERROR - image_dir_ 无法访问
+     */
+    volumemanager::ErrorCode RebuildManagementTable(
+        const std::vector<ImageSnapshotEntry>& snapshot,
+        RebuildReport* out_report = nullptr);
 
     /**
      * @brief 把外部文件移动到 image_dir_ 下，并登记到管理表
@@ -196,6 +252,21 @@ public:
      *         SUCCESS - 始终成功
      */
     volumemanager::ErrorCode GetStats(ImageDirStats& out_stats) const;
+
+    /**
+     * @brief 导出管理表快照（关机落盘专用）
+     *
+     * 与 RebuildManagementTable(snapshot, ...) 配对：关机时把整张管理表落盘，
+     * 重启时结合 image_dir_ 的实际文件合并重建，从而恢复 category 与 LRU 顺序
+     * （两者都无法从扇平布局的文件名反推）。
+     *
+     * **返回顺序按 LRU 由旧到新**（即 lru_list_ 从 back 到 front），可直接作为
+     * RebuildManagementTable 的 snapshot 入参：被插入方按同样顺序 push_front，
+     * 恰好还原原顺序。
+     *
+     * 锁语义：内部加读锁，可与其它读操作并发。
+     */
+    std::vector<ImageSnapshotEntry> SnapshotImageEntries() const;
 
     /**
      * @brief 获取当前写镜像数（image_dir 中 category == WRITE 的镜像条数）

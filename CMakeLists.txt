@@ -1056,24 +1056,29 @@ if(BUILD_TESTING)
         target_link_libraries(optical_node_archive_integration_test PRIVATE ${BRPC_DYNAMIC_LIB})
     endif()
 
+    # 运行期状态快照编解码单测：只依赖头文件 optical_node_manager_classes.h
+    # （快照格式 / WRTask / 归档批次编解码全为 inline），无需链接 optical_node_manager 库。
+    add_executable(optical_node_runtime_state_codec_test
+        tests/optical_node/optical_node_runtime_state_codec_test.cpp
+    )
+    target_include_directories(optical_node_runtime_state_codec_test
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/data_node/optical_node/optical_node_manager
+    )
+    add_test(NAME optical_node_runtime_state_codec
+        COMMAND optical_node_runtime_state_codec_test)
+    set_tests_properties(optical_node_runtime_state_codec
+        PROPERTIES TIMEOUT 60 LABELS "optical_node;unit")
+
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
-        # smoke：14 卷（约 1 张完整光盘 + 尾盘），覆盖封盘/刻录/释放/光盘读回，分钟级；
-        # full：56 卷（5 张光盘共存 + 四种 MDS 批次形态 + 背压触发与恢复；容量 100 / 写镜像 30），
-        #       十几分钟级；
-        # evict：26 卷（小容量档位 14 / 12，覆盖 image_dir 满载后的 LRU 淘汰与 CD_READ 重载），
-        #        十分钟级。
-        add_test(NAME optical_node_archive_smoke
+        # 单一综合场景（56 卷：5 张完整光盘 + 尾盘，小容量档位触发背压与 LRU 淘汰）：
+        # 一次运行覆盖 批次形态 → 归档下载 → 压缩封装 → 打包汇报 → 封盘 → 刻录释放 →
+        # 光盘读回 → 满载淘汰与重载 → 正常关机落盘与重启恢复（在途任务继续推进）。
+        # 光盘仿真时长不可压缩，56 卷同档位实测 20~35 分钟，故超时留足余量。
+        add_test(NAME optical_node
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/optical_node/run_optical_node_archive_test.py
-                --driver $<TARGET_FILE:optical_node_archive_integration_test> --scenario smoke)
-        set_tests_properties(optical_node_archive_smoke PROPERTIES TIMEOUT 300 LABELS "optical_node;slow")
-        add_test(NAME optical_node_archive_full
-            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/optical_node/run_optical_node_archive_test.py
-                --driver $<TARGET_FILE:optical_node_archive_integration_test> --scenario full)
-        set_tests_properties(optical_node_archive_full PROPERTIES TIMEOUT 1800 LABELS "optical_node;slow" SKIP_RETURN_CODE 77)
-        add_test(NAME optical_node_archive_evict
-            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/optical_node/run_optical_node_archive_test.py
-                --driver $<TARGET_FILE:optical_node_archive_integration_test> --scenario evict)
-        set_tests_properties(optical_node_archive_evict PROPERTIES TIMEOUT 1500 LABELS "optical_node;slow" SKIP_RETURN_CODE 77)
+                --driver $<TARGET_FILE:optical_node_archive_integration_test>)
+        set_tests_properties(optical_node PROPERTIES TIMEOUT 3600 LABELS "optical_node;slow" SKIP_RETURN_CODE 77)
     endif()
 endif()

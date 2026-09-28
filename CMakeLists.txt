@@ -147,7 +147,8 @@ endif()
 add_library(optical_node_manager STATIC
     src/data_node/optical_node/optical_node_manager/optical_node_manager.cpp
     src/data_node/optical_node/optical_node_manager/cd_manager_sim/cd_manager.cpp
-    src/data_node/optical_node/optical_node_manager/space_manager/image_dir_manager.cpp
+    src/data_node/optical_node/optical_node_manager/space_manager/space_manager.cpp
+    src/data_node/optical_node/optical_node_manager/space_manager/sha256.cpp
     src/data_node/optical_node/optical_node_manager/volume_manager/volume_manager.cpp
     src/data_node/optical_node/optical_node_manager/volume_manager/serializer.cpp
     src/data_node/optical_node/optical_node_manager/volume_manager/compression_utils.cpp
@@ -1020,5 +1021,64 @@ if(UNIX)
                     --client $<TARGET_FILE:zb_fuse_client> --fixture $<TARGET_FILE:client_io_latency_integration_test>)
             set_tests_properties(client_io_latency_mount_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
         endif()
+    endif()
+endif()
+
+# 光存储节点归档集成测试：进程内起 fake real_node / scheduler 与真光节点服务，
+# 走完 归档下载 → 压缩 → 卷镜像封装 → 打包汇报 → CD_BURN → 数据面读 / CD_READ 重载 全链路。
+if(BUILD_TESTING)
+    add_executable(optical_node_archive_integration_test
+        tests/optical_node/optical_node_archive_integration_test.cpp
+        tests/optical_node/fake_services.cpp
+        tests/optical_node/fake_client.cpp
+        tests/optical_node/fake_real_node_data.cpp
+        src/data_node/optical_node/config/OpticalNodeConfig.cpp
+        src/data_node/optical_node/service/OpticalStorageServiceImpl.cpp
+        src/data_node/optical_node/service/BrpcOpticalNodeService.cpp
+    )
+    target_include_directories(optical_node_archive_integration_test
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/data_node/optical_node/service
+            ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
+            ${GFLAGS_INCLUDE_PATH}
+            ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    target_link_libraries(optical_node_archive_integration_test
+        PRIVATE
+            optical_node_manager
+            zb_proto
+            brpc-static
+            ${GFLAGS_LIBRARY}
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    if(BRPC_DYNAMIC_LIB)
+        target_link_libraries(optical_node_archive_integration_test PRIVATE ${BRPC_DYNAMIC_LIB})
+    endif()
+
+    # 运行期状态快照编解码单测：只依赖头文件 optical_node_manager_classes.h
+    # （快照格式 / WRTask / 归档批次编解码全为 inline），无需链接 optical_node_manager 库。
+    add_executable(optical_node_runtime_state_codec_test
+        tests/optical_node/optical_node_runtime_state_codec_test.cpp
+    )
+    target_include_directories(optical_node_runtime_state_codec_test
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/data_node/optical_node/optical_node_manager
+    )
+    add_test(NAME optical_node_runtime_state_codec
+        COMMAND optical_node_runtime_state_codec_test)
+    set_tests_properties(optical_node_runtime_state_codec
+        PROPERTIES TIMEOUT 60 LABELS "optical_node;unit")
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        # 单一综合场景（56 卷：5 张完整光盘 + 尾盘，小容量档位触发背压与 LRU 淘汰）：
+        # 一次运行覆盖 批次形态 → 归档下载 → 压缩封装 → 打包汇报 → 封盘 → 刻录释放 →
+        # 光盘读回 → 满载淘汰与重载 → 正常关机落盘与重启恢复（在途任务继续推进）。
+        # 光盘仿真时长不可压缩，56 卷同档位实测 20~35 分钟，故超时留足余量。
+        add_test(NAME optical_node
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/optical_node/run_optical_node_archive_test.py
+                --driver $<TARGET_FILE:optical_node_archive_integration_test>)
+        set_tests_properties(optical_node PROPERTIES TIMEOUT 3600 LABELS "optical_node;slow" SKIP_RETURN_CODE 77)
     endif()
 endif()

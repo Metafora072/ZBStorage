@@ -7,11 +7,12 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <volume_manager/error_codes.h>
 
 /**
- * @file image_dir_manager.h
+ * @file space_manager.h
  * @brief image_dir 空间管理器
  *
  * 该模块负责管理 image_dir_ 目录下卷镜像的元信息与容量约束。
@@ -38,13 +39,40 @@ enum class ImageCategory {
  * 与 VolumeManager::PackVolume 的 output_path basename 约定保持一致。
  * 镜像在物理上全部平铺在 image_dir_/<basename>（2026-08-15 起改为扇平布局）：
  *   - 不再区分 read/ write/ 子目录；
- *   - category 仅作为语义标签（READ/WRITE），重建区分的问题后续再说。
+ *   - category 仅作为语义标签（READ/WRITE），扇平后无法从目录布局反推，
+ *     因此重启恢复时必须由快照回填（见 RebuildManagementTable 的 snapshot 参数）。
  */
 struct ImageEntry {
     uint64_t volume_id;                 // 卷镜像 ID（与文件名 volume_<id>.vimg 一致）
     ImageCategory category;             // 镜像类别（语义标签，物理上不再区分）
     std::string filename;               // 在 image_dir_ 下的文件名（basename，不带路径）
-    std::chrono::steady_clock::time_point last_access;  // 最近一次访问时间（LRU 依据）
+    std::chrono::steady_clock::time_point last_access;  // 最近一次访问时间（仅参考，LRU 以 lru_list_ 顺序为准）
+};
+
+/**
+ * @brief 管理表快照的一条记录（跨重启持久化用）
+ *
+ * 只需 volume_id + category：LRU 顺序由「记录在快照中的先后」承载
+ * （快照按 LRU 由旧到新排列），不落盘 steady_clock 时间点——该时钟的 epoch
+ * 在进程间 / 重启后没有可比性。
+ */
+struct ImageSnapshotEntry {
+    uint64_t volume_id{0};
+    ImageCategory category{ImageCategory::READ};
+};
+
+/**
+ * @brief 重建管理表的一致性报告：快照与目录文件的两侧差集
+ *
+ * 供上层记录 sidecar 与做幂等补齐（例如把快照里已消失的 WRITE 镜像对应的
+ * 任务补判为失败、把目录独有镜像纳入待打包光盘）。
+ */
+struct RebuildReport {
+    // 快照中有记录、但 image_dir_ 中没有对应文件（物理镜像已被换出 / 删除，不再登记）。
+    std::vector<uint64_t> snapshot_only;
+    // image_dir_ 中有文件、但快照未记录（崩溃未落快照，或快照后有新增）；
+    // 无 category 依据，按 READ 登记并置于 LRU 最新端（见 RebuildManagementTable 说明）。
+    std::vector<uint64_t> disk_only;
 };
 
 /**
@@ -68,51 +96,21 @@ struct ImageDirStats {
  * 与 VolumeManager::PackVolume 的 output_path 格式保持一致：
  *     output_path = temp_dir_ + "volume_" + std::to_string(volume_id) + ".vimg"
  */
-class ImageDirManager {
+class SpaceManager {
 public:
     /**
      * @brief 构造函数
      * @param image_dir_path image_dir 目录绝对路径
-     *
-     * 注意：disc_sim_dir_（模拟光盘库目录）**不会**在构造函数注入。
-     * 调用方必须显式调 SetDiscSimDir() 才能使用 LRU 换出 / 写镜像释放路径，
-     * 否则 DeleteFileAndEntry 在拼"移出目标路径"时使用空字符串，
-     * rename 必然 IO_ERROR。OpticalNodeManager::InitializeDir 流程
-     * 会确保 SetDiscSimDir() 在 RebuildManagementTable 之后、首次
-     * MoveFrom / RemoveSingleReadImage / RemoveWriteImage 之前调用。
      */
-    explicit ImageDirManager(std::string image_dir_path);
+    explicit SpaceManager(std::string image_dir_path);
 
     /**
      * @brief 析构函数
      */
-    ~ImageDirManager();
+    ~SpaceManager();
 
-    ImageDirManager(const ImageDirManager&) = delete;
-    ImageDirManager& operator=(const ImageDirManager&) = delete;
-
-    /**
-     * @brief 设置模拟光盘库目录（disc_sim_dir）
-     *
-     * disc_sim_dir 是当前系统为适配"模拟光盘库（cd_manager_sim）"而引入的特殊目录：
-     * 模拟光盘库不会真正销毁/弹出光盘——为了与"真实光盘库把光盘放回库位"的物理行为
-     * 保持一致，ImageDirManager 的释放路径（RemoveSingleReadImage / RemoveWriteImage
-     * / MoveFrom 容量满时换出 victim）不再是简单的 unlink，而是把镜像文件 rename(2)
-     * 到 disc_sim_dir/ 下，让后续的 OnCDReadComplete 重新"从光盘库加载"时能够找到。
-     *
-     * **注入时机**：必须在 RebuildManagementTable() 之后、首次
-     * RemoveSingleReadImage() / RemoveWriteImage() / MoveFrom() 之前调用。
-     * OpticalNodeManager::InitializeDir() 会保证这个顺序。
-     *
-     * **重复调用**：允许重复调用（每次 Run() 路径都重新设置新路径），
-     * 但**不**做"已注入"守门——上层调用方负责保证语义正确。
-     *
-     * @param disc_sim_dir_path disc_sim 目录绝对路径（带或不带尾斜杠均可）
-     * @return volumemanager::ErrorCode
-     *         SUCCESS                - 设置成功（含空字符串清空语义）
-     *         INVALID_PATH           - 路径非法（当前实现兜底为空字符串）
-     */
-    volumemanager::ErrorCode SetDiscSimDir(std::string disc_sim_dir_path);
+    SpaceManager(const SpaceManager&) = delete;
+    SpaceManager& operator=(const SpaceManager&) = delete;
 
     /**
      * @brief 设置容量上限（镜像数）
@@ -130,17 +128,10 @@ public:
     volumemanager::ErrorCode SetCapacityInImages(uint64_t capacity_in_images);
 
     /**
-     * @brief 从磁盘重建管理表
+     * @brief 从磁盘重建管理表（无快照：等价于空快照，全部按 READ 登记）
      *
      * 系统启动时调用一次。扫描 image_dir_ 单层目录（2026-08-15 起改为扇平布局，
      * 不再有 read/ write/ 子目录），从文件名（volume_<id>.vimg）重建管理表。
-     *
-     * **已知遗留（用户接受）**：扇平后无法从目录布局反推 category，当前实现把
-     * 扫描到的所有镜像统一登记为 ImageCategory::READ（语义标签丢失）。区分读写
-     * 镜像的问题后续另外处理（可能是 sidecar 元数据库 / mtime 启发式 / 上层
-     * 注入分类表等）。WRITE 镜像若被错误标为 READ，下一次容量满时换出仍能正常
-     * 执行（LRU evict 不区分读写外的语义），刻录完成后被 RemoveWriteImage 拒绝
-     * (category mismatch → VOLUME_NOT_FOUND) 是已接受的临时缺陷。
      *
      * 调用前应保证 image_dir_ 已存在（构造函数已 EnsureImageDir）。
      * 若管理表已有数据，将被清空重建。
@@ -150,6 +141,41 @@ public:
      *         IO_ERROR        - image_dir_ 无法访问
      */
     volumemanager::ErrorCode RebuildManagementTable();
+
+    /**
+     * @brief 结合「磁盘文件 + 快照」重建管理表
+     *
+     * 扇平布局无法从目录反推 category，LRU 顺序也无法从文件名恢复，
+     * 因此重启恢复需要快照补足；两者按以下优先级合并：
+     *
+     *   1. **目录扫描是存在性基线**：只有 image_dir_ 中确实存在 volume_<id>.vimg
+     *      的镜像才会被登记。快照里有、磁盘上没有的镜像**不登记**（其物理数据
+     *      已丢失），收集到 report->snapshot_only。
+     *   2. **快照是元数据来源**：磁盘存在且快照有记录时，category 取快照值；
+     *      LRU 位置按快照的排列顺序（由旧到新）恢复。
+     *   3. **磁盘独有镜像（快照未记录）** 默认按 READ 登记，并置于 LRU 的
+     *      **最新端**（队首），收集到 report->disk_only：
+     *        - 默认 READ 是因为没有任何依据判定它是写镜像；
+     *        - 置于最新端是安全性的关键——未刻录的写镜像**只存在于 image_dir_**
+     *          （vdisc 要到刻录完成回调才物化，压缩中间产物已被 PackVolume 删除），
+     *          若把它放在 LRU 最旧端，下次 MoveFrom 容量满时会把它 unlink 造成
+     *          不可恢复的数据丢失。放在最新端可保证它不会成为第一个 victim，
+     *          留出上层（ReconcileAndReplay）补判 category 的窗口。
+     *
+     * 幂等性：同一份输入重复调用结果相同；快照为空时退化为 RebuildManagementTable()。
+     * 快照中重复的 volume_id 只取首次出现，避免破坏三件套不变量。
+     *
+     * 锁语义：内部加写锁。与 GetStats 等查询接口不重叠。
+     *
+     * @param snapshot   管理表快照，**按 LRU 由旧到新**排列；空表示无快照信息
+     * @param out_report 可空；非空时回填两侧差集（见 RebuildReport）
+     * @return volumemanager::ErrorCode
+     *         SUCCESS  - 重建成功（image_dir_ 为空也算成功）
+     *         IO_ERROR - image_dir_ 无法访问
+     */
+    volumemanager::ErrorCode RebuildManagementTable(
+        const std::vector<ImageSnapshotEntry>& snapshot,
+        RebuildReport* out_report = nullptr);
 
     /**
      * @brief 把外部文件移动到 image_dir_ 下，并登记到管理表
@@ -189,43 +215,32 @@ public:
      *
      * 写镜像不会被换出。若当前没有任何读镜像，返回 VOLUME_NOT_FOUND。
      *
-     * **适配模拟光盘库（2026-08-15 用户决策）**：本方法不再简单地 unlink 镜像，
-     * 而是把镜像文件 rename(2) 到 disc_sim_dir_/volume_<id>.vimg，
-     * 等价于"把光盘放回光盘库"。这样：
-     *   - 模拟 cd_manager 在后续 OnCDReadComplete 回调里（默认的源路径就是
-     *     disc_sim_dir_/volume_<id>.vimg）能够再次找到该镜像；
-     *   - 与"真实光盘库把光盘放回库位"的物理行为保持一致；
-     *   - 模拟器下"重新读"语义得以闭环（不会因为 unlink 而丢失数据）。
-     *
-     * **前置条件**：调用 SetDiscSimDir() 注入 disc_sim_dir_，否则 rename 必然失败。
+     * **光盘打包改造（2026-09-26）**：镜像数据已随刻录持久化到 disc_sim_dir_
+     * 下的 vdisc 光盘文件中，image_dir_ 内的 vimg 只是缓存副本，换出即直接
+     * 删除（unlink），不再搬移到 disc_sim_dir_——需要再次读取时，上层按
+     * node_discs_meta 记录的偏移从 vdisc 中复制回 image_dir_。
      *
      * @return volumemanager::ErrorCode
      *         SUCCESS             - 成功换出一个读镜像
      *         VOLUME_NOT_FOUND    - 当前没有读镜像可换出
-     *         IO_ERROR            - rename 到 disc_sim_dir 失败
+     *         IO_ERROR            - unlink 镜像文件失败
      */
     volumemanager::ErrorCode RemoveSingleReadImage();
 
     /**
      * @brief 刻录完成后释放指定写镜像
      *
-     * 仅当对应 volume_id 存在且类别为 WRITE 时才会移动。
+     * 仅当对应 volume_id 存在且类别为 WRITE 时才会释放。
      *
-     * **适配模拟光盘库（2026-08-15 用户决策）**：本方法不再简单地 unlink 镜像，
-     * 而是把镜像文件 rename(2) 到 disc_sim_dir_/volume_<id>.vimg，
-     * 等价于"刻完的光盘弹出到库位"。这样：
-     *   - 模拟 cd_manager 的 BurnRequest.image_path 若再次指向 disc_sim_dir_，
-     *     流程可被复用（虽然刻录通常是一次性的，但保留对称）；
-     *   - 上层 OpticalNodeManager::OnCDBurnComplete 调本方法后,
-     *     image_dir_/ 不再保留临时卷,disc_sim_dir_ 接管"已刻光盘库位"。
-     *
-     * **前置条件**：调用 SetDiscSimDir() 注入 disc_sim_dir_，否则 rename 必然失败。
+     * **光盘打包改造（2026-09-26）**：刻录完成后镜像数据已写入 disc_sim_dir_
+     * 下的 vdisc 光盘文件，本方法直接删除 image_dir_ 内的 vimg，
+     * 不再搬移到 disc_sim_dir_。
      *
      * @param volume_id 待释放的卷镜像 ID
      * @return volumemanager::ErrorCode
-     *         SUCCESS             - 移动成功
+     *         SUCCESS             - 释放成功
      *         VOLUME_NOT_FOUND    - 管理表中无该 volume_id 或类别不是 WRITE
-     *         IO_ERROR            - rename 到 disc_sim_dir 失败
+     *         IO_ERROR            - unlink 镜像文件失败
      */
     volumemanager::ErrorCode RemoveWriteImage(uint64_t volume_id);
 
@@ -239,18 +254,38 @@ public:
     volumemanager::ErrorCode GetStats(ImageDirStats& out_stats) const;
 
     /**
+     * @brief 导出管理表快照（关机落盘专用）
+     *
+     * 与 RebuildManagementTable(snapshot, ...) 配对：关机时把整张管理表落盘，
+     * 重启时结合 image_dir_ 的实际文件合并重建，从而恢复 category 与 LRU 顺序
+     * （两者都无法从扇平布局的文件名反推）。
+     *
+     * **返回顺序按 LRU 由旧到新**（即 lru_list_ 从 back 到 front），可直接作为
+     * RebuildManagementTable 的 snapshot 入参：被插入方按同样顺序 push_front，
+     * 恰好还原原顺序。
+     *
+     * 锁语义：内部加读锁，可与其它读操作并发。
+     */
+    std::vector<ImageSnapshotEntry> SnapshotImageEntries() const;
+
+    /**
+     * @brief 获取当前写镜像数（image_dir 中 category == WRITE 的镜像条数）
+     *
+     * 供归档下载链路做背压判断：一旦写镜像数达到配置上限就暂停下载原始文件，
+     * 等 Zip 压缩（把 WRITE 变成待打包）与刻录释放（RemoveWriteImage）把占用降下来。
+     *
+     * **口径**：包含「已封印、等刻录释放」的镜像——它们在被显式释放前
+     * category 始终是 WRITE，因此自然计入；这正是背压需要的语义（封印并不立即
+     * 腾出 image_dir 空间，物理文件要等刻录完成才删除）。
+     *
+     * 锁语义：内部加读锁，可与其它读操作并发。
+     */
+    uint64_t GetWriteImageCount() const;
+
+    /**
      * @brief 获取 image_dir_ 路径
      */
     const std::string& image_dir_path() const { return image_dir_path_; }
-
-    /**
-     * @brief 获取 disc_sim_dir_ 路径（模拟光盘库目录，2026-08-15 引入）
-     *
-     * 注意：构造后必须显式调 SetDiscSimDir() 才会被设置，否则返回空字符串。
-     * OpticalNodeManager::InitializeDir() 会保证 SetDiscSimDir() 在首次
-     * RemoveSingleReadImage / RemoveWriteImage / MoveFrom 之前被调用。
-     */
-    const std::string& disc_sim_dir_path() const { return disc_sim_dir_path_; }
 
     /**
      * @brief 获取容量（镜像数）
@@ -368,26 +403,22 @@ private:
      *
      * 调用方需持有 unique_lock。被公开接口 RemoveSingleReadImage() 在已持锁路径下复用，
      * MoveFrom 不走这里（MoveFrom 走 DeleteFileAndEntry 直接释放指定 volume_id）。
-     *
-     * **适配模拟光盘库**：换出通过 DeleteFileAndEntry 落到 disc_sim_dir_，详见该函数说明。
      */
     volumemanager::ErrorCode RemoveSingleReadImageLocked();
 
     /**
-     * @brief 把文件从 image_dir_ 移动到 disc_sim_dir_ 并清理管理表项
+     * @brief 直接删除 image_dir_ 内的镜像文件并清理管理表项
      *
      * **适配扇平布局（2026-08-15）**：`entry.filename` 就是 image_dir_/ 下的
      * basename（不再有 read/ write/ 子目录），所以 src_path = image_dir_/<basename>。
      *
-     * **适配模拟光盘库（2026-08-15 用户决策）**：本方法不再简单地 unlink 文件，
-     * 而是把 image_dir_/<basename> rename(2) 到 disc_sim_dir_/<basename>，
-     * 等价于"把光盘放回光盘库位"。Rename 失败时优先 unlink 兜底（防止镜像残留在
-     * image_dir_ 内膨胀），且即使 rename 失败，管理表项也已经移走——这是为了与
-     * MoveFrom 容量满换出语义保持一致（MoveFrom 必须腾出 entries_ 槽位才能继续）。
+     * **光盘打包改造（2026-09-26）**：不再把镜像搬移到 disc_sim_dir_，而是直接
+     * unlink——镜像数据在刻录时已写入 disc_sim_dir_ 下的 vdisc，image_dir_ 内的
+     * vimg 只是缓存副本。管理表项始终先于 unlink 移除，以保证 MoveFrom 容量满
+     * 换出时能立刻腾出 entries_ 槽位；因此 unlink 失败时文件可能残留，调用方
+     * 可重试。
      *
      * 调用方需持有 unique_lock。调用方需保证要释放的 volume_id 在 entries_ 中。
-     *
-     * **前置条件**：必须先调 SetDiscSimDir() 注入 disc_sim_dir_，否则 rename 必然失败。
      */
     volumemanager::ErrorCode DeleteFileAndEntry(uint64_t volume_id);
 
@@ -406,19 +437,18 @@ private:
      */
     void InsertEntryLocked(const ImageEntry& entry);
 
+    /**
+     * @brief 统计某一类别的镜像条数
+     *
+     * 调用方需持锁（读锁即可）。抽出来供 GetStats 与 GetWriteImageCount 共用，
+     * 保证「按 category 计数」只有一处实现。
+     */
+    uint64_t CountEntriesByCategory(ImageCategory category) const;
+
     // Private methods below
 
 private:
     std::string image_dir_path_;                             // image_dir 绝对路径
-    // disc_sim_dir_path_ 是模拟光盘库目录（适配 cd_manager_sim 引入，2026-08-15）：
-    // RemoveSingleReadImage / RemoveWriteImage / MoveFrom 容量满时换出 victim 释放
-    // 镜像时，会把 image_dir_/<basename> rename(2) 到本目录下，等价于
-    // "把光盘放回库位"。允许为空（未注入时 DeleteFileAndEntry 的 rename 会失败
-    // 并兜底 unlink，避免 image_dir_ 内残留——见 DeleteFileAndEntry 实现）。
-    //
-    // 注意：2026-08-15 起 image_dir_/ 内部不再划分子目录，因此 dst 也只有
-    // disc_sim_dir_/volume_<id>.vimg 唯一一个位置。
-    std::string disc_sim_dir_path_;
     uint64_t capacity_in_images_;                            // 容量（镜像数），0 表示尚未设置
     bool capacity_set_;                                      // 是否已设置过容量
 

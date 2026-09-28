@@ -32,7 +32,7 @@ enum class ErrorCode {
     VOLUME_FULL_NO_READABLE, // image_dir_ 已满且没有 READ 镜像可换出（MoveFrom 专用）
     // ----- 任务阶段失败错误码（TODO-04）-----
     // 这些错误码用于把"任务在某一阶段失败"显式暴露给上层，避免 ZipTaskProcessor /
-    // BurnTaskProcessor / OnCDReadComplete / OnCDBurnComplete 静默 continue。
+    // CDBurnTaskProcessor / OnCDReadComplete / OnCDBurnComplete 静默 continue。
     // 上层可通过 WRTask::last_error_code 直接匹配这些枚举做精确告警。
     READ_FAILED,            // 读阶段失败：MountVolume 异常 / cd_manager 读提交失败 / inode 无法解析
     WRITE_FAILED,           // 写任务前置失败：inode 解析失败 / 任务状态异常

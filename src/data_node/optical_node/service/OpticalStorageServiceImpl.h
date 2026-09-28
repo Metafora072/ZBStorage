@@ -75,6 +75,10 @@ public:
     // 归档引擎是否已成功启动（状态为 RUNNING）。
     bool IsArchiveEngineReady() const;
 
+    // 正常关机：停止归档引擎并把运行期状态落盘（转发给 OpticalNodeManager::Shutdown）。
+    // 幂等；须在 brpc server 停止接收请求之后调用。
+    bool Shutdown();
+
     // 归档引擎当前状态 + 最近一次失败原因，仅用于排障 / 日志。
     std::string GetArchiveStatusDetail() const;
 

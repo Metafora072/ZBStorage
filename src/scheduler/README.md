@@ -1,5 +1,7 @@
 # Scheduler 模块说明
 
+跨模块调用方式、时序和完成条件见 [对外接口与联调契约](api/README.md)；C++ 调用方可链接 zb_scheduler_api_client。
+
 `Scheduler` 是集群控制平面，职责包括：
 
 - 接收 real node 和 virtual node 心跳

@@ -871,6 +871,21 @@ set_target_properties(scheduler_node_model PROPERTIES
 )
 target_link_libraries(scheduler_node_model PUBLIC zb_storage_model)
 
+add_library(zb_scheduler_api_client STATIC
+    src/scheduler/api/SchedulerClient.cpp
+)
+target_compile_features(zb_scheduler_api_client PUBLIC cxx_std_17)
+target_include_directories(zb_scheduler_api_client PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_BINARY_DIR}
+)
+target_link_libraries(zb_scheduler_api_client PUBLIC
+    zb_proto brpc-static ${GFLAGS_LIBRARY} ${CMAKE_THREAD_LIBS_INIT})
+if(BRPC_DYNAMIC_LIB)
+    target_link_libraries(zb_scheduler_api_client PUBLIC ${BRPC_DYNAMIC_LIB})
+endif()
+
 add_library(zb_node_metrics STATIC
     src/common/metrics/NodeMetricsCollector.cpp
 )
@@ -981,6 +996,24 @@ if(BUILD_TESTING)
         target_link_libraries(scheduler_managed_service_test PRIVATE ${BRPC_DYNAMIC_LIB})
     endif()
     add_test(NAME scheduler_managed_service_test COMMAND scheduler_managed_service_test)
+    add_executable(scheduler_public_api_test
+        tests/scheduler/scheduler_public_api_test.cpp
+        src/scheduler/health/FailureDetector.cpp
+        src/scheduler/model/ClusterState.cpp
+        src/scheduler/lifecycle/LifecycleManager.cpp
+        src/scheduler/migration/DrainMigrationCoordinator.cpp
+        src/scheduler/service/ManagedNodeProtoAdapter.cpp
+        src/scheduler/service/SchedulerServiceImpl.cpp)
+    target_include_directories(scheduler_public_api_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(scheduler_public_api_test PRIVATE
+        zb_scheduler_api_client scheduler_node_model zb_proto brpc-static
+        ${GFLAGS_LIBRARY} ${CMAKE_THREAD_LIBS_INIT})
+    if(BRPC_DYNAMIC_LIB)
+        target_link_libraries(scheduler_public_api_test PRIVATE ${BRPC_DYNAMIC_LIB})
+    endif()
+    add_test(NAME scheduler_public_api_test COMMAND scheduler_public_api_test)
     add_executable(scheduler_node_model_test
         tests/scheduler/cpp/scheduler_node_model_test.cpp)
     target_link_libraries(scheduler_node_model_test PRIVATE scheduler_node_model)
@@ -1032,6 +1065,7 @@ if(BUILD_TESTING)
         scheduler_node_model_test
         scheduler_snapshot_test
         scheduler_managed_service_test
+        scheduler_public_api_test
         scheduler_inprocess_disk_test
         scheduler_inprocess_optical_test
         PROPERTIES LABELS "scheduler_owner_smoke")

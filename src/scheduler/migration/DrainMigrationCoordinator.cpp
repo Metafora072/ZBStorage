@@ -31,30 +31,81 @@ DrainMigrationCoordinator::DrainMigrationCoordinator(ClusterState* cluster,
       retry_base_ms_(std::max<uint64_t>(1, retry_base_ms)),
       max_retries_(std::max<uint32_t>(1, max_retries)) {}
 
-bool DrainMigrationCoordinator::Start(const std::string& node_id,
-                                      uint64_t now_ms,
-                                      std::string* error) {
+void DrainMigrationCoordinator::SetLogicalSourceEmptyVerifier(
+    std::function<bool(const std::string&, std::string*)> verifier) {
+    logical_source_empty_ = std::move(verifier);
+}
+
+void DrainMigrationCoordinator::SetLogicalEmptyDrainBegin(
+    std::function<bool(const std::string&, uint64_t, std::string*)> begin) {
+    logical_empty_drain_begin_ = std::move(begin);
+}
+
+bool DrainMigrationCoordinator::BeginManagedDrain(const std::string& node_id,
+                                                   uint64_t now_ms,
+                                                   std::string* error) {
+    if (!CanStart(node_id, error)) return false;
+    ManagedNodeRuntime runtime;
+    if (!nodes_->GetNode(node_id, &runtime)) {
+        if (error) *error = "managed source node disappeared: " + node_id;
+        return false;
+    }
+    if (runtime.profile.kind == ManagedNodeKind::kStorage &&
+        runtime.profile.execution_mode == ExecutionMode::kVirtual) {
+        if (!logical_empty_drain_begin_) {
+            if (error) *error = "logical disk drain gate is unavailable";
+            return false;
+        }
+        return logical_empty_drain_begin_(node_id, now_ms, error);
+    }
+    return nodes_->BeginRemoveNode(node_id, now_ms, error);
+}
+
+bool DrainMigrationCoordinator::CanStart(const std::string& node_id,
+                                         std::string* error) const {
     if (!cluster_ || !nodes_ || !backend_ || node_id.empty()) {
         if (error) *error = "migration coordinator is not initialized";
         return false;
     }
     ManagedNodeRuntime runtime;
-    NodeState source;
     if (!nodes_->GetNode(node_id, &runtime)) {
         if (error) *error = "managed source node not found: " + node_id;
         return false;
     }
-    const bool requires_data_plane = runtime.profile.kind == ManagedNodeKind::kStorage &&
-                                     runtime.profile.execution_mode != ExecutionMode::kSimulated;
+    if (runtime.profile.kind == ManagedNodeKind::kStorage &&
+        runtime.profile.execution_mode == ExecutionMode::kVirtual) {
+        if (!logical_source_empty_ || !logical_empty_drain_begin_) {
+            if (error) *error = "logical storage drain needs a model-to-model migration backend";
+            return false;
+        }
+    }
+    NodeState source;
     if (runtime.profile.execution_mode != ExecutionMode::kSimulated &&
         !cluster_->GetNode(node_id, &source)) {
         if (error) *error = "source heartbeat address not found: " + node_id;
         return false;
     }
-    if (requires_data_plane && source.address.empty()) {
+    if (runtime.profile.kind == ManagedNodeKind::kStorage &&
+        runtime.profile.execution_mode == ExecutionMode::kPhysical &&
+        source.address.empty()) {
         if (error) *error = "source node has no service address";
         return false;
     }
+    return true;
+}
+
+bool DrainMigrationCoordinator::Start(const std::string& node_id,
+                                      uint64_t now_ms,
+                                      std::string* error) {
+    if (!CanStart(node_id, error)) return false;
+    ManagedNodeRuntime runtime;
+    NodeState source;
+    nodes_->GetNode(node_id, &runtime);
+    if (runtime.profile.execution_mode != ExecutionMode::kSimulated)
+        cluster_->GetNode(node_id, &source);
+    const bool requires_data_plane = runtime.profile.kind == ManagedNodeKind::kStorage &&
+                                     (runtime.profile.execution_mode == ExecutionMode::kPhysical ||
+                                      runtime.profile.execution_mode == ExecutionMode::kVirtual);
     std::lock_guard<std::mutex> lock(mu_);
     auto existing = tasks_.find(node_id);
     if (existing != tasks_.end() && existing->second.view.state != DrainMigrationState::kCompleted &&
@@ -64,7 +115,9 @@ bool DrainMigrationCoordinator::Start(const std::string& node_id,
     InternalTask task;
     task.view.migration_id = "drain-" + std::to_string(now_ms) + "-" + std::to_string(next_id_++);
     task.view.source_node_id = node_id;
-    task.view.source_address = source.address;
+    task.view.source_address = runtime.profile.execution_mode == ExecutionMode::kVirtual &&
+                                       runtime.profile.kind == ManagedNodeKind::kStorage
+                                   ? "model://" + node_id : source.address;
     task.view.created_at_ms = now_ms;
     task.view.updated_at_ms = now_ms;
     if (!requires_data_plane) {
@@ -211,10 +264,9 @@ bool DrainMigrationCoordinator::SelectTargetLocked(const InternalTask& task,
         }
         ManagedNodeRuntime runtime;
         if (!nodes_->GetNode(node.node_id, &runtime)) continue;
-        // VirtualNode currently models capacity and latency but does not retain
-        // source bytes. Verified physical-data drains therefore select only a
-        // byte-preserving physical storage node.
-        if (runtime.profile.execution_mode != ExecutionMode::kPhysical ||
+        const bool model_source = task.view.source_address.rfind("model://", 0) == 0;
+        if (runtime.profile.execution_mode !=
+                (model_source ? ExecutionMode::kVirtual : ExecutionMode::kPhysical) ||
             runtime.lifecycle != LifecycleState::kWorking ||
              runtime.health != ManagedHealthState::kHealthy ||
              !runtime.profile.participates_in_placement ||
@@ -247,8 +299,8 @@ bool DrainMigrationCoordinator::SelectTargetLocked(const InternalTask& task,
         }
     }
     if (!found && error) {
-        *error = wake_requested ? "physical migration target wake requested"
-                                : "no healthy enabled physical target has enough free capacity";
+        *error = wake_requested ? "migration target wake requested"
+                                : "no healthy enabled same-mode target has enough free capacity";
     }
     return found;
 }
@@ -332,9 +384,16 @@ void DrainMigrationCoordinator::CompleteLocked(InternalTask* task, uint64_t now_
         return;
     }
     if (runtime.profile.kind == ManagedNodeKind::kStorage &&
-        runtime.profile.execution_mode != ExecutionMode::kSimulated &&
+        runtime.profile.execution_mode == ExecutionMode::kPhysical &&
         !backend_->VerifySourceEmpty(task->view.source_address, &error)) {
         RetryLocked(task, now_ms, "final source verification failed: " + error);
+        return;
+    }
+    if (runtime.profile.kind == ManagedNodeKind::kStorage &&
+        runtime.profile.execution_mode == ExecutionMode::kVirtual &&
+        (!logical_source_empty_ ||
+         !logical_source_empty_(task->view.source_node_id, &error))) {
+        RetryLocked(task, now_ms, "final logical source verification failed: " + error);
         return;
     }
     uint64_t disk_references = 0;
@@ -353,14 +412,24 @@ void DrainMigrationCoordinator::CompleteLocked(InternalTask* task, uint64_t now_
         task->view.updated_at_ms = now_ms;
         return;
     }
+    const bool empty_virtual_optical =
+        runtime.profile.kind == ManagedNodeKind::kOpticalLibrary &&
+        runtime.profile.execution_mode != ExecutionMode::kPhysical &&
+        runtime.optical_library.observed &&
+        runtime.optical_library.blank_disc_count == runtime.optical_library.local_disc_count &&
+        runtime.optical_library.recording_disc_count == 0 &&
+        runtime.optical_library.pending_write_tasks == 0 &&
+        runtime.optical_library.pending_read_tasks == 0 &&
+        runtime.optical_library.busy_drives == 0;
     if (runtime.profile.kind == ManagedNodeKind::kOpticalLibrary &&
-        (!runtime.optical_library.observed || runtime.optical_library.local_disc_count != 0 ||
+        (!runtime.optical_library.observed ||
+         (runtime.optical_library.local_disc_count != 0 && !empty_virtual_optical) ||
          runtime.resident_data_bytes != 0)) {
         task->view.state = DrainMigrationState::kBlocked;
         task->view.last_error = !runtime.optical_library.observed
                                     ? "optical inventory has not been observed"
                                     : (runtime.optical_library.local_disc_count != 0
-                                           ? "optical library still has local discs"
+                                           ? "optical library still has occupied discs or active tasks"
                                            : "optical library still has referenced cache or metadata");
         task->view.updated_at_ms = now_ms;
         return;
@@ -370,7 +439,10 @@ void DrainMigrationCoordinator::CompleteLocked(InternalTask* task, uint64_t now_
         return;
     }
     NodeOperationState operation;
-    if (runtime.profile.execution_mode != ExecutionMode::kSimulated && lifecycle_ &&
+    const bool empty_virtual_storage = runtime.profile.kind == ManagedNodeKind::kStorage &&
+        runtime.profile.execution_mode == ExecutionMode::kVirtual;
+    if (runtime.profile.execution_mode != ExecutionMode::kSimulated &&
+        !empty_virtual_optical && !empty_virtual_storage && lifecycle_ &&
         !lifecycle_->StopNode(task->view.source_node_id, false,
                                             "automatic stop after verified drain",
                                             &operation, &error)) {

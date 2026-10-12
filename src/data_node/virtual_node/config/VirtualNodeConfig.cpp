@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -34,27 +36,19 @@ std::vector<std::string> Split(const std::string& input, char delimiter) {
 }
 
 bool ParseUint64(const std::string& text, uint64_t* out) {
-    if (!out || text.empty()) {
-        return false;
-    }
-    try {
-        *out = std::stoull(text);
-        return true;
-    } catch (const std::exception&) {
-        return false;
-    }
+    if (!out || text.empty()) return false;
+    uint64_t value = 0;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) return false;
+    *out = value;
+    return true;
 }
 
 bool ParseUint32(const std::string& text, uint32_t* out) {
-    if (!out || text.empty()) {
-        return false;
-    }
-    try {
-        *out = static_cast<uint32_t>(std::stoul(text));
-        return true;
-    } catch (const std::exception&) {
-        return false;
-    }
+    uint64_t value = 0;
+    if (!ParseUint64(text, &value) || value > std::numeric_limits<uint32_t>::max()) return false;
+    *out = static_cast<uint32_t>(value);
+    return true;
 }
 
 bool ParseBool(const std::string& value, bool* out) {
@@ -109,6 +103,11 @@ VirtualNodeConfig VirtualNodeConfig::LoadFromFile(const std::string& path, std::
         std::string value = Trim(trimmed.substr(eq + 1));
         if (key == "NODE_ID") {
             cfg.node_id = value;
+        } else if (key == "INSTANCE_GENERATION") {
+            if (!ParseUint64(value, &cfg.instance_generation) || cfg.instance_generation == 0) {
+                if (error) *error = "Invalid INSTANCE_GENERATION at line " + std::to_string(line_no);
+                return {};
+            }
         } else if (key == "NODE_ADDRESS") {
             cfg.node_address = value;
         } else if (key == "SCHEDULER_ADDR") {
@@ -210,7 +209,7 @@ VirtualNodeConfig VirtualNodeConfig::LoadFromFile(const std::string& path, std::
                 }
                 return {};
             }
-        } else if (key == "DISKS") {
+        } else if (key == "DISKS" || key == "DISK_IDS") {
             cfg.disk_ids = Split(value, ',');
         } else if (key == "READ_BYTES_PER_SEC") {
             if (!ParseUint64(value, &cfg.read_bytes_per_sec)) {
@@ -228,7 +227,8 @@ VirtualNodeConfig VirtualNodeConfig::LoadFromFile(const std::string& path, std::
             }
         } else if (key == "READ_MBPS") {
             uint64_t mbps = 0;
-            if (!ParseUint64(value, &mbps)) {
+            if (!ParseUint64(value, &mbps) ||
+                mbps > std::numeric_limits<uint64_t>::max() / (1024ULL * 1024ULL)) {
                 if (error) {
                     *error = "Invalid READ_MBPS at line " + std::to_string(line_no);
                 }
@@ -237,7 +237,8 @@ VirtualNodeConfig VirtualNodeConfig::LoadFromFile(const std::string& path, std::
             cfg.read_bytes_per_sec = mbps * 1024ULL * 1024ULL;
         } else if (key == "WRITE_MBPS") {
             uint64_t mbps = 0;
-            if (!ParseUint64(value, &mbps)) {
+            if (!ParseUint64(value, &mbps) ||
+                mbps > std::numeric_limits<uint64_t>::max() / (1024ULL * 1024ULL)) {
                 if (error) {
                     *error = "Invalid WRITE_MBPS at line " + std::to_string(line_no);
                 }
@@ -258,11 +259,34 @@ VirtualNodeConfig VirtualNodeConfig::LoadFromFile(const std::string& path, std::
                 }
                 return {};
             }
+        } else if (key == "WAKE_LATENCY_MS") {
+            if (!ParseUint32(value, &cfg.wake_latency_ms) ||
+                cfg.wake_latency_ms > 3600000) {
+                if (error) *error = "Invalid WAKE_LATENCY_MS at line " +
+                                    std::to_string(line_no);
+                return {};
+            }
         } else if (key == "JITTER_MS") {
             if (!ParseUint32(value, &cfg.jitter_ms)) {
                 if (error) {
                     *error = "Invalid JITTER_MS at line " + std::to_string(line_no);
                 }
+                return {};
+            }
+        } else if (key == "JITTER_SEED") {
+            if (!ParseUint32(value, &cfg.jitter_seed)) {
+                if (error) *error = "Invalid JITTER_SEED at line " + std::to_string(line_no);
+                return {};
+            }
+        } else if (key == "MAX_CONCURRENT_IO") {
+            if (!ParseUint32(value, &cfg.max_concurrent_io) || cfg.max_concurrent_io == 0 ||
+                cfg.max_concurrent_io > 1024) {
+                if (error) *error = "Invalid MAX_CONCURRENT_IO at line " + std::to_string(line_no);
+                return {};
+            }
+        } else if (key == "IO_QUEUE_LIMIT") {
+            if (!ParseUint32(value, &cfg.io_queue_limit) || cfg.io_queue_limit > 65536) {
+                if (error) *error = "Invalid IO_QUEUE_LIMIT at line " + std::to_string(line_no);
                 return {};
             }
         } else if (key == "DISK_CAPACITY_BYTES") {

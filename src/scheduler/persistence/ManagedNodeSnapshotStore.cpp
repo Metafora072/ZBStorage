@@ -245,6 +245,8 @@ bool RuntimeFromProto(const zb::rpc::ManagedNodeRuntimeSnapshot& input,
         node.optical_library.staging_capacity_bytes = optical.staging_capacity_bytes();
         node.optical_library.staging_used_bytes = optical.staging_used_bytes();
         node.optical_library.pending_write_tasks = optical.pending_write_tasks();
+        node.optical_library.pending_read_tasks = optical.pending_read_tasks();
+        node.optical_library.busy_drives = optical.busy_drives();
         node.optical_library.observed_at_ms = optical.observed_at_ms();
     }
     if (view.has_readiness()) {

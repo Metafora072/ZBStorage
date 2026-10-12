@@ -37,6 +37,14 @@ public:
                                                        uint64_t* scheduler_generation) const;
 
     bool IsWriteAdmitted(const std::string& node_id) const;
+    // Returns the committed incarnation, never a Scheduler proposal.
+    bool GetInstanceGeneration(const std::string& node_id, uint64_t* generation) const;
+    bool GetCommittedNode(const std::string& node_id,
+                          zb::rpc::CmsNodeCatalogEntry* entry) const;
+    // Allocator may return a virtual slot alias (base-vN); data RPCs use the
+    // CMS-owned logical base identity instead.
+    bool ResolveLogicalNodeId(const std::string& allocation_id,
+                              std::string* logical_id) const;
 
 private:
     static bool IsRetired(const zb::rpc::ManagedNodeView& node);

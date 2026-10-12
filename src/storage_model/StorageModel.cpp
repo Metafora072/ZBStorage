@@ -138,6 +138,9 @@ bool ValidateNodeHardwareProfile(const NodeHardwareProfile& profile, std::string
     if (profile.technology_generation == 0) {
         return Fail("technology_generation must be greater than zero", error);
     }
+    if (profile.instance_generation == 0) {
+        return Fail("instance_generation must be greater than zero", error);
+    }
     if (profile.external_network_bandwidth_bytes_per_sec == 0) {
         return Fail("external network bandwidth must be greater than zero", error);
     }

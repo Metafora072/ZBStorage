@@ -114,6 +114,10 @@ public:
                              const zb::rpc::CommitFileMigrationRequest* request,
                              zb::rpc::CommitFileMigrationReply* response,
                              google::protobuf::Closure* done) override;
+    void ModelOpticalArchive(google::protobuf::RpcController* cntl_base,
+                             const zb::rpc::ModelOpticalArchiveRequest* request,
+                             zb::rpc::ModelOpticalArchiveReply* response,
+                             google::protobuf::Closure* done) override;
     void CommitCmsNodeCatalog(google::protobuf::RpcController* cntl_base,
                               const zb::rpc::CommitCmsNodeCatalogRequest* request,
                               zb::rpc::CommitCmsNodeCatalogReply* response,

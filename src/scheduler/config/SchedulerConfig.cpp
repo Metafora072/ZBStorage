@@ -5,6 +5,8 @@
 #include <charconv>
 #include <cmath>
 #include <fstream>
+#include <filesystem>
+#include <sstream>
 #include <stdexcept>
 
 namespace zb::scheduler {
@@ -262,6 +264,37 @@ SchedulerConfig SchedulerConfig::LoadFromFile(const std::string& path, std::stri
             cfg.cluster_view_snapshot_path = value;
         } else if (key == "MANAGED_STATE_SNAPSHOT_PATH") {
             cfg.managed_state_snapshot_path = value;
+        } else if (key == "SIMULATION_DISK_CONFIGS" ||
+                   key == "SIMULATION_OPTICAL_CONFIGS") {
+            if (value.empty()) {
+                if (error) *error = key + " cannot be empty";
+                return {};
+            }
+            std::istringstream paths(value);
+            std::string part;
+            while (std::getline(paths, part, ',')) {
+                part = Trim(part);
+                if (part.empty()) {
+                    if (error) *error = "Empty path in " + key + " at line " + std::to_string(line_no);
+                    return {};
+                }
+                std::filesystem::path configured(part);
+                if (configured.is_relative()) {
+                    configured = std::filesystem::path(path).parent_path() / configured;
+                }
+                auto& targets = key == "SIMULATION_DISK_CONFIGS"
+                    ? cfg.simulation_disk_configs : cfg.simulation_optical_configs;
+                targets.push_back(configured.lexically_normal().string());
+            }
+        } else if (key == "SIMULATION_DATA_PORT") {
+            uint64_t parsed = 0;
+            if (!ParseUint64(value, &parsed) || parsed == 0 || parsed > 65535) {
+                if (error) *error = "Invalid SIMULATION_DATA_PORT at line " + std::to_string(line_no);
+                return {};
+            }
+            cfg.simulation_data_port = static_cast<uint32_t>(parsed);
+        } else if (key == "SIMULATION_DATA_ADDRESS") {
+            cfg.simulation_data_address = value;
         }
     }
 
@@ -281,6 +314,18 @@ SchedulerConfig SchedulerConfig::LoadFromFile(const std::string& path, std::stri
         (cfg.power_wake_cmd_template.empty() || cfg.power_standby_cmd_template.empty() ||
          cfg.power_off_cmd_template.empty())) {
         if (error) *error = "all POWER_*_CMD_TEMPLATE values are required when power actuation is enabled";
+        return {};
+    }
+    if ((!cfg.simulation_disk_configs.empty() ||
+         !cfg.simulation_optical_configs.empty() || cfg.simulation_data_port != 0 ||
+         !cfg.simulation_data_address.empty()) &&
+        (cfg.simulation_data_port == 0 || cfg.simulation_data_address.empty() ||
+         cfg.simulation_data_address.size() <= std::to_string(cfg.simulation_data_port).size() + 1 ||
+         cfg.simulation_data_address.compare(
+             cfg.simulation_data_address.size() - std::to_string(cfg.simulation_data_port).size() - 1,
+             std::to_string(cfg.simulation_data_port).size() + 1,
+             ":" + std::to_string(cfg.simulation_data_port)) != 0)) {
+        if (error) *error = "Simulation requires matching SIMULATION_DATA_PORT and SIMULATION_DATA_ADDRESS";
         return {};
     }
 

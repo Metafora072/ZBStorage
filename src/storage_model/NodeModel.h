@@ -134,6 +134,9 @@ struct NodeHardwareProfile {
     ExecutionMode execution_mode{ExecutionMode::kPhysical};
     uint32_t logical_node_count{1};
     uint32_t technology_generation{1};
+    // Immutable incarnation of this logical service identity, independent of
+    // hardware technology and inventory observation generations.
+    uint64_t instance_generation{1};
     bool participates_in_placement{true};
     uint64_t external_network_bandwidth_bytes_per_sec{0};
     uint64_t fixed_access_latency_us{0};
@@ -188,6 +191,9 @@ struct OpticalLibraryStatus {
     uint64_t staging_capacity_bytes{0};
     uint64_t staging_used_bytes{0};
     uint32_t pending_write_tasks{0};
+    // Background read work also holds drives and must block idle power-down.
+    uint32_t pending_read_tasks{0};
+    uint32_t busy_drives{0};
     uint64_t observed_at_ms{0};
 };
 

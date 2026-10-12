@@ -2,7 +2,7 @@
 
 依据根目录 `测试任务书.pdf` 第 4–5 页（T03）及第 10–13 页的原测试案例。负责人：丁森凡。
 
-本目录交付可直接运行的批量文件处理、节点分布、磁电节点能耗数据处理、10 节点仿真能效及外存真实闭环测试。内部开发回归用例仅保留本地，不作为交付依赖。T02 的通用 FUSE Trace 播放、T04 的长期仿真、T05 的光盘归档和机械调度不由本目录重新实现。
+本目录交付可直接运行的批量文件处理、节点分布、磁电节点能耗数据处理、10 节点仿真能效及外存真实闭环测试；同时保留 Scheduler/节点管理的少量模块回归。T02 的通用 FUSE Trace 播放、T04 的长期仿真、T05 的实体光盘归档和机械调度不由本目录重新实现。
 
 ## 目录组织
 
@@ -11,16 +11,19 @@ tests/scheduler/
 ├── README.md
 ├── run.py                 # 常规测试、仿真、电表分析入口
 ├── external_test.py       # 外存真实 FUSE 负载入口
+├── real_system_smoke.py   # 精简真实系统闭环：外存、FUSE、迁移、重启
+├── *_test.cpp             # 节点管理与进程内模型回归
+├── model_closure_*.{cpp,py} # 迁移、代际、模型光盘及 FUSE 闭环
 ├── python/                # 两个入口必需的支撑模块（包）
 ├── fixtures/              # 随代码提交的固定测试输入
 └── results/               # 本地运行结果、索引和历史报告，不提交
 ```
 
-以上为提交目录。开发机上的 `cpp/`、`python/test_*.py`、`python/closure.py` 均不提交，也不参与默认构建；使用者无需这些文件即可运行本文命令。原内部 `run.py closure` 命令不再公开，迁移、零引用与退役后的分配验证统一使用 `external_test.py` 的真实 FUSE 链路。
+模块回归位于本目录并由 CTest 构建；`results/` 仅保存本地实验结果，不提交。`run.py` 的 T03 任务入口与模块回归分别使用，前者不能替代迁移及光盘模型的故障门禁测试。
 
 Python 内部模块通过包相对导入复用，不直接运行内部文件。`fixtures/time_simulator_trace.csv` 是可直接传给 `--trace` 的最小 T04 格式示例，不是实验结果。
 
-`python/support.py` 固定以本测试目录定位结果和样例，不依赖调用者当前目录。`environment.json` 中的 `test_source_sha256` 以本目录为基准记录公开入口及支撑模块的相对路径，不包含未交付的内部回归文件，便于复核实际测试版本。
+`python/support.py` 固定以本测试目录定位结果和样例，不依赖调用者当前目录。`environment.json` 中的 `test_source_sha256` 以本目录为基准记录 T03 公开入口及支撑模块的相对路径；模块回归由 CTest 单独管理。
 
 已知跨模块缺陷统一记录在 [docs/issues](../../docs/issues/fuse-concurrent-write-20260915.md)。原有 `REPORT-*.md` 已移到本地 `results/reports/`；历史结果保持原样，不因本次目录整理重写。
 
@@ -49,7 +52,14 @@ python3 tests/scheduler/run.py meter-closure --files 1000
 
 `local` 启动独立端口的 Scheduler、MDS/CMS 和默认两个真实存储节点进程；`--optical-check` 额外启动新版光盘节点并验证库存未就绪时保持 JOINING。所有数据库、配置及节点数据均在本次结果目录中。结束时仅停止本工具启动的进程，文件保留。该环境是单服务器上的多进程功能实验，不是多台物理服务器的硬件性能验收。
 
-CTest 只为公开任务入口注册 `scheduler_t03_local_smoke`、`scheduler_t03_simulation` 和 `scheduler_t03_meter_closure`，不依赖内部回归文件。真实 FUSE 挂载及硬件传感器测试需按文末说明显式运行 `external_test.py`，不会在默认 CTest 中自动启动。
+`scheduler_owner_smoke` 是开发回归，包含模型用例，**不能作为实际系统闭环验收**。实际验收运行 `real_system_smoke.py`：在指定的可写外存上创建唯一私有目录，启动真实 Scheduler、MDS/CMS、两个 `real_node_server` 和 FUSE；逐字节验证跨对象文件、后端对象文件、服务重启后的读回、排空迁移、CMS 零引用及退役后分配。它不运行模拟电表或仿真节点，也不声称测得物理功耗。
+
+```bash
+ctest --test-dir build-release -L scheduler_owner_smoke --output-on-failure
+python3 tests/scheduler/real_system_smoke.py --build build-release --external-root /mnt/md0
+```
+
+真实测试要求 `/dev/fuse`、`fusermount3`、可写的独立外存及至少 256 MiB 空间；条件不满足时直接失败，不退化到仓库盘或模拟服务。测试结果保留在外存的 `zbstorage_scheduler_real_*` 私有目录，供逐项审计，不自动删除。光盘实体刻录和硬件电表由各自验收流程负责。
 
 ## T03-1 批量文件测试
 
@@ -199,7 +209,7 @@ python3 tests/scheduler/run.py meter-closure --files 1000
 
 ## 新版适配与协作边界
 
-- 内部 C++、Python 及 Trace 生成器回归用例留在开发机，不随本次代码交付；其他模块已在主分支上的测试不受影响。
+- Scheduler/节点管理的 C++ 与 Python 模块回归随代码保留在 `tests/scheduler/`；其他团队的测试不并入本目录。
 - 客户端恢复迁移后 `ResolveFileRead=NOT_FOUND` 的对象读取回退；使用本次 MDS 位置回复的权威文件大小/分片大小，裁剪 EOF，不吞掉 IO/网络错误。公开外存入口覆盖跨对象文件迁移前后的实际读回。
 - 新光盘引擎编译恢复，心跳保留引擎就绪信息；没有库存时保持 JOINING。删除旧 ImageStore 的库存和“待写任务恒为零”逻辑，等待 T05 提供线程安全的真实库存和异步任务快照。
 - MDS 的旧归档写 RPC、T02 的光盘异步读适配、T05 的镜像 ID 与打包/刻录完成回报仍属于对应负责人。T03 的光盘边界测试不把这些场景标为成功。

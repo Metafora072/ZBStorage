@@ -7,13 +7,16 @@
 
 #include "mds.pb.h"
 #include "real_node.pb.h"
+#include "scheduler/simulation/service/InProcessDiskService.h"
 
 namespace zb::scheduler {
 
 BrpcObjectMigrationBackend::BrpcObjectMigrationBackend(std::string mds_address,
                                                        uint32_t timeout_ms,
-                                                       uint64_t copy_chunk_bytes)
+                                                       uint64_t copy_chunk_bytes,
+                                                       InProcessDiskService* models)
     : mds_address_(std::move(mds_address)),
+      models_(models),
       timeout_ms_(std::max<uint32_t>(100, timeout_ms)),
       copy_chunk_bytes_(std::max<uint64_t>(4096, copy_chunk_bytes)) {}
 
@@ -44,6 +47,16 @@ bool BrpcObjectMigrationBackend::ListObjects(const std::string& source_address,
                                              std::string* error) {
     if (!objects) return false;
     objects->clear();
+    if (source_address.rfind("model://", 0) == 0) {
+        auto* source = models_ ? models_->GetStorage(source_address.substr(8)) : nullptr;
+        if (!source) { if (error) *error = "model source unavailable"; return false; }
+        std::vector<zb::real_node::ArchiveObjectMeta> inventory;
+        const auto status = source->ListTrackedObjects(&inventory);
+        if (!status.ok()) { if (error) *error = status.message; return false; }
+        for (const auto& row : inventory)
+            objects->push_back({row.disk_id, row.object_id, 0, 0, row.size_bytes});
+        return true;
+    }
     brpc::Channel* channel = ChannelFor(source_address, error);
     if (!channel) return false;
     zb::rpc::RealNodeService_Stub stub(channel);
@@ -81,6 +94,39 @@ bool BrpcObjectMigrationBackend::CopyAndVerify(const std::string& source_address
                                                const MigrationObject& object,
                                                const MigrationTarget& target,
                                                std::string* error) {
+    if (source_address.rfind("model://", 0) == 0) {
+        auto* source = models_ ? models_->GetStorage(source_address.substr(8)) : nullptr;
+        auto* destination = models_ ? models_->GetStorage(target.node_id) : nullptr;
+        if (!source || !destination) {
+            if (error) *error = "model source or target unavailable";
+            return false;
+        }
+        std::vector<zb::real_node::ArchiveObjectMeta> inventory;
+        const auto listed = source->ListTrackedObjects(&inventory);
+        if (!listed.ok()) { if (error) *error = listed.message; return false; }
+        const auto found = std::find_if(inventory.begin(), inventory.end(), [&](const auto& row) {
+            return row.disk_id == object.disk_id && row.object_id == object.object_id;
+        });
+        if (found == inventory.end() || found->size_bytes != object.size_bytes) {
+            if (error) *error = "model source object changed during drain";
+            return false;
+        }
+        const auto resident = source->ExportResidentModelObject(
+            object.disk_id, object.object_id, object.size_bytes);
+        if (!resident.ok()) { if (error) *error = resident.message; return false; }
+        const auto imported = destination->ImportModelObject(
+            target.disk_id, object.object_id, object.size_bytes);
+        if (!imported.ok()) { if (error) *error = imported.message; return false; }
+        std::vector<zb::real_node::ArchiveObjectMeta> verified;
+        const auto checked = destination->ListTrackedObjects(&verified);
+        if (!checked.ok()) { if (error) *error = checked.message; return false; }
+        const auto match = std::find_if(verified.begin(), verified.end(), [&](const auto& row) {
+            return row.disk_id == target.disk_id && row.object_id == object.object_id &&
+                   row.size_bytes == object.size_bytes;
+        });
+        if (match == verified.end()) { if (error) *error = "model target inventory mismatch"; return false; }
+        return true;
+    }
     brpc::Channel* source_channel = ChannelFor(source_address, error);
     brpc::Channel* target_channel = ChannelFor(target.address, error);
     if (!source_channel || !target_channel) return false;
@@ -148,6 +194,20 @@ bool BrpcObjectMigrationBackend::CommitFileLocation(const std::string& migration
                                                     const std::string& source_disk_id,
                                                     const MigrationTarget& target,
                                                     std::string* error) {
+    zb::msg::FileMeta model_file;
+    const bool model_source = source_address.rfind("model://", 0) == 0;
+    if (model_source) {
+        auto* source = models_ ? models_->GetStorage(source_node_id) : nullptr;
+        auto* destination = models_ ? models_->GetStorage(target.node_id) : nullptr;
+        if (!source || !destination) {
+            if (error) *error = "model source or target unavailable at commit";
+            return false;
+        }
+        const auto exported = source->ExportModelFile(inode_id, &model_file);
+        if (!exported.ok()) { if (error) *error = exported.message; return false; }
+        const auto imported = destination->ImportModelFile(model_file);
+        if (!imported.ok()) { if (error) *error = imported.message; return false; }
+    }
     brpc::Channel* channel = ChannelFor(mds_address_, error);
     if (!channel) return false;
     zb::rpc::MdsService_Stub stub(channel);
@@ -157,6 +217,13 @@ bool BrpcObjectMigrationBackend::CommitFileLocation(const std::string& migration
     request.mutable_expected_source()->set_node_id(source_node_id);
     request.mutable_expected_source()->set_node_address(source_address);
     request.mutable_expected_source()->set_disk_id(source_disk_id);
+    if (model_source) {
+        request.set_expected_inode_version(model_file.version);
+        request.mutable_expected_source()->set_instance_generation(
+            models_->GetInstanceGeneration(source_node_id));
+        request.mutable_target()->set_instance_generation(
+            models_->GetInstanceGeneration(target.node_id));
+    }
     request.mutable_target()->set_node_id(target.node_id);
     request.mutable_target()->set_node_address(target.address);
     request.mutable_target()->set_disk_id(target.disk_id);
@@ -219,6 +286,19 @@ bool BrpcObjectMigrationBackend::VerifyCmsNodeReferencesZero(
 bool BrpcObjectMigrationBackend::DeleteSourceObject(const std::string& source_address,
                                                     const MigrationObject& object,
                                                     std::string* error) {
+    if (source_address.rfind("model://", 0) == 0) {
+        auto* source = models_ ? models_->GetStorage(source_address.substr(8)) : nullptr;
+        if (!source) { if (error) *error = "model source unavailable for cleanup"; return false; }
+        zb::msg::DeleteFileMetaRequest request;
+        request.inode_id = object.inode_id;
+        request.disk_id = object.disk_id;
+        request.purge_objects = true;
+        const auto deleted = source->DeleteFileMeta(request);
+        if (deleted.status.ok() || deleted.status.code == zb::msg::StatusCode::kNotFound)
+            return true;
+        if (error) *error = deleted.status.message;
+        return false;
+    }
     brpc::Channel* channel = ChannelFor(source_address, error);
     if (!channel) return false;
     zb::rpc::RealNodeService_Stub stub(channel);

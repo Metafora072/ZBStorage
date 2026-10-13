@@ -26,6 +26,7 @@ constexpr uint32_t kReplicationRepairMaxRetry = 8;
 constexpr int kReplicationRepairRetryIntervalMs = 500;
 constexpr size_t kReplicationRepairMaxQueue = 10000;
 constexpr uint64_t kDefaultObjectUnitSize = 4ULL * 1024ULL * 1024ULL;
+constexpr uint64_t kMaxFileSlicesPerRequest = 4096;
 
 struct FileArchiveAggregate {
     uint64_t file_size{0};
@@ -36,15 +37,45 @@ uint32_t ComputeObjectCount(uint64_t file_size, uint64_t object_unit_size) {
     if (file_size == 0 || object_unit_size == 0) {
         return 0;
     }
-    const uint64_t count = (file_size + object_unit_size - 1) / object_unit_size;
+    const uint64_t count = 1 + (file_size - 1) / object_unit_size;
     return static_cast<uint32_t>(std::min<uint64_t>(count, std::numeric_limits<uint32_t>::max()));
+}
+
+bool ValidateFileSliceRange(uint64_t offset, uint64_t size,
+                            uint64_t object_unit_size, std::string* error) {
+    if (object_unit_size == 0 || size > std::numeric_limits<uint64_t>::max() - offset) {
+        if (error) *error = "invalid file slice range or object unit size";
+        return false;
+    }
+    if (size == 0) return true;
+    const uint64_t first = offset / object_unit_size;
+    const uint64_t last = (offset + size - 1) / object_unit_size;
+    if (last >= std::numeric_limits<uint32_t>::max()) {
+        if (error) *error = "file object index exceeds supported range";
+        return false;
+    }
+    if (last - first + 1 > kMaxFileSlicesPerRequest) {
+        if (error) *error = "MODEL_SLICE_LIMIT";
+        return false;
+    }
+    return true;
+}
+
+uint32_t StableJitterSeed(const std::string& node_id, uint32_t configured) {
+    if (configured != 0) return configured;
+    uint32_t hash = 2166136261u;
+    for (const unsigned char ch : node_id) {
+        hash ^= ch;
+        hash *= 16777619u;
+    }
+    return hash;
 }
 
 } // namespace
 
 VirtualStorageServiceImpl::VirtualStorageServiceImpl(VirtualNodeConfig config)
     : config_(std::move(config)),
-      rng_(std::random_device{}()) {
+      rng_(StableJitterSeed(config_.node_id, config_.jitter_seed)) {
     for (const auto& disk_id : config_.disk_ids) {
         if (!disk_id.empty()) {
             disk_set_.insert(disk_id);
@@ -56,7 +87,9 @@ VirtualStorageServiceImpl::VirtualStorageServiceImpl(VirtualNodeConfig config)
     for (const auto& disk_id : disk_set_) {
         disk_used_bytes_[disk_id] = 0;
     }
-    repl_repair_thread_ = std::thread([this]() { ReplicationRepairLoop(); });
+    if (config_.replication_enabled) {
+        repl_repair_thread_ = std::thread([this]() { ReplicationRepairLoop(); });
+    }
 }
 
 VirtualStorageServiceImpl::~VirtualStorageServiceImpl() {
@@ -78,10 +111,139 @@ void VirtualStorageServiceImpl::SetFileMetaStoreDir(const std::string& dir_path)
         return;
     }
     std::lock_guard<std::mutex> lock(object_mu_);
+    if (model_state_store_) return;
     file_meta_store_path_ = (dir / "file_meta.tsv").string();
     file_meta_loaded_ = false;
     file_meta_by_inode_.clear();
     preloaded_file_objects_.clear();
+}
+
+bool VirtualStorageServiceImpl::InitModelStateStore(const std::string& state_dir,
+                                                    std::string* error) {
+    std::lock_guard<std::mutex> lock(object_mu_);
+    if (model_state_store_ || !object_sizes_.empty() || !file_meta_by_inode_.empty() ||
+        file_meta_loaded_) {
+        if (error) *error = "model state must be opened before serving requests";
+        return false;
+    }
+    auto store = std::make_unique<ModelStateStore>();
+    std::vector<ModelObjectRecord> objects;
+    std::vector<ModelFileRecord> files;
+    if (!store->Open(state_dir, config_.node_id, config_.disk_ids,
+                     config_.disk_capacity_bytes, &objects, &files, error)) return false;
+    for (const auto& object : objects) {
+        object_sizes_[BuildObjectKey(object.disk_id, object.object_id)] = object.size;
+        object_home_disk_[object.object_id] = object.disk_id;
+        disk_used_bytes_[object.disk_id] += object.size;
+    }
+    for (const auto& file : files) {
+        file_meta_by_inode_[file.meta.inode_id] = file.meta;
+        if (!file.txid.empty()) last_commit_txid_by_inode_[file.meta.inode_id] = file.txid;
+        if (!file.commit_signature.empty())
+            last_commit_signature_by_inode_[file.meta.inode_id] = file.commit_signature;
+    }
+    file_meta_loaded_ = true;
+    model_state_store_ = std::move(store);
+    return true;
+}
+
+zb::msg::Status VirtualStorageServiceImpl::ImportModelObject(
+    const std::string& disk_id, const std::string& object_id, uint64_t size) {
+    if (!ValidateDisk(disk_id) || object_id.empty())
+        return zb::msg::Status::InvalidArgument("invalid model object target");
+    std::lock_guard<std::mutex> lock(object_mu_);
+    if (!model_state_store_) return zb::msg::Status::IoError("model state is not durable");
+    const auto home = object_home_disk_.find(object_id);
+    if (home != object_home_disk_.end() && home->second != disk_id)
+        return zb::msg::Status::IoError("OBJECT_ID_DISK_CONFLICT");
+    const std::string key = BuildObjectKey(disk_id, object_id);
+    const auto existing = object_sizes_.find(key);
+    if (existing != object_sizes_.end())
+        return existing->second == size ? zb::msg::Status::Ok()
+                                        : zb::msg::Status::IoError("MODEL_OBJECT_SIZE_CONFLICT");
+    const uint64_t used = disk_used_bytes_[disk_id];
+    if (used > config_.disk_capacity_bytes || size > config_.disk_capacity_bytes - used)
+        return zb::msg::Status::IoError("NO_SPACE");
+    std::string error;
+    if (!model_state_store_->PutObject(disk_id, object_id, size, &error))
+        return zb::msg::Status::IoError(error);
+    object_sizes_[key] = size;
+    object_home_disk_[object_id] = disk_id;
+    disk_used_bytes_[disk_id] = used + size;
+    return zb::msg::Status::Ok();
+}
+
+zb::msg::Status VirtualStorageServiceImpl::ExportResidentModelObject(
+    const std::string& disk_id, const std::string& object_id,
+    uint64_t expected_size) const {
+    std::lock_guard<std::mutex> lock(object_mu_);
+    const auto it = object_sizes_.find(BuildObjectKey(disk_id, object_id));
+    if (it == object_sizes_.end())
+        return zb::msg::Status::IoError(
+            "preloaded/generated file object needs a seed-preserving migration format");
+    return it->second == expected_size ? zb::msg::Status::Ok()
+                                       : zb::msg::Status::IoError("source model object size changed");
+}
+
+zb::msg::Status VirtualStorageServiceImpl::ExportModelFile(
+    uint64_t inode_id, zb::msg::FileMeta* meta) const {
+    if (!meta || inode_id == 0) return zb::msg::Status::InvalidArgument("invalid inode");
+    std::lock_guard<std::mutex> lock(object_mu_);
+    const auto it = file_meta_by_inode_.find(inode_id);
+    if (it == file_meta_by_inode_.end())
+        return zb::msg::Status::NotFound("model file metadata not found");
+    *meta = it->second;
+    return zb::msg::Status::Ok();
+}
+
+zb::msg::Status VirtualStorageServiceImpl::ImportModelFile(const zb::msg::FileMeta& meta) {
+    if (meta.inode_id == 0 || meta.object_unit_size == 0 || meta.version == 0)
+        return zb::msg::Status::InvalidArgument("invalid migrated file metadata");
+    std::lock_guard<std::mutex> lock(object_mu_);
+    if (!model_state_store_) return zb::msg::Status::IoError("model state is not durable");
+    const auto existing = file_meta_by_inode_.find(meta.inode_id);
+    if (existing != file_meta_by_inode_.end()) {
+        const auto& old = existing->second;
+        return old.version == meta.version && old.file_size == meta.file_size &&
+                       old.object_unit_size == meta.object_unit_size
+                   ? zb::msg::Status::Ok()
+                   : zb::msg::Status::IoError("MODEL_FILE_VERSION_CONFLICT");
+    }
+    ModelFileRecord row;
+    row.meta = meta;
+    std::string error;
+    if (!model_state_store_->PutFile(row, &error)) return zb::msg::Status::IoError(error);
+    file_meta_by_inode_[meta.inode_id] = meta;
+    return zb::msg::Status::Ok();
+}
+
+zb::msg::Status VirtualStorageServiceImpl::VerifyModelArchiveSource(
+    uint64_t inode_id, const std::string& disk_id,
+    uint64_t expected_size, uint64_t expected_version) const {
+    // Reject sparse and preloaded objects because their generated bytes differ.
+    if (inode_id == 0 || disk_id.empty())
+        return zb::msg::Status::InvalidArgument("invalid archive source");
+    std::lock_guard<std::mutex> lock(object_mu_);
+    const auto file = file_meta_by_inode_.find(inode_id);
+    if (file == file_meta_by_inode_.end() ||
+        file->second.file_size != expected_size ||
+        file->second.version != expected_version ||
+        file->second.object_unit_size == 0 ||
+        preloaded_file_objects_.count(inode_id) != 0)
+        return zb::msg::Status::IoError("model archive source metadata is incomplete or changed");
+    const uint64_t unit = file->second.object_unit_size;
+    const uint64_t count = expected_size == 0 ? 0 : 1 + (expected_size - 1) / unit;
+    if (count > UINT32_MAX)
+        return zb::msg::Status::IoError("model archive object count exceeds supported range");
+    for (uint64_t index = 0; index < count; ++index) {
+        const std::string key = BuildObjectKey(
+            disk_id, BuildStableObjectId(inode_id, static_cast<uint32_t>(index)));
+        const auto object = object_sizes_.find(key);
+        const uint64_t required = std::min<uint64_t>(unit, expected_size - index * unit);
+        if (object == object_sizes_.end() || object->second != required)
+            return zb::msg::Status::IoError("model archive source has a sparse or changed object");
+    }
+    return zb::msg::Status::Ok();
 }
 
 void VirtualStorageServiceImpl::ConfigureReplication(const std::string& node_id,
@@ -165,21 +327,60 @@ zb::msg::WriteObjectReply VirtualStorageServiceImpl::WriteObject(const zb::msg::
     }
 
     reply.bytes = static_cast<uint64_t>(request.data.size());
-    SimulateIo(reply.bytes, false);
+    if (normalized_request.offset > std::numeric_limits<uint64_t>::max() - reply.bytes) {
+        reply.status = zb::msg::Status::InvalidArgument("write range overflows uint64_t");
+        reply.bytes = 0;
+        return reply;
+    }
+    if (reply.bytes == 0) {
+        reply.status = zb::msg::Status::Ok();
+        return reply;
+    }
+    reply.status = SimulateIo(reply.bytes, false);
+    if (!reply.status.ok()) {
+        reply.bytes = 0;
+        return reply;
+    }
     {
         std::lock_guard<std::mutex> lock(object_mu_);
         const std::string key = BuildObjectKey(normalized_request.disk_id, object_id);
-        const uint64_t old_size = object_sizes_[key];
-        const uint64_t new_size = normalized_request.offset + static_cast<uint64_t>(normalized_request.data.size());
+        const auto home = object_home_disk_.find(object_id);
+        if (model_state_store_ && home != object_home_disk_.end() &&
+            home->second != normalized_request.disk_id) {
+            reply.status = zb::msg::Status::IoError("OBJECT_ID_DISK_CONFLICT");
+            reply.bytes = 0;
+            return reply;
+        }
+        const auto existing = object_sizes_.find(key);
+        const uint64_t old_size = existing == object_sizes_.end() ? 0 : existing->second;
+        const uint64_t new_size = std::max(old_size, normalized_request.offset + reply.bytes);
         if (new_size > old_size) {
             const uint64_t increase = new_size - old_size;
             const uint64_t used = disk_used_bytes_[normalized_request.disk_id];
-            if (used + increase > config_.disk_capacity_bytes) {
+            if (used > config_.disk_capacity_bytes ||
+                increase > config_.disk_capacity_bytes - used) {
                 reply.status = zb::msg::Status::IoError("NO_SPACE");
                 reply.bytes = 0;
                 return reply;
             }
+            if (model_state_store_) {
+                std::string persist_error;
+                if (!model_state_store_->PutObject(normalized_request.disk_id, object_id,
+                                                   new_size, &persist_error)) {
+                    reply.status = zb::msg::Status::IoError(persist_error);
+                    reply.bytes = 0;
+                    return reply;
+                }
+            }
             disk_used_bytes_[normalized_request.disk_id] = used + increase;
+        } else if (existing == object_sizes_.end() && model_state_store_) {
+            std::string persist_error;
+            if (!model_state_store_->PutObject(normalized_request.disk_id, object_id,
+                                               new_size, &persist_error)) {
+                reply.status = zb::msg::Status::IoError(persist_error);
+                reply.bytes = 0;
+                return reply;
+            }
         }
         object_home_disk_[object_id] = normalized_request.disk_id;
         object_sizes_[key] = new_size;
@@ -228,7 +429,6 @@ zb::msg::ReadObjectReply VirtualStorageServiceImpl::ReadObject(const zb::msg::Re
         return reply;
     }
 
-    SimulateIo(request.size, true);
     {
         std::lock_guard<std::mutex> lock(object_mu_);
         const std::string key = BuildObjectKey(effective_disk, object_id);
@@ -243,20 +443,29 @@ zb::msg::ReadObjectReply VirtualStorageServiceImpl::ReadObject(const zb::msg::Re
                 reply.status = zb::msg::Status::NotFound("object not found");
                 return reply;
             }
-            TrackObjectAccess(effective_disk, object_id, request.offset + reply.bytes, false, 0);
-            reply.status = zb::msg::Status::Ok();
-            return reply;
+            // Tracking may inspect file metadata under object_mu_. Do it only
+            // after leaving this critical section, like the ordinary path.
         }
-        const uint64_t object_size = it->second;
-        if (request.offset >= object_size) {
-            reply.bytes = 0;
-            reply.data.clear();
-        } else {
-            const uint64_t remain = object_size - request.offset;
-            const uint64_t read_len = std::min<uint64_t>(remain, request.size);
-            reply.bytes = read_len;
-            reply.data.assign(static_cast<size_t>(read_len), 'x');
+        if (it != object_sizes_.end()) {
+            const uint64_t object_size = it->second;
+            if (request.offset >= object_size) {
+                reply.bytes = 0;
+                reply.data.clear();
+            } else {
+                const uint64_t remain = object_size - request.offset;
+                const uint64_t read_len = std::min<uint64_t>(remain, request.size);
+                reply.bytes = read_len;
+                reply.data.assign(static_cast<size_t>(read_len), 'x');
+            }
         }
+    }
+    // Charge the bytes actually returned, not an oversized request extending
+    // past EOF. The generated reply is a snapshot taken before model latency.
+    reply.status = SimulateIo(reply.bytes, true);
+    if (!reply.status.ok()) {
+        reply.data.clear();
+        reply.bytes = 0;
+        return reply;
     }
     TrackObjectAccess(effective_disk, object_id, request.offset + reply.bytes, false, 0);
     reply.status = zb::msg::Status::Ok();
@@ -288,6 +497,13 @@ zb::msg::DeleteObjectReply VirtualStorageServiceImpl::DeleteObject(const zb::msg
         const std::string key = BuildObjectKey(effective_disk, object_id);
         auto it = object_sizes_.find(key);
         if (it != object_sizes_.end()) {
+            if (model_state_store_) {
+                std::string persist_error;
+                if (!model_state_store_->DeleteObject(effective_disk, object_id, &persist_error)) {
+                    reply.status = zb::msg::Status::IoError(persist_error);
+                    return reply;
+                }
+            }
             const uint64_t size = it->second;
             object_sizes_.erase(key);
             auto home_it = object_home_disk_.find(object_id);
@@ -349,6 +565,14 @@ zb::msg::ResetNodeDataReply VirtualStorageServiceImpl::ResetNodeData(const zb::m
 
     {
         std::lock_guard<std::mutex> lock(object_mu_);
+        if (model_state_store_) {
+            std::string persist_error;
+            if (!model_state_store_->Clear(request.purge_objects, request.purge_file_meta,
+                                           &persist_error)) {
+                reply.status = zb::msg::Status::IoError(persist_error);
+                return reply;
+            }
+        }
         if (request.purge_objects) {
             reply.objects_removed = static_cast<uint64_t>(object_sizes_.size());
             object_home_disk_.clear();
@@ -366,9 +590,11 @@ zb::msg::ResetNodeDataReply VirtualStorageServiceImpl::ResetNodeData(const zb::m
             file_meta_by_inode_.clear();
             preloaded_file_objects_.clear();
             last_commit_txid_by_inode_.clear();
+            last_commit_signature_by_inode_.clear();
             file_meta_loaded_ = true;
             std::string persist_error;
-            if (!InitFileMetaStorePath() || !PersistFileMetaStoreLocked(&persist_error)) {
+            if (!model_state_store_ &&
+                (!InitFileMetaStorePath() || !PersistFileMetaStoreLocked(&persist_error))) {
                 reply.status = zb::msg::Status::IoError(
                     persist_error.empty() ? "failed to persist empty file meta store" : persist_error);
                 return reply;
@@ -430,6 +656,7 @@ zb::msg::DiskReportReply VirtualStorageServiceImpl::GetDiskReport() const {
 
 bool VirtualStorageServiceImpl::ApplyFileMetaInternal(const zb::msg::ApplyFileMetaRequest& request,
                                                       const std::string* txid,
+                                                      const std::string* commit_signature,
                                                       zb::msg::ApplyFileMetaReply* out) {
     if (!out) {
         return false;
@@ -463,6 +690,15 @@ bool VirtualStorageServiceImpl::ApplyFileMetaInternal(const zb::msg::ApplyFileMe
         if (tx_it != last_commit_txid_by_inode_.end() &&
             tx_it->second == *txid &&
             meta_it != file_meta_by_inode_.end()) {
+            if (model_state_store_) {
+                const auto signature_it = last_commit_signature_by_inode_.find(request.meta.inode_id);
+                if (!commit_signature || signature_it == last_commit_signature_by_inode_.end() ||
+                    signature_it->second != *commit_signature) {
+                    reply.status = zb::msg::Status::IoError("TXID_PARAMETER_MISMATCH");
+                    *out = std::move(reply);
+                    return true;
+                }
+            }
             reply.meta = meta_it->second;
             reply.status = zb::msg::Status::Ok();
             *out = std::move(reply);
@@ -491,15 +727,18 @@ bool VirtualStorageServiceImpl::ApplyFileMetaInternal(const zb::msg::ApplyFileMe
         file_meta_by_inode_[created.inode_id] = created;
         if (txid && !txid->empty()) {
             last_commit_txid_by_inode_[created.inode_id] = *txid;
+            if (model_state_store_ && commit_signature)
+                last_commit_signature_by_inode_[created.inode_id] = *commit_signature;
         }
         std::string persist_error;
-        if (!PersistFileMetaStoreLocked(&persist_error)) {
+        if (!PersistFileMetaRowLocked(created.inode_id, &persist_error)) {
             file_meta_by_inode_.erase(created.inode_id);
             if (had_old_tx) {
                 last_commit_txid_by_inode_[created.inode_id] = old_txid;
             } else {
                 last_commit_txid_by_inode_.erase(created.inode_id);
             }
+            last_commit_signature_by_inode_.erase(created.inode_id);
             reply.status = zb::msg::Status::IoError(
                 persist_error.empty() ? "failed to persist file meta store" : persist_error);
             *out = std::move(reply);
@@ -515,6 +754,9 @@ bool VirtualStorageServiceImpl::ApplyFileMetaInternal(const zb::msg::ApplyFileMe
     const auto tx_old_it = last_commit_txid_by_inode_.find(request.meta.inode_id);
     const bool had_old_tx = tx_old_it != last_commit_txid_by_inode_.end();
     const std::string old_txid = had_old_tx ? tx_old_it->second : std::string();
+    const auto signature_old_it = last_commit_signature_by_inode_.find(request.meta.inode_id);
+    const bool had_old_signature = signature_old_it != last_commit_signature_by_inode_.end();
+    const std::string old_signature = had_old_signature ? signature_old_it->second : std::string();
     zb::msg::FileMeta next = it->second;
     if (request.expected_version > 0 && request.expected_version != next.version) {
         reply.status = zb::msg::Status::IoError("VERSION_MISMATCH");
@@ -529,14 +771,21 @@ bool VirtualStorageServiceImpl::ApplyFileMetaInternal(const zb::msg::ApplyFileMe
     it->second = next;
     if (txid && !txid->empty()) {
         last_commit_txid_by_inode_[request.meta.inode_id] = *txid;
+        if (model_state_store_ && commit_signature)
+            last_commit_signature_by_inode_[request.meta.inode_id] = *commit_signature;
     }
     std::string persist_error;
-    if (!PersistFileMetaStoreLocked(&persist_error)) {
+    if (!PersistFileMetaRowLocked(request.meta.inode_id, &persist_error)) {
         it->second = old;
         if (had_old_tx) {
             last_commit_txid_by_inode_[request.meta.inode_id] = old_txid;
         } else {
             last_commit_txid_by_inode_.erase(request.meta.inode_id);
+        }
+        if (had_old_signature) {
+            last_commit_signature_by_inode_[request.meta.inode_id] = old_signature;
+        } else {
+            last_commit_signature_by_inode_.erase(request.meta.inode_id);
         }
         reply.status = zb::msg::Status::IoError(
             persist_error.empty() ? "failed to persist file meta store" : persist_error);
@@ -578,35 +827,41 @@ zb::msg::DeleteFileMetaReply VirtualStorageServiceImpl::DeleteFileMeta(const zb:
         const zb::msg::FileMeta old = it->second;
 
         if (request.purge_objects) {
-            const uint64_t object_unit_size = old.object_unit_size > 0 ? old.object_unit_size : kDefaultObjectUnitSize;
-            if (object_unit_size == 0) {
-                reply.status = zb::msg::Status::IoError("object_unit_size is zero");
+            // Enumerate actual committed objects, including a stale object
+            // beyond the latest file length, without allocating for a sparse
+            // or maliciously large file_size.
+            for (const auto& [key, size] : object_sizes_) {
+                (void)size;
+                const size_t split = key.find('|');
+                if (split == std::string::npos) continue;
+                const std::string object_id = key.substr(split + 1);
+                uint64_t inode_id = 0;
+                uint32_t index = 0;
+                if (ParseStableObjectId(object_id, &inode_id, &index) &&
+                    inode_id == request.inode_id)
+                    removed_objects.emplace_back(key.substr(0, split), object_id);
+            }
+        }
+
+        if (model_state_store_) {
+            std::string persist_error;
+            if (!model_state_store_->DeleteFileAndObjects(request.inode_id,
+                                                           removed_objects, &persist_error)) {
+                reply.status = zb::msg::Status::IoError(persist_error);
                 return reply;
             }
-            const uint64_t object_count = old.file_size == 0 ? 0 : (old.file_size + object_unit_size - 1) / object_unit_size;
-            removed_objects.reserve(static_cast<size_t>(object_count));
-            for (uint64_t i = 0; i < object_count; ++i) {
-                const std::string object_id = BuildStableObjectId(request.inode_id, static_cast<uint32_t>(i));
-                std::string effective_disk = request.disk_id;
-                auto home_it = object_home_disk_.find(object_id);
-                if (home_it != object_home_disk_.end() && !home_it->second.empty()) {
-                    effective_disk = home_it->second;
-                }
-                const std::string key = BuildObjectKey(effective_disk, object_id);
-                auto obj_it = object_sizes_.find(key);
-                if (obj_it == object_sizes_.end()) {
-                    continue;
-                }
-                const uint64_t size = obj_it->second;
-                object_sizes_.erase(key);
-                auto home_erase_it = object_home_disk_.find(object_id);
-                if (home_erase_it != object_home_disk_.end() && home_erase_it->second == effective_disk) {
-                    object_home_disk_.erase(home_erase_it);
-                }
-                uint64_t& used = disk_used_bytes_[effective_disk];
-                used = used > size ? (used - size) : 0;
-                removed_objects.emplace_back(effective_disk, object_id);
-            }
+        }
+        for (const auto& [disk_id, object_id] : removed_objects) {
+            const std::string key = BuildObjectKey(disk_id, object_id);
+            auto obj_it = object_sizes_.find(key);
+            if (obj_it == object_sizes_.end()) continue;
+            const uint64_t size = obj_it->second;
+            object_sizes_.erase(obj_it);
+            auto home_it = object_home_disk_.find(object_id);
+            if (home_it != object_home_disk_.end() && home_it->second == disk_id)
+                object_home_disk_.erase(home_it);
+            uint64_t& used = disk_used_bytes_[disk_id];
+            used = used > size ? used - size : 0;
         }
 
         const auto tx_old_it = last_commit_txid_by_inode_.find(request.inode_id);
@@ -618,9 +873,10 @@ zb::msg::DeleteFileMetaReply VirtualStorageServiceImpl::DeleteFileMeta(const zb:
             had_old_preload ? preload_old_it->second : PreloadedFileObjectInfo{};
         file_meta_by_inode_.erase(it);
         last_commit_txid_by_inode_.erase(request.inode_id);
+        last_commit_signature_by_inode_.erase(request.inode_id);
         preloaded_file_objects_.erase(request.inode_id);
         std::string persist_error;
-        if (!PersistFileMetaStoreLocked(&persist_error)) {
+        if (!model_state_store_ && !PersistFileMetaStoreLocked(&persist_error)) {
             file_meta_by_inode_[old.inode_id] = old;
             if (had_old_tx) {
                 last_commit_txid_by_inode_[request.inode_id] = old_txid;
@@ -639,6 +895,23 @@ zb::msg::DeleteFileMetaReply VirtualStorageServiceImpl::DeleteFileMeta(const zb:
     archive_file_meta_store_.RemoveFile(request.inode_id);
     reply.status = zb::msg::Status::Ok();
     return reply;
+}
+
+bool VirtualStorageServiceImpl::PersistFileMetaRowLocked(uint64_t inode_id,
+                                                         std::string* error) {
+    if (!model_state_store_) return PersistFileMetaStoreLocked(error);
+    auto it = file_meta_by_inode_.find(inode_id);
+    if (it == file_meta_by_inode_.end()) {
+        return model_state_store_->DeleteFileAndObjects(inode_id, {}, error);
+    }
+    ModelFileRecord row;
+    row.meta = it->second;
+    auto tx_it = last_commit_txid_by_inode_.find(inode_id);
+    if (tx_it != last_commit_txid_by_inode_.end()) row.txid = tx_it->second;
+    auto signature_it = last_commit_signature_by_inode_.find(inode_id);
+    if (signature_it != last_commit_signature_by_inode_.end())
+        row.commit_signature = signature_it->second;
+    return model_state_store_->PutFile(row, error);
 }
 
 zb::msg::ResolveFileReadReply VirtualStorageServiceImpl::ResolveFileRead(
@@ -678,6 +951,11 @@ zb::msg::ResolveFileReadReply VirtualStorageServiceImpl::ResolveFileRead(
         return reply;
     }
     const uint64_t read_size = std::min<uint64_t>(request.size, reply.meta.file_size - request.offset);
+    std::string range_error;
+    if (!ValidateFileSliceRange(request.offset, read_size, object_unit_size, &range_error)) {
+        reply.status = zb::msg::Status::InvalidArgument(range_error);
+        return reply;
+    }
     BuildObjectSlices(request.inode_id, request.offset, read_size, object_unit_size, request.disk_id, &reply.slices);
     reply.status = zb::msg::Status::Ok();
     return reply;
@@ -717,6 +995,11 @@ zb::msg::AllocateFileWriteReply VirtualStorageServiceImpl::AllocateFileWrite(
     }
 
     const uint64_t object_unit_size = reply.meta.object_unit_size > 0 ? reply.meta.object_unit_size : kDefaultObjectUnitSize;
+    std::string range_error;
+    if (!ValidateFileSliceRange(request.offset, request.size, object_unit_size, &range_error)) {
+        reply.status = zb::msg::Status::InvalidArgument(range_error);
+        return reply;
+    }
     if (request.size > 0) {
         BuildObjectSlices(request.inode_id, request.offset, request.size, object_unit_size, request.disk_id, &reply.slices);
     }
@@ -740,6 +1023,12 @@ zb::msg::CommitFileWriteReply VirtualStorageServiceImpl::CommitFileWrite(const z
         reply.status = zb::msg::Status::InvalidArgument("object_unit_size is zero");
         return reply;
     }
+    if (request.file_size > 0 &&
+        1 + (request.file_size - 1) / request.object_unit_size >
+            std::numeric_limits<uint32_t>::max()) {
+        reply.status = zb::msg::Status::InvalidArgument("file object count exceeds supported range");
+        return reply;
+    }
 
     zb::msg::ApplyFileMetaRequest apply_req;
     apply_req.meta.inode_id = request.inode_id;
@@ -751,8 +1040,17 @@ zb::msg::CommitFileWriteReply VirtualStorageServiceImpl::CommitFileWrite(const z
     apply_req.expected_version = request.expected_version;
     apply_req.allow_create = request.allow_create;
 
+    // Include all caller-controlled commit parameters. In particular, the
+    // same txid cannot silently acknowledge a different size or CAS version.
+    const std::string commit_signature =
+        std::to_string(request.file_size) + ":" +
+        std::to_string(request.object_unit_size) + ":" +
+        std::to_string(request.expected_version) + ":" +
+        (request.allow_create ? "1" : "0") + ":" +
+        std::to_string(request.mtime_sec);
+
     zb::msg::ApplyFileMetaReply meta_reply;
-    ApplyFileMetaInternal(apply_req, &request.txid, &meta_reply);
+    ApplyFileMetaInternal(apply_req, &request.txid, &commit_signature, &meta_reply);
     reply.status = meta_reply.status;
     reply.meta = meta_reply.meta;
     if (reply.status.ok()) {
@@ -1135,20 +1433,58 @@ void VirtualStorageServiceImpl::RemoveObjectTracking(const std::string& disk_id,
     archive_meta_store_.RemoveObject(disk_id, object_id);
 }
 
-void VirtualStorageServiceImpl::SimulateIo(uint64_t bytes, bool is_read) {
-    uint64_t bytes_per_sec = is_read ? config_.read_bytes_per_sec : config_.write_bytes_per_sec;
-    uint32_t base_latency_ms = is_read ? config_.read_base_latency_ms : config_.write_base_latency_ms;
-
-    uint64_t transfer_ms = 0;
-    if (bytes_per_sec > 0 && bytes > 0) {
-        double seconds = static_cast<double>(bytes) / static_cast<double>(bytes_per_sec);
-        transfer_ms = static_cast<uint64_t>(std::ceil(seconds * 1000.0));
+zb::msg::Status VirtualStorageServiceImpl::SimulateIo(uint64_t bytes, bool is_read) {
+    using Clock = std::chrono::steady_clock;
+    const uint64_t bandwidth = is_read ? config_.read_bytes_per_sec : config_.write_bytes_per_sec;
+    if (bandwidth == 0 || config_.max_concurrent_io == 0) {
+        return zb::msg::Status::IoError("INVALID_IO_RESOURCE_CONFIG");
     }
-
-    uint64_t delay_ms = static_cast<uint64_t>(base_latency_ms) + transfer_ms + RandomJitterMs();
-    if (delay_ms > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+    // Keep model reservations within a finite horizon so a malformed huge RPC
+    // cannot overflow steady_clock arithmetic or occupy the queue indefinitely.
+    const long double transfer_us =
+        std::ceil(static_cast<long double>(bytes) * 1000000.0L / bandwidth);
+    constexpr long double kMaxTransferUs = 24.0L * 60 * 60 * 1000000;
+    if (transfer_us > kMaxTransferUs) {
+        return zb::msg::Status::IoError("MODEL_IO_DURATION_LIMIT");
     }
+    const auto transfer = std::chrono::microseconds(static_cast<int64_t>(transfer_us));
+    const auto latency = std::chrono::milliseconds(
+        static_cast<uint64_t>(is_read ? config_.read_base_latency_ms
+                                      : config_.write_base_latency_ms) + RandomJitterMs());
+    Clock::time_point finish;
+    {
+        std::lock_guard<std::mutex> lock(io_mu_);
+        const uint64_t budget = static_cast<uint64_t>(config_.max_concurrent_io) +
+                                config_.io_queue_limit;
+        if (io_outstanding_ >= budget) {
+            return zb::msg::Status::IoError("MODEL_IO_QUEUE_FULL");
+        }
+        const auto now = Clock::now();
+        if (io_slot_available_.empty()) {
+            io_slot_available_.resize(config_.max_concurrent_io, now);
+            io_bandwidth_available_ = now;
+        }
+        auto slot = std::min_element(io_slot_available_.begin(), io_slot_available_.end());
+        const auto start = std::max(now, *slot);
+        // Transfers share one node-wide read/write budget. Fixed device latency
+        // may overlap across slots; the transfer timeline may not overlap.
+        const auto transfer_start = std::max(start, io_bandwidth_available_);
+        io_bandwidth_available_ = transfer_start + transfer;
+        finish = io_bandwidth_available_ + latency;
+        *slot = finish;
+        ++io_outstanding_;
+    }
+    std::this_thread::sleep_until(finish);
+    {
+        std::lock_guard<std::mutex> lock(io_mu_);
+        --io_outstanding_;
+    }
+    return zb::msg::Status::Ok();
+}
+
+IoResourceSnapshot VirtualStorageServiceImpl::GetIoResourceSnapshot() const {
+    std::lock_guard<std::mutex> lock(io_mu_);
+    return {io_outstanding_, config_.max_concurrent_io, config_.io_queue_limit};
 }
 
 uint32_t VirtualStorageServiceImpl::RandomJitterMs() {
@@ -1423,10 +1759,6 @@ bool VirtualStorageServiceImpl::TryReadPreloadedObjectLocked(const std::string& 
     }
     *bytes_read = 0;
     out->clear();
-    if (size == 0) {
-        return true;
-    }
-
     uint64_t inode_id = 0;
     uint32_t object_index = 0;
     if (!ParseStableObjectId(object_id, &inode_id, &object_index)) {
@@ -1452,6 +1784,7 @@ bool VirtualStorageServiceImpl::TryReadPreloadedObjectLocked(const std::string& 
     if (object_begin >= meta_it->second.file_size) {
         return false;
     }
+    if (size == 0) return true;
     const uint64_t object_size = std::min<uint64_t>(object_unit_size, meta_it->second.file_size - object_begin);
     if (offset >= object_size) {
         return true;
@@ -1481,9 +1814,9 @@ void VirtualStorageServiceImpl::BuildObjectSlices(uint64_t inode_id,
     slices->reserve(static_cast<size_t>(end_index - start_index + 1));
     for (uint64_t i = start_index; i <= end_index; ++i) {
         const uint64_t object_start = i * object_unit_size;
-        const uint64_t object_end = object_start + object_unit_size;
         const uint64_t seg_start = std::max<uint64_t>(object_start, offset);
-        const uint64_t seg_end = std::min<uint64_t>(object_end, end);
+        const uint64_t seg_end = seg_start +
+            std::min<uint64_t>(object_unit_size - (seg_start - object_start), end - seg_start);
         if (seg_end <= seg_start) {
             continue;
         }

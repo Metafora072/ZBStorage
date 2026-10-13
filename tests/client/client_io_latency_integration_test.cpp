@@ -54,6 +54,7 @@ public:
         if (optical) {
             auto* anchor = location->mutable_optical_location();
             anchor->set_node_id("test-node"); anchor->set_disk_id("disc0"); anchor->set_node_address(node_address);
+            anchor->set_image_id("image0");
         } else {
             auto* anchor = location->mutable_disk_location();
             anchor->set_node_id("test-node"); anchor->set_disk_id("disk0"); anchor->set_node_address(node_address);
@@ -132,10 +133,56 @@ public:
     }
 };
 
+class OpticalService : public rpc::OpticalNodeService {
+public:
+    explicit OpticalService(NodeService* node) : node_(node) {}
+
+    void SendArchiveMetadata(google::protobuf::RpcController*,
+                             const rpc::SendArchiveMetadataRequest*, rpc::ArchiveReply* reply,
+                             google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        reply->mutable_status()->set_code(rpc::MDS_INVALID_ARGUMENT);
+    }
+    void RequestAsyncReadFile(google::protobuf::RpcController*,
+                              const rpc::RequestAsyncReadFileRequest*,
+                              rpc::RequestAsyncReadFileReply* reply,
+                              google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        node_->Delay();
+        reply->mutable_status()->set_code(rpc::MDS_OK);
+        reply->set_task_id(1);
+    }
+    void ReadObjectByTaskId(google::protobuf::RpcController*,
+                            const rpc::ReadObjectByTaskIdRequest* request,
+                            rpc::ReadObjectByTaskIdReply* reply,
+                            google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        node_->Delay();
+        std::lock_guard<std::mutex> lock(node_->objects_mu);
+        const std::string data = node_->objects["object-0"] + node_->objects["object-1"];
+        reply->set_data(data.substr(request->offset(), request->read_size()));
+        reply->mutable_status()->set_code(rpc::MDS_OK);
+    }
+    void ReadObjectByInodeId(google::protobuf::RpcController*,
+                             const rpc::ReadObjectByInodeIdRequest*,
+                             rpc::ReadObjectByInodeIdReply* reply,
+                             google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        reply->mutable_status()->set_code(rpc::MDS_INVALID_ARGUMENT);
+    }
+private:
+    NodeService* node_;
+};
+
 struct LocalServer {
     brpc::Server server;
-    explicit LocalServer(google::protobuf::Service* service) {
+    explicit LocalServer(google::protobuf::Service* service,
+                         google::protobuf::Service* second_service = nullptr) {
         Check(server.AddService(service, brpc::SERVER_DOESNT_OWN_SERVICE) == 0, "add test service");
+        if (second_service) {
+            Check(server.AddService(second_service, brpc::SERVER_DOESNT_OWN_SERVICE) == 0,
+                  "add second test service");
+        }
         Check(server.Start("127.0.0.1:0", nullptr) == 0, "start test server");
     }
     ~LocalServer() { server.Stop(0); server.Join(); }
@@ -180,7 +227,8 @@ struct Expected {
 void TestClientRequests() {
     TempDir temp;
     NodeService node;
-    LocalServer node_server(&node);
+    OpticalService optical(&node);
+    LocalServer node_server(&node, &optical);
     MetadataService metadata;
     metadata.node_address = node_server.Address();
     LocalServer mds_server(&metadata);

@@ -281,6 +281,13 @@ bool CmsNodeRegistry::Commit(
                     if (error) *error = "CMS node kind cannot change: " + node_id;
                     return false;
                 }
+                const auto old_generation = existing->second.managed_view().spec().instance_generation();
+                const auto new_generation = entry.managed_view().spec().instance_generation();
+                if ((old_generation == 0 ? 1 : old_generation) !=
+                    (new_generation == 0 ? 1 : new_generation)) {
+                    if (error) *error = "CMS instance generation cannot change for an existing node: " + node_id;
+                    return false;
+                }
                 compact_id = static_cast<uint32_t>(existing->second.managed_view().compact_id());
                 if (IsRetired(existing->second.managed_view()) && !IsRetired(entry.managed_view())) {
                     if (error) *error = "retired CMS node cannot rejoin: " + node_id;
@@ -353,6 +360,50 @@ bool CmsNodeRegistry::IsWriteAdmitted(const std::string& node_id) const {
         if (node_id.size() > prefix.size() && node_id.rfind(prefix, 0) == 0) {
             return IsWriteAllocatable(item.second.managed_view());
         }
+    }
+    return false;
+}
+
+bool CmsNodeRegistry::GetInstanceGeneration(const std::string& node_id,
+                                            uint64_t* generation) const {
+    if (!generation || node_id.empty()) return false;
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto it = nodes_.find(node_id);
+    if (it == nodes_.end()) return false;
+    const uint64_t value = it->second.managed_view().spec().instance_generation();
+    *generation = value == 0 ? 1 : value;
+    return true;
+}
+
+bool CmsNodeRegistry::GetCommittedNode(const std::string& node_id,
+                                       zb::rpc::CmsNodeCatalogEntry* entry) const {
+    if (!entry || node_id.empty()) return false;
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto it = nodes_.find(node_id);
+    if (it == nodes_.end()) return false;
+    *entry = it->second;
+    return true;
+}
+
+bool CmsNodeRegistry::ResolveLogicalNodeId(const std::string& allocation_id,
+                                           std::string* logical_id) const {
+    if (!logical_id || allocation_id.empty()) return false;
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto exact = nodes_.find(allocation_id);
+    if (exact != nodes_.end()) {
+        *logical_id = exact->first;
+        return true;
+    }
+    for (const auto& item : nodes_) {
+        const std::string prefix = item.first + "-v";
+        if (allocation_id.rfind(prefix, 0) != 0 ||
+            allocation_id.size() == prefix.size()) continue;
+        const std::string suffix = allocation_id.substr(prefix.size());
+        if (suffix.find_first_not_of("0123456789") != std::string::npos) continue;
+        if (item.second.managed_view().spec().execution_mode() !=
+            zb::rpc::MANAGED_EXECUTION_VIRTUAL) continue;
+        *logical_id = item.first;
+        return true;
     }
     return false;
 }

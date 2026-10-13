@@ -23,13 +23,16 @@
 #include <limits>
 #include <string>
 #include <sstream>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "client/metrics/IoLatency.h"
+#include "common/rpc/LogicalNodeRoute.h"
 #include "mds.pb.h"
+#include "optical_node.pb.h"
 #include "real_node.pb.h"
 #include "scheduler.pb.h"
 
@@ -40,6 +43,8 @@ DEFINE_uint32(cluster_view_ttl_ms, 10000, "Max tolerated staleness of scheduler 
 DEFINE_uint32(default_replica, 1, "Default replica for create");
 DEFINE_uint64(default_object_unit_size, 4194304, "Default object unit size for create");
 DEFINE_int32(timeout_ms, 3000, "RPC timeout in ms");
+DEFINE_uint32(optical_read_wait_ms, 120000,
+              "Maximum wait for an asynchronous optical read task");
 DEFINE_int32(max_retry, 0, "RPC max retry");
 DEFINE_bool(bootstrap_tier_dirs, true, "Create and configure tier-specific subdirectories on mount");
 DEFINE_string(real_dir_name, "real", "Top-level directory for real-node backed POSIX files");
@@ -327,6 +332,7 @@ zb::rpc::ReplicaLocation ToReplicaLocation(const zb::rpc::FileLocationView& view
     replica.set_node_id(location.node_id());
     replica.set_node_address(location.node_address());
     replica.set_disk_id(location.disk_id());
+    replica.set_instance_generation(location.instance_generation());
     replica.set_object_id(BuildStableObjectId(view.attr().inode_id(), 0));
     replica.set_size(view.attr().size());
     replica.set_storage_tier(zb::rpc::STORAGE_TIER_DISK);
@@ -340,6 +346,7 @@ zb::rpc::ReplicaLocation ToReplicaLocation(const zb::rpc::FileLocationView& view
     replica.set_node_id(location.node_id());
     replica.set_node_address(location.node_address());
     replica.set_disk_id(location.disk_id());
+    replica.set_instance_generation(location.instance_generation());
     replica.set_object_id(location.file_id().empty() ? BuildStableObjectId(view.attr().inode_id(), 0)
                                                      : location.file_id());
     replica.set_size(view.attr().size());
@@ -354,12 +361,24 @@ bool HasOpticalLocation(const zb::rpc::FileLocationView& view) {
 }
 
 bool IsArchivedReadOnly(const zb::rpc::FileLocationView& view) {
-    return view.attr().file_archive_state() == zb::rpc::INODE_ARCHIVE_ARCHIVED;
+    return view.attr().file_archive_state() == zb::rpc::INODE_ARCHIVE_ARCHIVED ||
+           view.attr().storage_tier() == zb::rpc::INODE_STORAGE_OPTICAL ||
+           HasLegacyOpticalLocation(view);
 }
 
 bool SelectLocationForIo(const zb::rpc::FileLocationView& view, zb::rpc::ReplicaLocation* anchor) {
     if (!anchor) {
         return false;
+    }
+    if (view.attr().storage_tier() == zb::rpc::INODE_STORAGE_DISK &&
+        HasLegacyDiskLocation(view)) {
+        *anchor = ToReplicaLocation(view, view.disk_location());
+        return true;
+    }
+    if (view.attr().storage_tier() == zb::rpc::INODE_STORAGE_OPTICAL &&
+        HasLegacyOpticalLocation(view)) {
+        *anchor = ToReplicaLocation(view, view.optical_location());
+        return true;
     }
     if (HasDiskLocationInAttr(view.attr()) || HasOpticalLocationInAttr(view.attr())) {
         *anchor = ToReplicaLocation(view, view.attr());
@@ -924,6 +943,8 @@ public:
             request.set_epoch(replica.epoch());
             zb::rpc::WriteObjectReply reply;
             brpc::Controller cntl;
+            zb::rpc_route::SetLogicalNodeRoute(&cntl, replica.node_id(),
+                replica.instance_generation() == 0 ? 1 : replica.instance_generation());
             {
                 RpcLatencyScope timing(trace, RpcTarget::DataNode);
                 stub.WriteObject(&cntl, &request, &reply, nullptr);
@@ -973,6 +994,8 @@ public:
             }
             zb::rpc::ReadObjectReply reply;
             brpc::Controller cntl;
+            zb::rpc_route::SetLogicalNodeRoute(&cntl, replica.node_id(),
+                replica.instance_generation() == 0 ? 1 : replica.instance_generation());
             {
                 RpcLatencyScope timing(trace, RpcTarget::DataNode);
                 stub.ReadObject(&cntl, &request, &reply, nullptr);
@@ -991,6 +1014,83 @@ public:
         }
         if (error) {
             *error = last_error;
+        }
+        return false;
+    }
+
+    bool ReadOpticalFile(const zb::rpc::ReplicaLocation& replica, uint64_t inode_id,
+                         uint64_t offset, uint64_t size, std::string* out,
+                         std::string* error, IoTraceContext* trace = nullptr) {
+        if (!out || inode_id == 0 || replica.disk_id().empty() ||
+            replica.image_id().empty()) {
+            if (error) *error = "incomplete optical read location";
+            return false;
+        }
+        const auto addresses = CollectAddresses(replica, resolver_);
+        if (addresses.empty()) { if (error) *error = "no optical node address"; return false; }
+        for (const auto& address : addresses) {
+            brpc::Channel* channel = GetChannel(address);
+            if (!channel) continue;
+            zb::rpc::OpticalNodeService_Stub stub(channel);
+            zb::rpc::RequestAsyncReadFileRequest request;
+            request.set_inode_id(inode_id);
+            request.set_disk_id(replica.disk_id());
+            request.set_image_id(replica.image_id());
+            zb::rpc::RequestAsyncReadFileReply accepted;
+            brpc::Controller controller;
+            if (!zb::rpc_route::SetLogicalNodeRoute(
+                    &controller, replica.node_id(),
+                    replica.instance_generation() == 0 ? 1 : replica.instance_generation())) {
+                if (error) *error = "invalid optical instance route";
+                return false;
+            }
+            {
+                RpcLatencyScope timing(trace, RpcTarget::DataNode);
+                stub.RequestAsyncReadFile(&controller, &request, &accepted, nullptr);
+            }
+            if (controller.Failed() || accepted.status().code() != zb::rpc::MDS_OK) {
+                if (error) *error = controller.Failed() ? controller.ErrorText()
+                                                        : accepted.status().message();
+                continue;
+            }
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(FLAGS_optical_read_wait_ms);
+            std::string result;
+            result.reserve(static_cast<size_t>(size));
+            uint64_t consumed = 0;
+            while (consumed < size) {
+                const uint64_t chunk = std::min<uint64_t>(size - consumed, 4ULL * 1024 * 1024);
+                zb::rpc::ReadObjectByTaskIdRequest part;
+                part.set_task_id(accepted.task_id());
+                part.set_offset(offset + consumed);
+                part.set_read_size(chunk);
+                zb::rpc::ReadObjectByTaskIdReply data;
+                brpc::Controller read_controller;
+                zb::rpc_route::SetLogicalNodeRoute(
+                    &read_controller, replica.node_id(),
+                    replica.instance_generation() == 0 ? 1 : replica.instance_generation());
+                {
+                    RpcLatencyScope timing(trace, RpcTarget::DataNode);
+                    stub.ReadObjectByTaskId(&read_controller, &part, &data, nullptr);
+                }
+                if (!read_controller.Failed() &&
+                    data.status().message() == "MODEL_NOT_READY" &&
+                    std::chrono::steady_clock::now() < deadline) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    continue;
+                }
+                if (read_controller.Failed() || data.status().code() != zb::rpc::MDS_OK ||
+                    data.data().size() != chunk) {
+                    if (error) *error = read_controller.Failed() ? read_controller.ErrorText()
+                        : (data.status().message().empty() ? "optical read incomplete"
+                                                           : data.status().message());
+                    return false;
+                }
+                result.append(data.data());
+                consumed += chunk;
+            }
+            *out = std::move(result);
+            return true;
         }
         return false;
     }
@@ -1031,6 +1131,8 @@ public:
             request.set_object_unit_size_hint(object_unit_size_hint);
             zb::rpc::ResolveFileReadReply reply;
             brpc::Controller cntl;
+            zb::rpc_route::SetLogicalNodeRoute(&cntl, replica.node_id(),
+                replica.instance_generation() == 0 ? 1 : replica.instance_generation());
             {
                 RpcLatencyScope timing(trace, RpcTarget::DataNode);
                 stub.ResolveFileRead(&cntl, &request, &reply, nullptr);
@@ -1097,6 +1199,8 @@ public:
             request.set_object_unit_size_hint(object_unit_size_hint);
             zb::rpc::AllocateFileWriteReply reply;
             brpc::Controller cntl;
+            zb::rpc_route::SetLogicalNodeRoute(&cntl, replica.node_id(),
+                replica.instance_generation() == 0 ? 1 : replica.instance_generation());
             {
                 RpcLatencyScope timing(trace, RpcTarget::DataNode);
                 stub.AllocateFileWrite(&cntl, &request, &reply, nullptr);
@@ -1169,6 +1273,8 @@ public:
             request.set_mtime_sec(mtime_sec);
             zb::rpc::CommitFileWriteReply reply;
             brpc::Controller cntl;
+            zb::rpc_route::SetLogicalNodeRoute(&cntl, replica.node_id(),
+                replica.instance_generation() == 0 ? 1 : replica.instance_generation());
             {
                 RpcLatencyScope timing(trace, RpcTarget::DataNode);
                 stub.CommitFileWrite(&cntl, &request, &reply, nullptr);
@@ -2075,32 +2181,12 @@ int FuseReadImpl(FuseState* state, const char* path, char* buf, size_t size, off
         if (read_size > hint_file_size - request_offset) {
             read_size = hint_file_size - request_offset;
         }
-        std::vector<zb::rpc::FileObjectSlice> slices;
-        BuildObjectSlices(inode_id,
-                          request_offset,
-                          read_size,
-                          hint_object_unit_size,
-                          anchor.disk_id(),
-                          &slices);
-        std::string output(static_cast<size_t>(read_size), 'x');
-        uint64_t write_pos = 0;
-        for (const auto& slice : slices) {
-            if (slice.length() == 0) {
-                continue;
-            }
-            std::string data;
-            std::string error;
-            zb::rpc::ReplicaLocation replica = BuildObjectReplicaFromAnchor(anchor, slice.object_id());
-            if (!state->data_nodes.Read(replica, slice.object_offset(), slice.length(), &data, &error, trace)) {
-                return -EIO;
-            }
-            const size_t copy_len = static_cast<size_t>(std::min<uint64_t>(slice.length(), data.size()));
-            if (write_pos + copy_len > output.size()) {
-                return -EIO;
-            }
-            std::memcpy(output.data() + write_pos, data.data(), copy_len);
-            write_pos += slice.length();
-        }
+        std::string output;
+        std::string error;
+        if (!state->data_nodes.ReadOpticalFile(anchor, inode_id, request_offset,
+                                               read_size, &output, &error, trace))
+            return -EIO;
+        if (output.size() != read_size) return -EIO;
         std::memcpy(buf, output.data(), output.size());
         return static_cast<int>(output.size());
     }

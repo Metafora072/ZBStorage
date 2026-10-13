@@ -104,12 +104,14 @@ message ReplicaLocation {
   string image_id = 16;
   uint64 image_offset = 17;
   uint64 image_length = 18;
+  uint64 instance_generation = 20; // 0 from legacy MDS means generation 1
 }
 
 message DiskFileLocation {
   string node_id = 1;
   string node_address = 2;
   string disk_id = 3;
+  uint64 instance_generation = 4;
 }
 
 // Scheduler calls this only after every object of the inode has been copied
@@ -120,12 +122,31 @@ message CommitFileMigrationRequest {
   uint64 inode_id = 2;
   DiskFileLocation expected_source = 3;
   DiskFileLocation target = 4;
+  uint64 expected_inode_version = 5; // required for logical model drains
 }
 
 message CommitFileMigrationReply {
   MdsStatus status = 1;
   DiskFileLocation location = 2;
   bool already_committed = 3;
+}
+
+// A modeled optical write is first validated, then durably burned locally,
+// and finally committed by CMS/MDS. The same manifest is used for both calls.
+message ModelOpticalArchiveRequest {
+  string operation_id = 1;
+  string source_lease_id = 2;
+  uint64 inode_id = 3;
+  uint64 source_version = 4;
+  uint64 size = 5;
+  DiskFileLocation expected_source = 6;
+  OpticalFileLocation target = 7;
+  bool commit = 8;
+}
+
+message ModelOpticalArchiveReply {
+  MdsStatus status = 1;
+  bool already_committed = 2;
 }
 
 // Scheduler proposes operational state, but CMS is the authority that commits
@@ -191,6 +212,7 @@ message OpticalFileLocation {
   string image_id = 4;
   string file_id = 5;
   string file_path = 6;
+  uint64 instance_generation = 7;
 }
 
 message FileLocationView {
@@ -692,6 +714,7 @@ service MdsService {
   rpc Rmdir(RmdirRequest) returns (RmdirReply);
   rpc GetFileLocation(GetFileLocationRequest) returns (GetFileLocationReply);
   rpc CommitFileMigration(CommitFileMigrationRequest) returns (CommitFileMigrationReply);
+  rpc ModelOpticalArchive(ModelOpticalArchiveRequest) returns (ModelOpticalArchiveReply);
   rpc CommitCmsNodeCatalog(CommitCmsNodeCatalogRequest) returns (CommitCmsNodeCatalogReply);
   rpc GetCmsNodeCatalog(GetCmsNodeCatalogRequest) returns (GetCmsNodeCatalogReply);
   rpc VerifyNodeReferences(VerifyNodeReferencesRequest) returns (VerifyNodeReferencesReply);

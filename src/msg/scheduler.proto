@@ -325,6 +325,7 @@ message ManagedNodeSpec {
   ManagedReliabilityProfile reliability = 12;
   uint32 technology_generation = 13;
   bool participates_in_placement_set = 14;
+  uint64 instance_generation = 15; // logical service incarnation, not technology_generation
 }
 
 message ManagedDeviceInventory {
@@ -352,6 +353,8 @@ message ManagedOpticalLibraryStatus {
   uint64 staging_capacity_bytes = 9;
   uint64 staging_used_bytes = 10;
   uint32 pending_write_tasks = 11;
+  uint32 pending_read_tasks = 12;
+  uint32 busy_drives = 13;
 }
 
 message ManagedNodeReadiness {

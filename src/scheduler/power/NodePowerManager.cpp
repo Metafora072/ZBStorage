@@ -214,12 +214,22 @@ bool NodePowerManager::FinalizeRemoveNode(const std::string& node_id,
         }
         return false;
     }
+    const bool empty_virtual_optical =
+        node.profile.kind == ManagedNodeKind::kOpticalLibrary &&
+        node.profile.execution_mode != ExecutionMode::kPhysical &&
+        node.optical_library.observed &&
+        node.optical_library.blank_disc_count == node.optical_library.local_disc_count &&
+        node.optical_library.recording_disc_count == 0 &&
+        node.optical_library.pending_write_tasks == 0 &&
+        node.optical_library.pending_read_tasks == 0 &&
+        node.optical_library.busy_drives == 0;
     if (node.profile.kind == ManagedNodeKind::kOpticalLibrary &&
-        (!node.optical_library.observed || node.optical_library.local_disc_count != 0)) {
+        (!node.optical_library.observed ||
+         (node.optical_library.local_disc_count != 0 && !empty_virtual_optical))) {
         if (error) {
             *error = !node.optical_library.observed
                          ? "optical inventory must be observed before retirement"
-                         : "optical library still has local discs";
+                         : "optical library still has occupied discs or active tasks";
         }
         return false;
     }
@@ -412,7 +422,17 @@ bool NodePowerManager::ReportOpticalLibraryStatus(
         if (error) *error = "stale optical library status";
         return false;
     }
+    AdvancePowerPolicyLocked(&node, status.observed_at_ms);
     node.optical_library = status;
+    if (status.observed &&
+        (status.pending_write_tasks != 0 || status.pending_read_tasks != 0 ||
+         status.busy_drives != 0) &&
+        IsServingLifecycle(node.lifecycle) &&
+        node.health == ManagedHealthState::kHealthy &&
+        node.administrative_state == zb::storage_model::AdministrativeState::kEnabled) {
+        SetPowerLevelLocked(&node, PowerLevel::kMedium,
+                            status.observed_at_ms, true);
+    }
     if (status.observed && status.local_disc_count > 0 &&
         status.recorded_disc_count == status.local_disc_count &&
         status.pending_write_tasks == 0) {
@@ -546,7 +566,11 @@ bool NodePowerManager::RequestPowerLevel(const std::string& node_id,
         if (error) *error = "power-off violates online node or capacity safety policy";
         return false;
     }
-    const bool changed = SetPowerLevelLocked(&node, level, now_ms, force);
+    bool changed = SetPowerLevelLocked(&node, level, now_ms, force);
+    if (force && level >= PowerLevel::kMedium && now_ms > node.last_access_ms) {
+        node.last_access_ms = now_ms;
+        changed = true;
+    }
     if (node.profile.execution_mode != ExecutionMode::kPhysical) {
         node.actuated_power_level = level;
     }
@@ -1357,6 +1381,13 @@ PowerLevel NodePowerManager::DesiredPowerLevelLocked(const ManagedNodeRuntime& n
         node.lifecycle == LifecycleState::kExiting ||
         node.lifecycle == LifecycleState::kRetired) {
         return PowerLevel::kOff;
+    }
+    if (node.profile.kind == ManagedNodeKind::kOpticalLibrary &&
+        node.optical_library.observed &&
+        (node.optical_library.pending_write_tasks != 0 ||
+         node.optical_library.pending_read_tasks != 0 ||
+         node.optical_library.busy_drives != 0)) {
+        return PowerLevel::kMedium;
     }
     const uint64_t idle_ms = now_ms > node.last_access_ms ? now_ms - node.last_access_ms : 0;
     const bool may_power_off = policy_.allow_off_with_resident_data || node.resident_data_bytes == 0;

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace zb::scheduler {
 
@@ -41,6 +42,15 @@ struct SchedulerConfig {
     std::string reboot_cmd_template;
     std::string cluster_view_snapshot_path;
     std::string managed_state_snapshot_path;
+
+    // Paths to existing per-node virtual disk configs. The shared endpoint is
+    // hosted by scheduler_server and is advertised for every listed node.
+    std::vector<std::string> simulation_disk_configs;
+    // Optical model instances expose the formal read RPC but remain Joining
+    // until archive commit, write, and MDS publication contracts are complete.
+    std::vector<std::string> simulation_optical_configs;
+    uint32_t simulation_data_port{0};
+    std::string simulation_data_address;
 
     static SchedulerConfig LoadFromFile(const std::string& path, std::string* error);
 };

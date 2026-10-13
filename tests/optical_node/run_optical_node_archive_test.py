@@ -3,19 +3,18 @@
 """光存储节点归档集成测试的 ctest 驱动脚本（仅使用 Python 标准库）。
 
 职责：
-    1. 准备语料（调用同目录的 prepare_archive_corpus.py）；
+    1. 准备语料（调用同目录的 prepare_archive_corpus.py，直接合成高熵文件，无需外部 jpg）；
     2. 运行 C++ 测试二进制（由 --driver 指定），把 stdout+stderr 合并落盘为 output.log；
     3. 回显日志末尾的「测试点汇总」区块，并按需清理工作目录。
 
-单一综合场景（56 卷 560 文件，1 MiB/文件按 256 KiB 切成 4 片，镜像 ≈ 10.1 MiB）：
+单一综合场景（56 卷 560 文件，1 MiB/文件按 256 KiB 切成 4 片，压缩比 ≈ 0.97）：
     一次运行覆盖「MDS 批次形态 → 归档下载 → 压缩封装 → 打包汇报 → 封盘（生成 vdisc）→
-    刻录释放 → 光盘读回 → image_dir 满载淘汰与重载 → 正常关机落盘与重启恢复（在途任务
-    继续推进）」。档位为小容量缓存（image_dir 容量 14 / 背压上限 12），因此背压触发与
-    恢复（多轮触发-解除）、LRU 淘汰、以及 5 张光盘共存下的元数据索引规模都在同一次
-    运行内被观测到。
+    刻录释放 → 新 6 接口读链路（订阅/准备/ReadReady/建会话/区间读/两级释放）→
+    image_dir 满载淘汰与重载 → 正常关机落盘与重启恢复（在途准备任务继续推进）」。
+    档位为小容量缓存（image_dir 容量 14 / 背压上限 12），因此背压触发与恢复（多轮
+    触发-解除）、LRU 淘汰、以及 5 张光盘共存下的元数据索引规模都在同一次运行内被观测到。
     墙钟约 20~35 分钟（光盘仿真时长不可压缩，产线未提供测试旋钮）。
 
-语料来源：--input-dir，其次环境变量 ZBSTORAGE_OPTICAL_CORPUS，缺省 ~/WR/testWrite。
 工作目录：默认 tests/optical_node/results/optical_node-<时间戳>/（见 tests/README.md 结果保存约定），
         其中 corpus/ 为脚本产出的语料、archive/ 为光节点工作目录、
         output.log 为本次运行的完整日志（按测试点记录目标 / 期望 / 验证方法 / 逐项检查结论）。
@@ -26,7 +25,7 @@
     失败                  全部保留以便排查；
     --keep                无论成败全部保留。
 
-退出码约定：语料缺失 -> 77（ctest SKIP_RETURN_CODE 视为跳过）；其余非零原样透传。
+退出码约定：非零原样透传（构建/运行失败即失败，不再有「语料缺失跳过」分支）。
 """
 
 import argparse
@@ -36,20 +35,9 @@ import shutil
 import subprocess
 import sys
 
-# 语料/跳过约定
-SKIP_RETURN_CODE = 77
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 LOG_NAME = "output.log"
-
-
-def resolve_corpus_src(input_dir):
-    """语料来源目录：优先命令行，其次环境变量，最后 ~/WR/testWrite。"""
-    if input_dir:
-        return os.path.expanduser(input_dir)
-    return os.environ.get("ZBSTORAGE_OPTICAL_CORPUS") or os.path.expanduser(
-        "~/WR/testWrite"
-    )
 
 
 def default_work_dir():
@@ -106,25 +94,18 @@ def main():
     parser = argparse.ArgumentParser(description="光存储节点归档集成测试驱动")
     parser.add_argument("--driver", required=True, help="C++ 测试二进制路径")
     parser.add_argument("--work-dir", default=None, help="工作目录")
-    parser.add_argument("--input-dir", default=None, help="语料来源目录")
     parser.add_argument("--keep", action="store_true",
                         help="保留全部产物（默认成功后只保留 output.log）")
     args = parser.parse_args()
 
-    corpus_src = resolve_corpus_src(args.input_dir)
-    if not os.path.isdir(corpus_src):
-        print("[skip] 语料目录不存在：%s（可通过 ZBSTORAGE_OPTICAL_CORPUS "
-              "或 --input-dir 指定）" % corpus_src, file=sys.stderr)
-        sys.exit(SKIP_RETURN_CODE)
-
     work_dir = args.work_dir or default_work_dir()
     work_dir = os.path.abspath(work_dir)
     os.makedirs(work_dir, exist_ok=True)
-    print("[info] 语料来源=%s 工作目录=%s" % (corpus_src, work_dir))
+    print("[info] 工作目录=%s" % work_dir)
 
     corpus_out = os.path.join(work_dir, "corpus")
     # 卷数必须大于「单盘可容纳的镜像数」才会触发封印（生成 vdisc 并刻录）：
-    # 10 MiB 卷 → 镜像 ≈ 10.1 MiB；100 MiB 盘恰好容纳 10 个，故至少要 11 卷才封出第一张盘。
+    # 压缩比 0.97 → 10 MiB 卷镜像 ≈ 9.7 MiB；100 MiB 盘容纳 10 个，故要 >10 卷才封出第一张盘。
     # 56 卷：5 张完整光盘 + 尾盘；叠加「容量 14 的小缓存」即可触发 LRU 淘汰与 CD_READ 重载，
     # 并让 node_discs_meta / disc_image_index_ 达到多盘规模（重启恢复索引的验证更有力度）。
     volumes = 56
@@ -135,16 +116,14 @@ def main():
         log.write("optical_node 归档集成测试运行日志\n")
         log.write("开始时间: %s\n" % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         log.write("场景: 综合场景（%d 卷）\n" % volumes)
-        log.write("语料来源: %s\n" % corpus_src)
         log.write("工作目录: %s\n" % work_dir)
         log.write("=" * 96 + "\n")
         log.flush()
 
-        # 步骤 1：生成语料
+        # 步骤 1：生成语料（直接合成高熵文件，压缩比 ≈ 0.90，无需外部 jpg）
         prepare = os.path.join(SCRIPT_DIR, "prepare_archive_corpus.py")
         prep_cmd = [
             sys.executable, prepare,
-            "--input-dir", corpus_src,
             "--out-dir", corpus_out,
             "--volumes", str(volumes),
             # 256 KiB 分片：1 MiB 文件 → 4 片，覆盖下载侧的多分片重组（见 README 测试点 A2）。

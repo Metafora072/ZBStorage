@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -63,10 +64,11 @@ inline constexpr const char* kThreadArchive = "StartBackgroundWorkers.thread=arc
 
 // 运行期链路 phase：上层按字段做 == 比较时使用这些常量。
 inline constexpr const char* kRunGuard          = "RunGuard";
-inline constexpr const char* kReadFile          = "ReadFile";
-inline constexpr const char* kReadObjectByTaskId = "ReadObjectByTaskId";
-inline constexpr const char* kReadObjectByInodeId = "ReadObjectByInodeId";
-inline constexpr const char* kWriteObject       = "WriteObject";
+inline constexpr const char* kPrepareRead       = "PrepareRead";
+inline constexpr const char* kAcquireReadSession = "AcquireReadSession";
+inline constexpr const char* kReadPreparedFile  = "ReadPreparedFile";
+inline constexpr const char* kReleaseReadSession = "ReleaseReadSession";
+inline constexpr const char* kReleasePreparedRead = "ReleasePreparedRead";
 inline constexpr const char* kSendArchiveMetadata = "SendArchiveMetadata";
 inline constexpr const char* kArchiveTaskProcessor = "ArchiveTaskProcessor";
 inline constexpr const char* kOnCDReadComplete  = "OnCDReadComplete";
@@ -83,6 +85,8 @@ inline constexpr const char* kPersistRuntimeState  = "PersistRuntimeState";
 inline constexpr const char* kLoadRuntimeState     = "LoadRuntimeState";
 inline constexpr const char* kLoadPendingDiscMeta  = "LoadPendingDiscMeta";
 inline constexpr const char* kReconcileAndReplay   = "ReconcileAndReplay";
+// 重建时扫描 read/ 清理无任务认领的孤儿读产物。
+inline constexpr const char* kCleanupOrphanReadArtifacts = "CleanupOrphanReadArtifacts";
 
 }  // namespace start_failure_phase
 
@@ -115,7 +119,7 @@ inline const char* WRTaskStateToString(WRTaskState state) {
 }
 
 // 任务类型：
-//   READ                 数据面读任务（客户端 RequestAsyncReadFile 发起，产物为解压后的读文件）
+//   READ                 数据面读任务（客户端 PrepareRead 发起，产物为解压后的读文件）
 //   WRITE                写任务（压缩并封装进卷镜像）
 //   CD_BURN              单卷刻录任务（旧链路保留）
 //   DISC_BURN            光盘级刻录任务：一张光盘包含多个卷镜像，volume_ids 有效
@@ -158,6 +162,19 @@ public:
     // 与 state 同批赋值，落审计日志时再转成可读时间串。
     uint64_t state_changed_at_ms;
     std::string file_path;
+
+    // 仅 READ 有效：上层 PrepareRead 请求的关联与核对信息。
+    // 本层不解释这些字段，仅在 READY 时回传给协调层用于发送 ReadReady。
+    std::string request_id;              // 客户端准备请求编号
+    uint64_t session_id{0};              // 通知会话（0 表示无/未关联）
+    uint64_t expected_file_size{0};      // 提交时给出的逻辑大小，用于就绪时核对
+    bool     has_file_version{false};    // 是否携带版本
+    uint64_t file_version{0};            // 携带时的版本值
+
+    // 仅 READ 任务有效：读产物有效期（epoch 毫秒）；0 表示无有效期。
+    // 在 READY 设置时与重启重建时赋值为「当前时间 + TTL」；到期且无读取引用时
+    // 由清理线程回收产物并置 FINISH。不入快照（重建时按当前时间刷新）。
+    uint64_t read_expire_at_ms{0};
 
     // 仅 DISC_BURN 有效：本张光盘包含的全部卷镜像 ID（顺序与光盘数据区顺序一致）。
     std::vector<std::string> volume_ids;
@@ -223,6 +240,19 @@ public:
         this->type = WRTaskType::READ;
         state = WRTaskState::START;
         state_changed_at_ms = NowMs();
+    }
+
+    // 设置 READ 任务的准备上下文（PrepareRead 关联信息）；须在 SetReadTask 之后调用。
+    void SetPrepareContext(const std::string& request_id,
+                           uint64_t session_id,
+                           uint64_t expected_file_size,
+                           bool has_file_version,
+                           uint64_t file_version) {
+        this->request_id = request_id;
+        this->session_id = session_id;
+        this->expected_file_size = expected_file_size;
+        this->has_file_version = has_file_version;
+        this->file_version = file_version;
     }
 
     // 设置写任务载荷；disk_id/volume_id 留空，由 ZipTaskProcessor 分配。
@@ -601,20 +631,6 @@ public:
         return task_map_.erase(task_id) > 0;
     }
 
-    // 收集所有 FINISH 终态任务的 task_id（供清理线程周期性移除）。
-    // 返回副本，调用方随后逐个 Erase；FINISH 为终态，期间不会被其它路径改写。
-    std::vector<uint64_t> CollectFinishTaskIds() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<uint64_t> ids;
-        ids.reserve(task_map_.size());
-        for (const auto& kv : task_map_) {
-            if (kv.second.state == WRTaskState::FINISH) {
-                ids.push_back(kv.first);
-            }
-        }
-        return ids;
-    }
-
     bool Contains(uint64_t task_id) const {
         std::lock_guard<std::mutex> lock(mutex_);
         return task_map_.find(task_id) != task_map_.end();
@@ -811,6 +827,170 @@ private:
     std::unordered_map<std::string, std::vector<uint64_t>> map_;
 };
 
+// 一次独立打开的读取会话记录。
+struct ReadSession {
+    uint64_t read_handle{0};
+    uint64_t task_id{0};
+    std::string artifact_path;   // 服务端本地产物路径（不对外暴露）
+    uint64_t file_size{0};
+    uint32_t max_read_bytes{0};
+};
+
+// AcquireReadSession 的成功结果。
+struct AcquireReadSessionResult {
+    uint64_t read_handle{0};
+    uint64_t file_size{0};
+    uint32_t max_read_bytes{0};
+};
+
+// ReadPreparedFile 的本次区间读取结果。
+struct ReadPreparedFileResult {
+    uint64_t bytes_read{0};  // 实际返回长度，等于 data 长度
+    bool eof{false};         // 本次请求到达文件末尾
+};
+
+// 读会话表：read_handle -> 会话，并跟踪每个 task 的准备引用 / 读取引用状态。
+// 独立加锁，不复用 WRTaskMap 的「取副本—改—Update」路径，避免并发打开时丢引用。
+//
+// 「是否允许新打开、加读取引用、建会话」与「释放准备引用、判引用是否归零」都走同一把
+// mutex_，使 AcquireReadSession 与 ReleasePreparedRead 成为不可中途打断的状态变更。
+class ReadSessionTable {
+public:
+    // Acquire 的结果。
+    enum class AcquireOutcome {
+        kAcquired,          // 会话已建立
+        kPrepareReleased,   // 该任务准备引用已释放，不再允许新打开
+        kInvalidArgument,   // artifact_path 为空或 max_read_bytes 为 0
+    };
+
+    ReadSessionTable() = default;
+    ReadSessionTable(const ReadSessionTable&) = delete;
+    ReadSessionTable& operator=(const ReadSessionTable&) = delete;
+
+    // 建立会话并 +1 读取引用；准备引用已释放时拒绝。
+    // 检查 released、插入会话、递增引用在同一把锁内完成。
+    AcquireOutcome Acquire(uint64_t task_id, const std::string& artifact_path,
+                           uint64_t file_size, uint32_t max_read_bytes,
+                           uint64_t* out_read_handle) {
+        if (out_read_handle == nullptr) {
+            return AcquireOutcome::kInvalidArgument;
+        }
+        *out_read_handle = 0;
+        if (artifact_path.empty() || max_read_bytes == 0) {
+            return AcquireOutcome::kInvalidArgument;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (prepare_released_.find(task_id) != prepare_released_.end()) {
+            return AcquireOutcome::kPrepareReleased;
+        }
+        const uint64_t read_handle = next_read_handle_.fetch_add(1);
+        ReadSession session;
+        session.read_handle = read_handle;
+        session.task_id = task_id;
+        session.artifact_path = artifact_path;
+        session.file_size = file_size;
+        session.max_read_bytes = max_read_bytes;
+        sessions_[read_handle] = std::move(session);
+        ++task_read_refs_[task_id];
+        *out_read_handle = read_handle;
+        return AcquireOutcome::kAcquired;
+    }
+
+    // 查会话（返回副本）；不存在返回 false。
+    bool Get(uint64_t read_handle, ReadSession* out) const {
+        if (out == nullptr) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = sessions_.find(read_handle);
+        if (it == sessions_.end()) {
+            return false;
+        }
+        *out = it->second;
+        return true;
+    }
+
+    // 该任务是否仍有打开的读会话（读取引用 > 0）；供有效期回收判定。
+    bool HasReaders(uint64_t task_id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = task_read_refs_.find(task_id);
+        return it != task_read_refs_.end() && it->second > 0;
+    }
+
+    // 关闭会话并减读取引用；返回所属 task_id（0 表示会话不存在）。
+    // *out_cleanable = true 表示此刻「准备引用已释放且读取引用归零」且为首次判定，
+    // 调用方应清理该任务的准备产物。
+    uint64_t Release(uint64_t read_handle, bool* out_cleanable) {
+        if (out_cleanable != nullptr) {
+            *out_cleanable = false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = sessions_.find(read_handle);
+        if (it == sessions_.end()) {
+            return 0;
+        }
+        const uint64_t task_id = it->second.task_id;
+        sessions_.erase(it);
+        auto ref_it = task_read_refs_.find(task_id);
+        if (ref_it != task_read_refs_.end()) {
+            if (--ref_it->second == 0) {
+                task_read_refs_.erase(ref_it);
+            }
+        }
+        if (out_cleanable != nullptr && IsCleanableLocked(task_id)) {
+            artifact_cleaned_.insert(task_id);
+            *out_cleanable = true;
+        }
+        return task_id;
+    }
+
+    // 标记准备引用已释放（幂等）。
+    // 返回 true 表示此刻读取引用已归零且为首次判定，调用方应清理该任务的准备产物。
+    bool ReleasePrepare(uint64_t task_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        prepare_released_.insert(task_id);
+        if (IsCleanableLocked(task_id)) {
+            artifact_cleaned_.insert(task_id);
+            return true;
+        }
+        return false;
+    }
+
+    // 关闭全部读会话（关机时调用）。
+    void CloseAll() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sessions_.clear();
+        task_read_refs_.clear();
+        prepare_released_.clear();
+        artifact_cleaned_.clear();
+    }
+
+private:
+    // 调用方需持有 mutex_：准备引用已释放、读取引用归零、且尚未判定过清理。
+    bool IsCleanableLocked(uint64_t task_id) const {
+        if (prepare_released_.find(task_id) == prepare_released_.end()) {
+            return false;
+        }
+        if (artifact_cleaned_.find(task_id) != artifact_cleaned_.end()) {
+            return false;
+        }
+        auto it = task_read_refs_.find(task_id);
+        return it == task_read_refs_.end() || it->second == 0;
+    }
+
+    std::atomic<uint64_t> next_read_handle_{1};
+    mutable std::mutex mutex_;
+    // read_handle -> 会话。
+    std::unordered_map<uint64_t, ReadSession> sessions_;
+    // task_id -> 读取引用数。
+    std::unordered_map<uint64_t, uint32_t> task_read_refs_;
+    // 已释放准备引用的 task。
+    std::unordered_set<uint64_t> prepare_released_;
+    // 已判定清理的 task（保证产物清理只触发一次）。
+    std::unordered_set<uint64_t> artifact_cleaned_;
+};
+
 // 归档下载背压判定的一次快照：记录「为什么暂停/放行」，便于日志与排查。
 // 判定为「需暂停下一批下载」当且仅当：写镜像占用达上限，或原始文件积压超阈值。
 struct ArchiveBackpressureState {
@@ -840,6 +1020,32 @@ struct ArchiveFileInfo {
 struct SendArchiveMetadataRequest {
     uint64_t batch_id{0};
     std::vector<ArchiveFileInfo> files;
+};
+
+// SubmitPrepareTask 的入参：一次整文件异步准备请求的定位信息与上层关联信息。
+// disk_id / volume_id 为已剥离前缀的尾部序号；request_id / session_id 由本层原样保存，
+// 不做解释，仅在任务 READY 时回传给协调层。
+struct PrepareReadParams {
+    std::string disk_id;
+    std::string volume_id;
+    std::string inode_id;
+    std::string request_id;
+    uint64_t session_id{0};
+    uint64_t expected_file_size{0};
+    bool     has_file_version{false};
+    uint64_t file_version{0};
+};
+
+// 一个准备任务变为 READY 时，回传给协调层用于发送 ReadReady 的完整上下文。
+// 由 OpticalNodeManager 在 READY 发布后构造，协调层序列化为 ReadReadyEvent 后写入通知 Stream。
+struct PreparedFileReadyEvent {
+    uint64_t task_id{0};
+    uint64_t session_id{0};          // 通知会话；0 表示无通知目标
+    std::string request_id;
+    uint64_t inode_id{0};
+    uint64_t file_size{0};           // 产物实际大小
+    bool     has_file_version{false};
+    uint64_t file_version{0};
 };
 
 // 归档请求队列：多生产者（MDS RPC 线程）/ 单消费者（archive_task_thread_）。
@@ -1268,6 +1474,15 @@ struct DiscSuperblock {
 // 段缺失即表示对应状态为空，因此新增段天然向后兼容；字段布局变化时递增
 // RUNTIME_STATE_FORMAT_VERSION。
 // ============================================================================
+
+// LoadRuntimeState() 的结果。区分「本来就没有快照」与「有快照但没读成功」：
+// 前者是首次启动的正常退化，后者是异常，需要显式告知上层
+//（sidecar 是单槽字符串，运行期其它失败会把它覆盖掉）。
+enum class RuntimeStateLoadResult {
+    kNoSnapshot,   // 没有快照文件（首次启动 / 上次非正常退出）—— 正常
+    kLoaded,       // 快照载入成功
+    kLoadFailed,   // 快照存在但读取 / 解析失败 —— 异常
+};
 
 // 快照文件魔数标识 "ZBRS"。
 constexpr uint32_t RUNTIME_STATE_MAGIC = 0x5A425253u;

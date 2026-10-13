@@ -3,6 +3,10 @@
 #include <cctype>
 #include <mutex>
 
+#include <butil/iobuf.h>
+
+#include "optical_node.pb.h"
+
 namespace zb::optical_node {
 
 namespace {
@@ -38,6 +42,9 @@ OpticalStorageServiceImpl::OpticalStorageServiceImpl(const OpticalNodeConfig& co
                             config.disc_block_size_bytes,
                             config.max_write_images,
                             config.scheduler_addr) {
+    // 在 Run() 拉起后台线程之前注册完成回调：任何准备任务 READY 都能通知到客户端。
+    optical_node_manager_.SetPreparedFileReadyCallback(
+        [this](const optical_node_manager::PreparedFileReadyEvent& ev) { SendReadReady(ev); });
     optical_node_manager_.Run();
 }
 
@@ -99,35 +106,75 @@ volumemanager::ErrorCode OpticalStorageServiceImpl::SendArchiveMetadata(
     return optical_node_manager_.SendArchiveMetadata(request);
 }
 
-volumemanager::ErrorCode OpticalStorageServiceImpl::RequestAsyncReadFile(
-    const std::string& disk_id,
-    const std::string& image_id,
-    const std::string& inode_id,
-    uint64_t* task_id) {
+volumemanager::ErrorCode OpticalStorageServiceImpl::PrepareRead(const PrepareReadParams& params,
+                                                                uint64_t* task_id) {
     // 上层 disk_id / image_id 带前缀，manager 只用尾部 <seq>。
     std::string volume_id;
-    if (!ExtractTrailingSeq(image_id, &volume_id)) {
+    if (!ExtractTrailingSeq(params.image_id, &volume_id)) {
         return volumemanager::ErrorCode::INVALID_PARAMETER;
     }
     std::string disk_seq;
-    if (!disk_id.empty() && !ExtractTrailingSeq(disk_id, &disk_seq)) {
+    if (!params.disk_id.empty() && !ExtractTrailingSeq(params.disk_id, &disk_seq)) {
         return volumemanager::ErrorCode::INVALID_PARAMETER;
     }
-    return optical_node_manager_.RequestAsyncReadFile(disk_seq, volume_id, inode_id, task_id);
+
+    optical_node_manager::PrepareReadParams manager_params;
+    manager_params.disk_id = disk_seq;
+    manager_params.volume_id = volume_id;
+    manager_params.inode_id = params.inode_id;
+    manager_params.request_id = params.request_id;
+    manager_params.session_id = params.session_id;
+    manager_params.expected_file_size = params.file_size;
+    manager_params.has_file_version = params.has_file_version;
+    manager_params.file_version = params.file_version;
+    return optical_node_manager_.SubmitPrepareTask(manager_params, task_id);
 }
 
-volumemanager::ErrorCode OpticalStorageServiceImpl::ReadObjectByTaskId(uint64_t task_id,
-                                                                      std::string* out,
-                                                                      uint64_t offset,
-                                                                      uint64_t read_size) {
-    return optical_node_manager_.ReadObjectByTaskId(task_id, out, offset, read_size);
+volumemanager::ErrorCode OpticalStorageServiceImpl::AcquireReadSession(
+        uint64_t task_id, optical_node_manager::AcquireReadSessionResult* out) {
+    return optical_node_manager_.AcquireReadSession(task_id, out);
 }
 
-volumemanager::ErrorCode OpticalStorageServiceImpl::ReadObjectByInodeId(const std::string& inode_id,
-                                                                       std::string* out,
-                                                                       uint64_t offset,
-                                                                       uint64_t read_size) {
-    return optical_node_manager_.ReadObjectByInodeId(inode_id, out, offset, read_size);
+volumemanager::ErrorCode OpticalStorageServiceImpl::ReadPreparedFile(
+        uint64_t read_handle, uint64_t offset, uint64_t size, std::string* out,
+        optical_node_manager::ReadPreparedFileResult* result) {
+    return optical_node_manager_.ReadPreparedFile(read_handle, offset, size, out, result);
+}
+
+volumemanager::ErrorCode OpticalStorageServiceImpl::ReleaseReadSession(uint64_t read_handle) {
+    return optical_node_manager_.ReleaseReadSession(read_handle);
+}
+
+volumemanager::ErrorCode OpticalStorageServiceImpl::ReleasePreparedRead(uint64_t task_id) {
+    return optical_node_manager_.ReleasePreparedRead(task_id);
+}
+
+uint64_t OpticalStorageServiceImpl::SubscribeReadEvents(const std::string& client_id,
+                                                        brpc::StreamId server_stream) {
+    return read_event_sessions_.RegisterSession(client_id, server_stream);
+}
+
+void OpticalStorageServiceImpl::SendReadReady(
+        const optical_node_manager::PreparedFileReadyEvent& ev) {
+    zb::rpc::ReadReadyEvent msg;
+    msg.set_request_id(ev.request_id);
+    msg.set_task_id(ev.task_id);
+    msg.set_inode_id(ev.inode_id);
+    msg.set_file_size(ev.file_size);
+    if (ev.has_file_version) {
+        msg.set_has_file_version(true);
+        msg.set_file_version(ev.file_version);
+    }
+
+    std::string bytes;
+    if (!msg.SerializeToString(&bytes)) {
+        // 序列化失败：本阶段仅忽略，不重试。
+        return;
+    }
+    butil::IOBuf buf;
+    buf.append(bytes);
+    // 会话可能已被对端关闭：SendMessage 返回 false，本阶段仅忽略，不重试。
+    read_event_sessions_.SendMessage(ev.session_id, buf);
 }
 
 bool OpticalStorageServiceImpl::IsArchiveEngineReady() const {
@@ -135,6 +182,8 @@ bool OpticalStorageServiceImpl::IsArchiveEngineReady() const {
 }
 
 bool OpticalStorageServiceImpl::Shutdown() {
+    // 先关闭通知会话，停止向客户端推送后再停归档引擎。
+    read_event_sessions_.CloseAll();
     return optical_node_manager_.Shutdown();
 }
 

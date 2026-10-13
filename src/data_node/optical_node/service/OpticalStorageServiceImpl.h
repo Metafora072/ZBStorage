@@ -7,6 +7,7 @@
 #include <optical_node_manager.h>
 
 #include "../config/OpticalNodeConfig.h"
+#include "ReadEventSessionRegistry.h"
 
 namespace zb::optical_node {
 
@@ -52,25 +53,47 @@ public:
     volumemanager::ErrorCode SendArchiveMetadata(
         const optical_node_manager::SendArchiveMetadataRequest& request);
 
-    // 提交异步读任务，立即返回 task_id。入参 disk_id 形如 "optical-disk-<seq>"、
-    // image_id 形如 "img-<seq>"；本层取出尾部 <seq> 后再转发给
-    // OpticalNodeManager::RequestAsyncReadFile。
-    volumemanager::ErrorCode RequestAsyncReadFile(const std::string& disk_id,
-                                                  const std::string& image_id,
-                                                  const std::string& inode_id,
-                                                  uint64_t* task_id);
+    // 提交整文件异步准备任务（对应 OpticalNodeService.PrepareRead）。
+    // 入参与线协议一致：disk_id / image_id 带前缀（本层剥离尾部序号），
+    // session_id 指定完成通知通道。成功（READ_DELAY）只表示受理，不代表文件可读。
+    struct PrepareReadParams {
+        uint64_t session_id{0};
+        std::string request_id;
+        std::string inode_id;
+        std::string disk_id;
+        std::string image_id;
+        uint64_t file_size{0};
+        bool     has_file_version{false};
+        uint64_t file_version{0};
+    };
+    volumemanager::ErrorCode PrepareRead(const PrepareReadParams& params, uint64_t* task_id);
 
-    // 按 task_id 读取 [offset, offset+read_size) 区间；转发给 OpticalNodeManager。
-    volumemanager::ErrorCode ReadObjectByTaskId(uint64_t task_id,
-                                                std::string* out,
-                                                uint64_t offset,
-                                                uint64_t read_size);
+    // 为一次独立打开建立读会话（对应 OpticalNodeService.AcquireReadSession）；
+    // 转发给 OpticalNodeManager，成功时回填 read_handle / file_size / max_read_bytes。
+    volumemanager::ErrorCode AcquireReadSession(uint64_t task_id,
+                                                optical_node_manager::AcquireReadSessionResult* out);
 
-    // 按 inode_id 读取最近一次 RequestAsyncReadFile 产物的区间；转发给 OpticalNodeManager。
-    volumemanager::ErrorCode ReadObjectByInodeId(const std::string& inode_id,
-                                                 std::string* out,
-                                                 uint64_t offset,
-                                                 uint64_t read_size);
+    // 在已建立的读会话上同步读取文件区间（对应 OpticalNodeService.ReadPreparedFile）；
+    // 转发给 OpticalNodeManager，数据追加到 *out 末尾并回填 bytes_read / eof。
+    volumemanager::ErrorCode ReadPreparedFile(uint64_t read_handle,
+                                              uint64_t offset,
+                                              uint64_t size,
+                                              std::string* out,
+                                              optical_node_manager::ReadPreparedFileResult* result);
+
+    // 关闭一次读取会话（对应 OpticalNodeService.ReleaseReadSession）；转发给 OpticalNodeManager。
+    volumemanager::ErrorCode ReleaseReadSession(uint64_t read_handle);
+
+    // 释放本轮准备的准备引用（对应 OpticalNodeService.ReleasePreparedRead）；转发给 OpticalNodeManager。
+    volumemanager::ErrorCode ReleasePreparedRead(uint64_t task_id);
+
+    // 登记客户端的读取完成通知会话（对应 OpticalNodeService.SubscribeReadEvents）。
+    // server_stream 由 brpc 适配层 StreamAccept 取得；返回节点内唯一的 session_id，
+    // 失败返回 0。本层只保存会话，不感知准备任务。
+    uint64_t SubscribeReadEvents(const std::string& client_id, brpc::StreamId server_stream);
+
+    // 通知会话管理组件；供适配层取 handler，以及后续 ReadReady 发送使用。
+    ReadEventSessionRegistry* read_event_sessions() { return &read_event_sessions_; }
 
     // 归档引擎是否已成功启动（状态为 RUNNING）。
     bool IsArchiveEngineReady() const;
@@ -83,13 +106,20 @@ public:
     std::string GetArchiveStatusDetail() const;
 
 private:
+    // 准备任务 READY 后（后台线程回调）把 ReadReady 序列化并写入对应通知 Stream；
+    // 会话已关闭或写入失败时仅记录，本阶段不重试。
+    void SendReadReady(const optical_node_manager::PreparedFileReadyEvent& ev);
+
     mutable std::mutex repl_mu_;
     ReplicationStatusSnapshot repl_;
     // 副本同步超时；当前仅由 ConfigureReplication 写入，后续副本数据同步启用时消费。
     uint32_t replication_timeout_ms_{2000};
 
+    // 读取完成通知通道（session_id -> brpc Stream）；由 SubscribeReadEvents 登记。
+    ReadEventSessionRegistry read_event_sessions_;
+
     // 本节点的归档引擎：接收 MDS 下发的归档文件、驱动镜像封装与刻录，
-    // 并承载数据面异步读（RequestAsyncReadFile / ReadObjectBy*）。
+    // 并承载数据面读链路（PrepareRead / AcquireReadSession / ReadPreparedFile）。
     optical_node_manager::OpticalNodeManager optical_node_manager_;
 };
 

@@ -179,6 +179,7 @@ add_executable(optical_node_server
     src/data_node/optical_node/config/OpticalNodeConfig.cpp
     src/data_node/optical_node/service/OpticalStorageServiceImpl.cpp
     src/data_node/optical_node/service/BrpcOpticalNodeService.cpp
+    src/data_node/optical_node/service/ReadEventSessionRegistry.cpp
     src/data_node/optical_node/server/optical_node_server.cpp
 )
 target_include_directories(optical_node_server
@@ -1025,7 +1026,8 @@ if(UNIX)
 endif()
 
 # 光存储节点归档集成测试：进程内起 fake real_node / scheduler 与真光节点服务，
-# 走完 归档下载 → 压缩 → 卷镜像封装 → 打包汇报 → CD_BURN → 数据面读 / CD_READ 重载 全链路。
+# 走完 归档下载 → 压缩 → 卷镜像封装 → 打包汇报 → CD_BURN → 新 6 接口读链路（订阅/准备/ReadReady/
+# 建会话/区间读/两级释放）与 CD_READ 重载 全链路。
 if(BUILD_TESTING)
     add_executable(optical_node_archive_integration_test
         tests/optical_node/optical_node_archive_integration_test.cpp
@@ -1035,6 +1037,7 @@ if(BUILD_TESTING)
         src/data_node/optical_node/config/OpticalNodeConfig.cpp
         src/data_node/optical_node/service/OpticalStorageServiceImpl.cpp
         src/data_node/optical_node/service/BrpcOpticalNodeService.cpp
+        src/data_node/optical_node/service/ReadEventSessionRegistry.cpp
     )
     target_include_directories(optical_node_archive_integration_test
         PRIVATE
@@ -1074,8 +1077,9 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         # 单一综合场景（56 卷：5 张完整光盘 + 尾盘，小容量档位触发背压与 LRU 淘汰）：
         # 一次运行覆盖 批次形态 → 归档下载 → 压缩封装 → 打包汇报 → 封盘 → 刻录释放 →
-        # 光盘读回 → 满载淘汰与重载 → 正常关机落盘与重启恢复（在途任务继续推进）。
-        # 光盘仿真时长不可压缩，56 卷同档位实测 20~35 分钟，故超时留足余量。
+        # 新 6 接口读链路（订阅/准备/ReadReady/建会话/区间读/两级释放）与光盘读回 → 缓存命中
+        # → 读会话与引用生命周期 → 满载淘汰与重载 → 正常关机落盘与重启恢复（在途准备任务继续推进）。
+        # 光盘仿真时长不可压缩，56 卷同档位实测约 9 分钟（533s），超时 3600s 留足余量。
         add_test(NAME optical_node
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/optical_node/run_optical_node_archive_test.py
                 --driver $<TARGET_FILE:optical_node_archive_integration_test>)

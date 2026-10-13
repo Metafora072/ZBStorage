@@ -3,18 +3,21 @@
 进程内起真光节点服务 + 假 real_node / 假 scheduler，通过 brpc 走完
 **归档下发（四种批次形态）→ 下载侧背压节流 → 256KiB 分片下载重组 → 压缩 → 卷镜像封装 → 打包汇报
 → 按容量积攒 → 封印为光盘 → CD_BURN 刻录 → 物化 vdisc → 逐个释放写镜像 → 刻录汇报
-→ 数据面读 / CD_READ 重载 → 缓存命中 → LRU 淘汰与重载
-→ 正常关机落盘（log/runtime_state_snapshot）→ 同 root 重启恢复 → 在途读任务继续推进到终态**
-全链路，断言只依赖文件系统产物、RPC 返回码与控制台汇报行，不使用固定 sleep。
+→ 数据面读（新 6 接口：SubscribeReadEvents → PrepareRead → ReadReady 通知 → AcquireReadSession
+→ ReadPreparedFile 区间读 → ReleaseReadSession / ReleasePreparedRead）/ CD_READ 重载 → 缓存命中
+→ 读会话与引用生命周期（多次独立打开 / EOF 与随机重读 / 两级释放）→ LRU 淘汰与重载
+→ 正常关机落盘（log/runtime_state_snapshot）→ 同 root 重启恢复 → 在途准备任务继续推进到可读**
+全链路，断言只依赖文件系统产物、RPC 返回码、通知 Stream 消息与控制台汇报行，不使用固定 sleep。
 
 ctest 只注册 **一个综合用例**（`optical_node`），一次运行覆盖以上全部环节。
 
 ## 一、前置条件
 
 - 已配置好构建环境（brpc / protobuf / gflags / zlib），且 `include(CTest)` 生效（顶层 `CMakeLists.txt` 已具备）。
-- 一份 jpg 语料目录，默认 `~/WR/testWrite`（实测 13 张、合计 30MB）。
-  jpg 是**难压缩**数据，用来避免高压缩率导致镜像填不满；脚本保证同一归档文件内不复用同一张 jpg。
-  可用 `--input-dir` 或环境变量 `ZBSTORAGE_OPTICAL_CORPUS` 指定其他目录。
+- **无需任何外部语料**：驱动脚本每次都用 `prepare_archive_corpus.py` 在进程内合成语料。
+  语料不再是 jpg，而是**确定性合成的高熵文件**（随机字节主体 + 少量可压缩填充），由 `--target-ratio`
+  把 zlib level 9 的实测压缩比稳定控制在 **0.97** 附近——既避免高压缩率导致镜像填不满，
+  又不再依赖 `~/WR/testWrite` 之类的 jpg 目录。
 
 ## 二、测试规模（固定参数）
 
@@ -23,15 +26,15 @@ ctest 只注册 **一个综合用例**（`optical_node`），一次运行覆盖�
 | `volume_size_bytes` | 10 MiB（10485760） |
 | `size_threshold` | 0.9（打包触发线 9437184 字节） |
 | `disc_capacity_bytes` | 100 MiB（104857600） |
-| `standard_images_per_disc` | 10（100 MiB 盘恰好容纳 10 个 ≈10.1 MiB 的镜像） |
+| `standard_images_per_disc` | 10（100 MiB 盘恰好容纳 10 个 ≈9.7 MiB 的镜像） |
 | `disc_block_size_bytes` | 2048 |
-| 每卷文件数 / 单文件大小 | 10 / 1 MiB（实测压缩率 0.9837，10 个文件恰好越过触发线） |
+| 每卷文件数 / 单文件大小 | 10 / 1 MiB（实测压缩率 0.97，10 个文件恰好越过触发线） |
 | 对象分片大小 | 256 KiB（4 片/文件，覆盖下载侧多分片重组） |
 | `available_id_count`（volume/disk 共用） | 5 |
 | `capacity_in_images` / `max_write_images` | 14 / 12（小容量档位：写链路必然触发背压，读入若干已刻录卷后必然满载触发淘汰） |
 | 卷数 | 56（5 张完整光盘 + 尾盘） |
 | inode 起始号 | 1000（56 卷 × 10 文件 = 1000~1559） |
-| 数据面读分片 | 4 MiB |
+| 读会话单次读取上限（max_read_bytes） | 4 MiB |
 
 容量约束的不变式：**单盘镜像数(10) < `MAX_WRITE_IMAGES`(12) < `CAPACITY_IN_IMAGES`(14)**。
 下限侧违反会让节点永远攒不满一张盘（不封印 → 不释放 → 下载活锁）；上限侧违反会让背压来不及生效、
@@ -41,10 +44,10 @@ ctest 只注册 **一个综合用例**（`optical_node`），一次运行覆盖�
 
 | 场景 | 卷数 | 档位（容量 / 写镜像上限） | 覆盖内容 | 墙钟（实测） |
 | --- | --- | --- | --- | --- |
-| `optical_node` | 56 | 14 / 12 | 写链路与四种批次形态、打包/刻录汇报、5 张光盘共存与尾盘、下载背压的触发与恢复、CD_READ 重载与缓存命中、`image/` 满载后的 LRU 淘汰与重载、正常关机落盘与重启恢复（在途读任务继续推进） | 约 9.5 分钟（563s） |
+| `optical_node` | 56 | 14 / 12 | 写链路与四种批次形态、打包/刻录汇报、5 张光盘共存与尾盘、下载背压的触发与恢复、新 6 接口读链路（订阅 → 准备 → ReadReady → 建会话 → 区间读 → 两级释放）与 CD_READ 重载、缓存命中、读会话与引用生命周期（多次独立打开 / EOF 与随机重读）、`image/` 满载后的 LRU 淘汰与重载、正常关机落盘与重启恢复（在途准备任务继续推进到可读） | 约 9 分钟（533s） |
 
 墙钟几乎全部来自光盘库仿真的固定时长（装盘 12s、退盘 3s、攫取 2s、读 0.5s+100MB/s、刻录 1s+20MB/s），
-产线未提供测试旋钮，**不可压缩**；单次 CD_READ 约 20~22s，故 12 次读回就占 4 分钟以上。
+产线未提供测试旋钮，**不可压缩**；单次 CD_READ 约 20~32s，故 12 次 A3 读回加 A5/A8 的重载就占 6 分钟以上。
 
 ## 三、构建
 
@@ -84,16 +87,15 @@ python3 tests/optical_node/run_optical_node_archive_test.py \
 | --- | --- |
 | `--driver` | C++ 测试二进制路径，**必须是绝对路径**（脚本会把工作目录切到工作目录下再执行） |
 | `--work-dir` | 工作目录，默认 `tests/optical_node/results/optical_node-<时间戳>` |
-| `--input-dir` | jpg 语料来源目录，默认取 `ZBSTORAGE_OPTICAL_CORPUS`，再缺省 `~/WR/testWrite` |
 | `--keep` | 成功时也保留 `corpus/` 与 `archive/`（默认成功后只保留 `output.log`，失败则全部保留） |
 
-卷数固定为 56（脚本内置），无需也无法通过参数改变。
+卷数固定为 56（脚本内置），无需也无法通过参数改变。脚本不再需要 jpg 语料目录，也没有「语料缺失 → 跳过」分支，
+会先在 `<work>/corpus/` 内合成语料再运行二进制。
 
-### 方式 C：直接跑二进制（需自备语料）
+### 方式 C：直接跑二进制（自行生成语料）
 
 ```bash
 python3 tests/optical_node/prepare_archive_corpus.py \
-  --input-dir ~/WR/testWrite \
   --out-dir tests/optical_node/results/corpus-manual \
   --volumes 56
 
@@ -103,7 +105,8 @@ python3 tests/optical_node/prepare_archive_corpus.py \
 ```
 
 语料脚本参数：`--volumes`（卷数）、`--files-per-volume`（默认 10）、`--file-size-mb`（默认 1）、
-`--object-unit-kib`（默认 256）、`--inode-base`（默认 1000）、`--seed`（默认 20260925，确定性洗牌）。
+`--object-unit-kib`（默认 256）、`--inode-base`（默认 1000）、`--seed`（默认 20260925，确定性随机）、
+`--target-ratio`（目标压缩比，默认 0.97）。
 加 `--selftest` 只打印实测压缩率与预测打包分组、不落盘：
 
 ```bash
@@ -127,8 +130,8 @@ python3 tests/optical_node/prepare_archive_corpus.py --selftest
 │   └── real-1/disk0/obj-<inode>-<index>.dat   # 每个文件 4 个 256KiB 分片
 └── archive/                      # 光节点工作目录
     ├── input/  temp/             # 归档中间文件（最终应为空）
-    ├── image/                    # 卷镜像平铺（容量 14）：volume_<id>.vimg ≈10.1MiB
-    ├── disc_sim/                 # 光盘库模拟区（已物化光盘本体）：disc_<id>.vdisc ≈100MiB
+    ├── image/                    # 卷镜像平铺（容量 14）：volume_<id>.vimg ≈9.7MiB
+    ├── disc_sim/                 # 光盘库模拟区（已物化光盘本体）：disc_<id>.vdisc ≈97MiB
     ├── read/                     # 数据面读产物（读完应被清理）
     ├── meta/                     # pending_disc_meta（未封盘集合）、node_discs_meta（已刻录索引，持久）；
     │                             # disc_<disk_id>_meta 为**临时**中间态，刻录 + 索引完成后即被删除
@@ -161,15 +164,16 @@ python3 tests/optical_node/prepare_archive_corpus.py --selftest
 
 | 编号 | 测试点 | 测试目标 | 主要断言 |
 | --- | --- | --- | --- |
-| `A0` | 环境与配置就绪 | 被测光节点与全部仿真对手方、语料分组真值、档位参数可信，后续断言才有前提 | 分组非空、档位满足「单盘镜像数 < 背压上限 < 容量」、`IsArchiveEngineReady` 为真、三个 brpc server 均已监听、archive 各子目录存在 |
+| `A0` | 环境与配置就绪 | 被测光节点与全部仿真对手方、语料分组真值、档位参数可信，后续断言才有前提 | 分组非空、档位满足「单盘镜像数 < 背压上限 < 容量」、`IsArchiveEngineReady` 为真、`SubscribeReadEvents` 建立通知通道并返回 >0 的 `session_id`、三个 brpc server 均已监听、archive 各子目录存在 |
 | `A1.i` | 第 i 卷：归档下发 → 压缩封装 → 打包汇报 | 写链路端到端：按 256KiB 分片下载 → 压缩累加 → 达阈值封装 → 上报 → 写镜像留在 `image/` 等刻录释放；批次切分（形态写在标题里）不应改变卷分组 | 汇报 `count` 与 inode 集合 == zlib9 预测分组、`volume_id` 全局唯一、`image/` 出现该写镜像且体积 ∈ (0, 10MiB] |
 | `A2` | 下载完整性与多分片重组 | 节点没有漏读或重复读 real_node 的对象，且逐片取回、按绝对偏移重组 | `ResolveFileRead` 次数 == 文件数、`ReadObject` 次数 == 文件数 × 4、分片大小均为 256KiB、每文件 4 片 |
-| `A3.i` | 第 i 卷：数据面读 + CD_READ 重载 | 镜像已刻录（不在 `image/`）时读请求触发 CD_READ，按 `node_discs_meta` 记录的偏移从 vdisc 复制回 `image/` 并读通，末片后任务进 FINISH | 读回字节与语料逐字节一致、镜像回到 `image/`、vdisc 数量不变（只复制不搬移）、`ReadObjectByInodeId` 返回 `MDS_NOT_FOUND`、`image/` 镜像数 ≤ 容量 |
-| `A4.i` | 第 i 卷：缓存命中 | 同卷第二次读不重复走光盘装载（省掉一次 20s+ 的 CD_READ） | 耗时 < 3000ms、`image/` 与 `disc_sim/` 快照前后完全不变、数据仍与语料一致 |
+| `A3.i` | 第 i 卷：数据面读（新 6 接口）+ CD_READ 重载 | `PrepareRead` 立即可受理并返回 `task_id`；准备完成后节点经通知 Stream 主动推送 `ReadReady`；客户端据 `task_id` 建立读会话、按文件绝对偏移区间读取，镜像被 CD_READ 从 vdisc 复制回 `image/` 并读通 | `PrepareRead` 返回 `OPTICAL_OK`+`task_id`、收到 `request_id/task_id/inode_id/file_size` 匹配的 `ReadReady`、`AcquireReadSession` 返回 `max_read_bytes=4MiB` 与正确 `file_size`、读回字节与语料逐字节一致、镜像回到 `image/`、vdisc 数量不变（只复制不搬移）、`image/` 镜像数 ≤ 容量 |
+| `A4.i` | 第 i 卷：缓存命中 | 同卷第二次读不重复走光盘装载（省掉一次 20s+ 的 CD_READ） | 「`PrepareRead` → `ReadReady`」耗时 < 3000ms（实测 1~2ms）、`image/` 与 `disc_sim/` 快照前后完全不变、数据仍与语料一致 |
+| `A9` | 读会话与引用生命周期 | 同一 READY 任务可多次独立 `AcquireReadSession`（各自持读取引用）；EOF 只表示本次到达文件末尾（不关会话、不释放缓存）；支持随机读/重复读/先读尾再读头；超上限的单次请求被拒；`ReleaseReadSession` 只减读取引用（close 后可再 open），`ReleasePreparedRead` 才撤销新打开资格 | 两次 `AcquireReadSession` 得到不同 `read_handle`、两个句柄都能读对；尾区间 `eof=true`、`offset≥file_size` 返回 0 字节且 `eof=true`、`size=0` 返回 0 字节且 `eof=false`；单次 `size>max_read_bytes` 返回 `OPTICAL_INVALID_ARGUMENT`；关一个句柄另一个仍可读；全关后再 `Acquire` 仍成功；`ReleasePreparedRead` 后再 `Acquire` 返回 `OPTICAL_NOT_FOUND` |
 | `A5` | LRU 淘汰与重载 | `image/` 满 `capacity_in_images` 后读新卷应换出一个 READ 镜像，且被换出的卷仍可重载读通——淘汰只影响缓存层级，不影响数据可用性 | 满载后读新卷仍能读通、`image/` 恒为 14、`disc_sim/` 不变、刚加载的卷保留、victim 恰为读前读后差集且 ≠ 刚加载的卷、victim 重载读通并回到 `image/` |
 | `A6` | 归档中间态清理 | 流程结束不残留中间产物 | `input/` 无 `.archive`、`log/` 目录存在 |
 | `A7` | 光盘封印与刻录（跨卷汇总） | 镜像按容量积攒，装不下下一个时才把当前集合封印成一张光盘（提交 `DISC_BURN`，刻录完成后物化 vdisc 并逐个释放 `image/` 中的写镜像、上报）；未装满的尾盘继续留在 pending | 写阶段 `image/` 峰值 < 容量（背压生效、未触发 `VOLUME_FULL`）、每盘 `count` == `image_ids` 数量、**`node_discs_meta` 追加块数 == 汇报盘数**、**`meta/` 无残留 `disc_<id>_meta`**、vdisc 存在且 ≤ 盘容量、`disc_sim` vdisc 数 == 已刻录盘数、已刻录镜像恰为打包顺序的前缀、尾盘镜像仍在 `image/` |
-| `A8` | 正常关机落盘与重启恢复（在途任务继续推进） | `Shutdown()` 把运行期内存态落到 `log/runtime_state_snapshot`；同 root 重启后读回并让关机前未完成的任务继续推进到终态——节点重启不丢在途工作 | 关机快照生成且非空、状态切 `STOPPED`；重启后 `RUNNING` 且原因含 `runtime state restored`、快照被消费为 `.loaded`、`image/` 与 `disc_sim/` 前后完全一致、`node_discs_meta` 块数与字节数不变、`meta/` 无残留 `disc_<id>_meta`；**在途读任务用原 task_id 仍能读回完整数据**（字节与语料一致）且末片后进 FINISH |
+| `A8` | 正常关机落盘与重启恢复（在途准备任务继续推进） | `Shutdown()` 把运行期内存态落到 `log/runtime_state_snapshot`；同 root 重启后读回并让关机前未完成的准备任务继续推进到可读——节点重启不丢在途工作（通知会话 / 读会话表为进程内易失态，不落盘） | 关机快照生成且非空、状态切 `STOPPED`；重启后 `RUNNING` 且原因含 `runtime state restored`、快照被消费为 `.loaded`、`image/` 与 `disc_sim/` 前后完全一致、`node_discs_meta` 块数与字节数不变、`meta/` 无残留 `disc_<id>_meta`；**在途任务用原 `task_id` 经 `AcquireReadSession` 轮询到 `OPTICAL_OK` 后仍能读回完整数据**（字节与语料一致），且不补发 `ReadReady` |
 | `B1` | 批次形态覆盖（下发切分不改变卷分组） | 批次边界（单文件小批次 / 跨卷边界批次 / 大小混合批次）不应改变卷分组、不应遗漏或重复文件；顺带覆盖「多个 MDS 批次累计成一轮下载」（一轮配额 = 卷镜像容量） | 四种形态均出现、单文件批次 ≥10、跨卷边界批次 ≥2、第 1 卷由 10 个单文件批次累计而成、汇报数 == 卷数、全部 inode 无遗漏无重复 |
 | `B2` | 背压触发与恢复 | 写镜像数达 `MAX_WRITE_IMAGES` 时暂停下载、不把 `image/` 堆到硬上限；刻录完成释放写镜像后应唤醒被阻塞的下载线程（不能睡死） | 采样到 `throttled=true`、写镜像数确实堆到上限、过冲 ≤1 个镜像、触发原因覆盖「写镜像达上限」、随后采样到 `throttled=false`（写镜像占用回落） |
 
@@ -177,15 +181,55 @@ python3 tests/optical_node/prepare_archive_corpus.py --selftest
 （仅把绝对路径缩写成 `.../archive/…`、把过长的文件清单用 `…` 折叠）：
 
 ```text
-[CASE] A3.1  第 1/12 卷：数据面读 + CD_READ 重载
-  [STEP] 读 volume_1 inode=1009（镜像在光盘库，预期触发一次 CD_READ 装载）
-    [PASS] 读任务就绪（inode=1009，镜像已从光盘库装载完成） —— 已在 23507ms 内满足
-    [PASS] 读回数据与语料逐字节一致（inode=1009，共 1048576 字节，耗时 23507ms）
-    [PASS] 末片读完后任务进入 FINISH（ReadObjectByInodeId 返回 MDS_NOT_FOUND，inode=1009）
+[CASE] A0  环境与配置就绪
+    [PASS] 被测光节点 Run() 成功且状态为 RUNNING
+    [PASS] 三个 brpc server 均已监听（光节点 / 假 real_node / 假 scheduler）
+  [STEP] 客户端 SubscribeReadEvents 建立准备完成通知通道（附带 brpc Stream）
+    [PASS] SubscribeReadEvents 成功且返回有效 session_id（=1）
+[CASE-END] A0 result=PASS checks=6 failed=0
+
+[CASE] A3.1  第 1/12 卷：数据面读（新 6 接口）+ CD_READ 重载
+  [STEP] PrepareRead volume_1 inode=1009（镜像在光盘库，预期触发一次 CD_READ 装载）
+    [PASS] 读回数据与语料逐字节一致（inode=1009，共 1048576 字节，准备耗时 20177ms，总耗时 20180ms）
+    [PASS] AcquireReadSession 返回 max_read_bytes=4MiB（actual=4194304 expected=4194304）
+    [PASS] AcquireReadSession 返回 file_size 与语料一致（actual=1048576 expected=1048576）
     [PASS] CD_READ 后镜像回到 image_dir（volume_1）
     [PASS] 光盘文件持久保留（读回只复制区间，不搬移/删除 vdisc）（actual=5 expected=5）
     [PASS] image_dir 镜像数不超过容量上限（当前 8 / 14）
 [CASE-END] A3.1 result=PASS checks=6 failed=0
+
+[CASE] A4.1  第 1/12 卷：缓存命中（镜像已在 image_dir，不应再次触发 CD_READ）
+  [STEP] PrepareRead 同卷第二个 inode=1008，读前快照 image=[volume_1.vimg,…] disc_sim=[disc_1.vdisc,…]
+    [PASS] 缓存命中读回数据与语料一致（inode=1008）
+    [PASS] 缓存命中「PrepareRead → ReadReady」耗时 < 3000ms（实测 1ms，远小于一次 CD 装载）
+    [PASS] 缓存命中前后 image_dir / disc_sim 内容不变
+[CASE-END] A4.1 result=PASS checks=3 failed=0
+
+[CASE] A8  正常关机落盘与重启恢复（在途准备任务继续推进）
+    [PASS] 重启时确实从快照恢复了运行期状态（状态原因含 runtime state restored）
+    [PASS] 快照已被消费为 runtime_state_snapshot.loaded（不会重复重放）
+    [PASS] node_discs_meta 追加块数在重启前后一致（恢复未重复追加）（actual=5 expected=5）
+  [STEP] 重启后重新 SubscribeReadEvents（通知会话不落盘，需重新建立）
+  [STEP] 以原 task_id=566 轮询就绪并读回：验证在途任务在重启后被恢复并推进到可读
+    [PASS] 恢复任务就绪（AcquireReadSession 返回 OPTICAL_OK，task_id=566） —— 已在 31878ms 内满足
+    [PASS] 在途准备任务在重启后仍能恢复并读回完整数据、与语料逐字节一致（inode=1129，准备耗时 31878ms）
+    [PASS] 重启后未对恢复任务补发 ReadReady（恢复任务通知目标 session_id 不落盘，为 0）
+    [PASS] 重启后完成读回的卷镜像落在 image_dir（volume_13）
+[CASE-END] A8 result=PASS checks=16 failed=0
+
+[CASE] A9  读会话与引用生命周期（多次独立打开 / EOF 与随机重读 / 两级释放）
+  [STEP] PrepareRead volume_12 inode=1119（镜像已在 image_dir，准备应快速完成）
+    [PASS] 收到匹配的 ReadReady（task_id=617）
+    [PASS] 同一 READY 任务两次 AcquireReadSession 得到两个不同 read_handle（=26/27）
+    [PASS] 先读尾部区间成功且 eof=true（offset=1044480）
+    [PASS] 再读头部区间成功且 eof=false（随机/逆向读取不依赖隐式游标）
+    [PASS] 重复读同一区间返回一致字节（EOF 不释放会话、不改变引用）
+    [PASS] offset≥file_size 返回 0 字节且 eof=true
+    [PASS] size=0 返回 0 字节且 eof=false
+    [PASS] 单次 size>max_read_bytes 返回 OPTICAL_INVALID_ARGUMENT（size=4194305）
+    [PASS] 关闭全部读会话后再次 AcquireReadSession 仍成功（read_handle=28，准备引用尚在）
+    [PASS] ReleasePreparedRead 后再 AcquireReadSession 被拒（不再允许新会话）
+[CASE-END] A9 result=PASS checks=19 failed=0
 ```
 
 `B1` / `B2`（写链路的下发切分与下载背压）的观测事实：
@@ -220,31 +264,29 @@ python3 tests/optical_node/prepare_archive_corpus.py --selftest
 
 ```text
 [CASE] A5  LRU 淘汰与重载（image_dir 满载后读入新卷）
-  [STEP] 读前快照 .../archive/image/ => [volume_10.vimg(10269000) volume_11.vimg(10304268) … volume_9.vimg(10288600) ]；.../archive/disc_sim/ => [disc_1.vdisc(103112704) … disc_5.vdisc(103192576) ]
+  [STEP] 读前快照 .../archive/image/ => [volume_10.vimg(10176826) … volume_9.vimg(10176818) ]；.../archive/disc_sim/ => [disc_1.vdisc(101791744) … disc_5.vdisc(101791744) ]
     [PASS] 读满后 image_dir 镜像数量等于 capacity_in_images（actual=14 expected=14）
     [PASS] 待读入的卷已从 image_dir 释放（volume_50，读回必须走 CD_READ）
   [STEP] 读 volume_50 inode=1499（image_dir 已满，预期淘汰一个 READ 受害者）
-    [PASS] 读任务就绪（inode=1499，镜像已从光盘库装载完成） —— 已在 24704ms 内满足
     [PASS] 满载后读入新卷仍可读通（字节与语料一致）
-  [STEP] 读后快照 image=[volume_10.vimg,volume_11.vimg,…,volume_50.vimg,…] disc_sim=[disc_1.vdisc,…,disc_5.vdisc]
+  [STEP] 读后快照 image=[volume_10.vimg,…,volume_50.vimg,…] disc_sim=[disc_1.vdisc,…,disc_5.vdisc]
     [PASS] 淘汰后 image_dir 镜像数量保持不变（actual=14 expected=14）
     [PASS] 淘汰只删缓存副本，disc_sim 中的 vdisc 不变
     [PASS] 刚加载的卷保留在 image_dir（volume_50）
     [PASS] 恰好淘汰一个 READ 受害者（原 image_dir 中的镜像）（actual=1 expected=1）
     [PASS] 被淘汰的不是刚加载的卷（victim=5，新卷=50）
   [STEP] 被淘汰的镜像 volume_5，重新读以验证可从 vdisc 重新提取
-    [PASS] 读任务就绪（inode=1049，镜像已从光盘库装载完成） —— 已在 31357ms 内满足
     [PASS] 被淘汰卷重载后可读通（字节与语料一致）
     [PASS] 重载后被淘汰卷回到 image_dir（volume_5）
     [PASS] 重载后 vdisc 仍持久保留（actual=5 expected=5）
-[CASE-END] A5 result=PASS checks=13 failed=0
+[CASE-END] A5 result=PASS checks=11 failed=0
 ```
 
 实测汇总（机器负载不同会有差异；总耗时指 C++ 二进制内部计时，不含语料生成）：
 
 | 用例 | 测试点 | 检查 | 失败 | 总耗时 |
 | --- | --- | --- | --- | --- |
-| `optical_node`（56 卷） | 88（A0 + A1×56 + A2 + A8 + A3×12 + A4×12 + A5 + A6 + A7 + B1 + B2） | 528 | 0 | 587s |
+| `optical_node`（56 卷） | 89（A0 + A1×56 + A2 + A7 + A8 + A3×12 + A4×12 + A9 + A5 + A6 + B1 + B2） | 534 | 0 | 533s |
 
 > 实测覆盖了「`disc_<id>_meta` 刻录完成后删除」：A7 断言 `node_discs_meta` 追加块数 == 汇报盘数（5）且
 > `meta/` 无残留 `disc_<id>_meta`，A8 断言重启后仍无残留、索引块数与字节数均不变。
@@ -268,9 +310,16 @@ python3 tests/optical_node/prepare_archive_corpus.py --selftest
 - `volume_id`（= MDS 的 image_id）与 `disk_id`（= MDS 的 disc_id）由节点本地递增生成，
   MDS 的 `AllocateAvailableImageId` / `AllocateAvailableDiscId` 未实现。
 - 重启恢复只覆盖**正常关机**（`Shutdown()`），且只由信号路径触发：`Shutdown()` 未通过 brpc 暴露，
-  进程内 `Shutdown()` → 再 `Run()` 也不支持（队列 `Close()` 后不重开）。
+  进程内 `Shutdown()` → 再 `Run()` 也不支持（队列 `Close()` 后不重开）；测试是「同进程内重建一个新实例」，
+  并非复用同一实例再 `Run()`。
   未被持久化的运行态：`WriteObject` 分片上传中间态（客户端需重传）、`cd_manager_sim` 的活跃任务
-  （刻录进度丢弃，重启后从零重演）、下载轮次配额。`kill -9` / 掉电没有快照，退化为「无快照启动」。
+  （刻录进度丢弃，重启后从零重演）、下载轮次配额，以及**通知会话表与读会话表**（进程内易失态）。
+  故重启后需重新 `SubscribeReadEvents`；恢复任务的通知目标 `session_id` 不落盘，不会补发 `ReadReady`
+  （A8 以「轮询 `AcquireReadSession` 得到 `OPTICAL_OK`」作为就绪判据）。`kill -9` / 掉电没有快照，
+  退化为「无快照启动」。
+- 新读接口语义尚未完全覆盖：`PrepareRead` 的可选 `file_version` 只走了「未提供」分支
+  （测试不传版本，`has_file_version=false`），未验证携带版本时 `ReadReady` 的回传；
+  也未断言「同一 `request_id` 恰好收到一次」`ReadReady`（重复通知未验证）。
 - `prepare_archive_corpus.py` 的 `--volumes` 默认值仍是 26，与测试用的 56 不一致（驱动脚本每次都显式传参，
   只有手工调用该脚本时才需注意）。
 
@@ -278,7 +327,7 @@ python3 tests/optical_node/prepare_archive_corpus.py --selftest
 
 | 现象 | 处理 |
 | --- | --- |
-| ctest 直接显示 `Skipped` | 语料目录不存在（退出码 77）。用 `--input-dir` 或 `ZBSTORAGE_OPTICAL_CORPUS` 指定 jpg 目录 |
+| A3/A4/A9 报「未在超时内收到 ReadReady」 | 先确认 A0 的 `SubscribeReadEvents` 返回了 >0 的 `session_id`；再确认 `PrepareRead` 用的就是该 `session_id`、等待的 `request_id` 与提交的一致；节点侧确认准备完成回调已在 `Run()` 之前注册（否则后台线程启动后回调缺失会丢通知） |
 | 脚本报 `No such file or directory: '<driver>'` | `--driver` 给了相对路径；改用绝对路径，或用 ctest 运行 |
 | 跑满 TIMEOUT | 机器负载高导致 CD 仿真叠加；确认串行执行（不要 `ctest -j` 并发），并留足磁盘（语料 + 5 张 vdisc + `image/` 峰值约 1.5GB） |
 | 断言失败 | 工作目录已自动保留：看 `[ReportFilesPackedToImage]` / `[ReportImagesBurnedToDisc]` 上报行、`GetArchiveStatusDetail()` 输出（含 `backpressure=(throttled=… write_images=x/y input_pending=a/b)` 快照）与 `image/`、`disc_sim/`、`meta/`、`log/` 目录快照 |
@@ -287,4 +336,4 @@ python3 tests/optical_node/prepare_archive_corpus.py --selftest
 | A8 报「快照未被消费」或「状态原因不含 runtime state restored」 | 检查 `archive/log/`：正常应是 `runtime_state_snapshot` 已改名为 `.loaded`；若残留 `runtime_state_snapshot`，说明加载失败（`GetArchiveStatusDetail()` 的 sidecar 段会给出失败原因） |
 | A7 报「meta/ 有残留 disc_<id>_meta」 | 该盘已封印但未完成「刻录 + 索引」：看 `[ReportImagesBurnedToDisc]` 是否缺该 disc_id、`meta/node_discs_meta` 块数是否少了、`disc_sim/` 是否有对应 `.vdisc`（或半截 `.tmp`） |
 | 想复盘某次运行 | 日志在 `tests/optical_node/results/optical_node-<时间戳>/output.log`；`ctest` 方式下按运行时间挑最新目录 |
-| `expected_pack_plan.tsv` 与实际上报的 inode 集合不符 | python 与 libz 版本差异导致压缩率漂移；用 `--selftest` 对比实测 ratio（正常约 0.9837，单文件约 0.9785） |
+| `expected_pack_plan.tsv` 与实际上报的 inode 集合不符 | python 与 libz 版本差异导致压缩率漂移；用 `--selftest` 对比实测 ratio（目标 0.97，实测约 0.9704） |

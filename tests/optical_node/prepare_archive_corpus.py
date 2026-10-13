@@ -2,6 +2,11 @@
 # -*- coding: utf-8 -*-
 """为光存储节点归档集成测试生成语料（仅使用 Python 标准库）。
 
+本脚本不再依赖外部 jpg 语料，而是**直接合成高熵文件**：文件主体为确定性伪随机
+字节（近似不可压缩），尾部混入约 (1 - 目标压缩比) 的可压缩填充，使 zlib level 9
+的实测压缩比稳定落在目标值（默认 0.97）附近。这样既去掉了对 ~/WR/testWrite 的
+依赖，又能让「每卷 10 个 1 MiB 文件」的封装分组保持稳定。
+
 本脚本模拟"真实节点(real node)"磁盘上待归档的文件布局，并基于 zlib 逐字节
 复刻被测节点的打包行为，产出"期望打包计划"供测试断言。
 
@@ -11,6 +16,9 @@ volume_manager/volume_manager.cpp::AddFileToCollect）：
     2. 单文件压缩后 > 卷大小 -> VOLUME_FULL；
     3. pending + 压缩后大小 > 卷大小 -> 先打包当前分组（溢出预打包分支）；
     4. 累加 pending，若 pending / volume_size >= size_threshold -> 打包并清零。
+
+压缩比口径：压缩比 = 压缩后大小 / 原始大小。目标 0.97 时，每卷 10 个 1 MiB 文件
+压缩后 ≈ 9.7 MiB（≥ 0.9 × 10 MiB 触发线、< 10 MiB 卷大小），故每组恰好 10 个文件。
 """
 
 import argparse
@@ -23,55 +31,32 @@ import zlib
 VOLUME_SIZE = 10 * 1024 * 1024
 SIZE_THRESHOLD = 0.9
 
-# 跳过测试的约定退出码（ctest SKIP_RETURN_CODE）
-SKIP_RETURN_CODE = 77
+# 目标压缩比（压缩后 / 原始）。0.97 使每卷恰好装 10 个 1 MiB 文件。
+DEFAULT_TARGET_RATIO = 0.97
 
 
-def is_jpeg(name: str) -> bool:
-    lower = name.lower()
-    return lower.endswith(".jpg") or lower.endswith(".jpeg")
+def build_high_entropy_content(size: int, seed: int, target_ratio: float) -> bytes:
+    """生成大小固定、zlib(level 9) 压缩比受控为 ~target_ratio 的确定性内容。
 
-
-def collect_jpegs(input_dir: str):
-    """收集并按文件名排序所有 jpg/jpeg。"""
-    if not os.path.isdir(input_dir):
-        return []
-    names = [n for n in os.listdir(input_dir) if is_jpeg(n)]
-    names.sort()
-    blobs = []
-    for n in names:
-        path = os.path.join(input_dir, n)
-        if os.path.isfile(path):
-            with open(path, "rb") as fp:
-                blobs.append(fp.read())
-    return blobs
-
-
-def build_file_content(jpg_blobs, target_size: int, file_seed: int) -> bytes:
-    """按确定性但依赖数据顺序的方式拼接 jpg 得到目标大小的文件内容。
-
-    关键点：同一个归档文件内**不复用同一张 jpg**（用 seed+f 洗牌后依次各取一次，
-    不足时用 seed+f+1000*k 重新洗牌继续）。因为 jpg 本身已压缩，deflate 的匹配
-    窗口只有 32 KiB，只要单个文件内不出现相隔 32 KiB 以内的重复字节块，压缩率就
-    稳定在 ~1.0；若在同一位置重复使用同一张 jpg，重复块会落入窗口内被 deflate
-    匹配，压缩率骤降，文件就永远填不满卷，整个打包计划随之漂移。
+    构成：
+      - 前 (target_ratio * size) 字节为确定性伪随机字节（deflate 无法找到匹配，
+        近似原样存储，贡献 target_ratio 的压缩比）；
+      - 其余字节为一段可压缩填充（同一字节的连续重复，deflate 可压到近乎 0）。
+    因此整体压缩后大小 ≈ target_ratio * size，压缩比 ≈ target_ratio。
     """
-    out = bytearray()
-    k = 0
-    while len(out) < target_size:
-        # 第一次用 seed+f，后续每次重新洗牌用 seed+f+1000*k（k>=1）
-        rnd = random.Random(file_seed + 1000 * k)
-        order = list(range(len(jpg_blobs)))
-        rnd.shuffle(order)
-        for idx in order:
-            if len(out) >= target_size:
-                break
-            out.extend(jpg_blobs[idx])
-        k += 1
-    return bytes(out[:target_size])
+    if size < 0:
+        raise ValueError("size 不能为负")
+    random_bytes = int(size * target_ratio)
+    if random_bytes > size:
+        random_bytes = size
+    rnd = random.Random(seed)
+    body = rnd.randbytes(random_bytes)
+    filler_byte = bytes([(seed * 131 + 17) & 0xFF])
+    filler = filler_byte * (size - random_bytes)
+    return body + filler
 
 
-def predict_plan_and_write(args, jpg_blobs, write_corpus: bool):
+def predict_plan_and_write(args, write_corpus: bool):
     """逐个文件复刻 AddFileToCollect 的判断顺序，产出计划与统计。
 
     返回 (plan, raw_total, comp_total, single_ratio)：
@@ -97,7 +82,7 @@ def predict_plan_and_write(args, jpg_blobs, write_corpus: bool):
 
     for f in range(total_files):
         inode_id = args.inode_base + f
-        content = build_file_content(jpg_blobs, file_size, args.seed + f)
+        content = build_high_entropy_content(file_size, args.seed + f, args.target_ratio)
 
         # 与本节点侧完全一致：zlib 级别 9 == compress2(Z_BEST_COMPRESSION)
         compressed = zlib.compress(content, 9)
@@ -195,21 +180,15 @@ def check_plan(plan, args, ratio):
 
 
 def main():
-    default_input = os.environ.get("ZBSTORAGE_OPTICAL_CORPUS") or os.path.expanduser(
-        "~/WR/testWrite"
-    )
-
     parser = argparse.ArgumentParser(
-        description="生成光存储节点归档集成测试语料（模拟 real node 磁盘）"
+        description="生成光存储节点归档集成测试语料（合成高熵文件，模拟 real node 磁盘）"
     )
-    parser.add_argument("--input-dir", default=default_input,
-                        help="jpg/jpeg 语料来源目录")
     parser.add_argument("--out-dir", default=None,
                         help="输出目录（--selftest 时可省略）")
     parser.add_argument("--volumes", type=int, default=26, help="卷数量")
     parser.add_argument("--files-per-volume", type=int, default=10,
-                        help="每卷文件数（1 MiB × 10 × 实测压缩率 0.983 ≈ 10.1 MiB，"
-                             "刚好越过 10 MiB 卷的 0.9 封装阈值）")
+                        help="每卷文件数（1 MiB × 10，压缩比 0.97 时压缩后 ≈ 9.7 MiB，"
+                             "越过 10 MiB 卷的 0.9 封装阈值）")
     parser.add_argument("--file-size-mb", type=int, default=1,
                         help="每个归档文件大小(MiB)")
     parser.add_argument("--object-unit-kib", type=int, default=256,
@@ -218,7 +197,9 @@ def main():
     parser.add_argument("--inode-base", type=int, default=1000,
                         help="起始 inode 号")
     parser.add_argument("--seed", type=int, default=20260925,
-                        help="确定性洗牌种子")
+                        help="确定性随机种子（每个文件用 seed+f 洗牌）")
+    parser.add_argument("--target-ratio", type=float, default=DEFAULT_TARGET_RATIO,
+                        help="目标压缩比（压缩后 / 原始），默认 %.2f" % DEFAULT_TARGET_RATIO)
     parser.add_argument("--selftest", action="store_true",
                         help="只打印压缩率与预测分组，不落盘")
     args = parser.parse_args()
@@ -226,24 +207,17 @@ def main():
     if not args.selftest and not args.out_dir:
         parser.error("--out-dir 为必填（除 --selftest 外）")
 
-    jpg_blobs = collect_jpegs(args.input_dir)
-    if not jpg_blobs:
-        print(
-            "[skip] 语料目录不可用或没有 jpg/jpeg：%s（可通过环境变量 "
-            "ZBSTORAGE_OPTICAL_CORPUS 或 --input-dir 指定）" % args.input_dir,
-            file=sys.stderr,
-        )
-        sys.exit(SKIP_RETURN_CODE)
-
     trigger = int(VOLUME_SIZE * SIZE_THRESHOLD)
-    print("[info] 语料目录=%s，jpg 数量=%d" % (args.input_dir, len(jpg_blobs)))
+    print("[info] 合成高熵语料：目标压缩比=%.4f（随机主体 %d%% + 可压缩填充 %d%%）"
+          % (args.target_ratio, round(args.target_ratio * 100),
+             round((1 - args.target_ratio) * 100)))
     print(
         "[info] volume_size=%d 阈值=%.2f 触发线=%d 字节；单文件=%d 字节"
         % (VOLUME_SIZE, SIZE_THRESHOLD, trigger, args.file_size_mb * 1024 * 1024)
     )
 
     plan, raw_total, comp_total, single_ratio = predict_plan_and_write(
-        args, jpg_blobs, write_corpus=not args.selftest
+        args, write_corpus=not args.selftest
     )
     ratio = comp_total / float(raw_total)
     check_plan(plan, args, ratio)
@@ -255,9 +229,6 @@ def main():
     )
     print("[info] 预测打包计划：共 %d 卷，每卷文件数=%s"
           % (len(plan), [len(g) for g in plan]))
-    for vi, g in enumerate(plan):
-        print("       volume %d: count=%d inodes=%s"
-              % (vi, len(g), ",".join(str(x) for x in g)))
 
     if args.selftest:
         print("[selftest] 未写入任何文件，退出。")
@@ -265,8 +236,8 @@ def main():
 
     with open(os.path.join(args.out_dir, "corpus_meta.txt"), "w",
               encoding="utf-8") as fp:
-        fp.write("input_dir\t%s\n" % os.path.abspath(args.input_dir))
-        fp.write("jpg_count\t%d\n" % len(jpg_blobs))
+        fp.write("generated\tkeyword:high_entropy\n")
+        fp.write("target_ratio\t%.6f\n" % args.target_ratio)
         fp.write("raw_total_bytes\t%d\n" % raw_total)
         fp.write("compressed_total_bytes\t%d\n" % comp_total)
         fp.write("measured_ratio\t%.6f\n" % ratio)

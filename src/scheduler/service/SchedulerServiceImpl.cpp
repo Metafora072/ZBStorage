@@ -263,7 +263,9 @@ void SchedulerServiceImpl::RemoveManagedNode(
     std::string error;
     const bool ok = request->finalize()
                         ? node_manager_->FinalizeRemoveNode(request->node_id(), now_ms, request->force(), &error)
-                        : node_manager_->BeginRemoveNode(request->node_id(), now_ms, &error);
+                        : (migration_
+                               ? migration_->BeginManagedDrain(request->node_id(), now_ms, &error)
+                               : node_manager_->BeginRemoveNode(request->node_id(), now_ms, &error));
     if (!ok) {
         FillStatus(response->mutable_status(), zb::rpc::SCHED_INVALID_ARGUMENT, error);
         return;

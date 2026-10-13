@@ -8,6 +8,7 @@ namespace zb::virtual_node {
 
 struct VirtualNodeConfig {
     std::string node_id;
+    uint64_t instance_generation{1};
     std::string node_address;
     std::string scheduler_addr;
     std::string group_id;
@@ -34,7 +35,15 @@ struct VirtualNodeConfig {
     uint64_t write_bytes_per_sec{500ULL * 1024ULL * 1024ULL};
     uint32_t read_base_latency_ms{1};
     uint32_t write_base_latency_ms{1};
+    // In-process Scheduler model: wall-clock delay before a sleeping logical
+    // node can serve an access. The standalone virtual node may ignore it.
+    uint32_t wake_latency_ms{0};
     uint32_t jitter_ms{0};
+    uint32_t jitter_seed{0}; // Zero derives a stable seed from NODE_ID.
+    // Shared node I/O budget. At most max_concurrent_io requests may be in
+    // service; io_queue_limit bounds additional waiting requests.
+    uint32_t max_concurrent_io{5};
+    uint32_t io_queue_limit{64};
     uint64_t disk_capacity_bytes{1024ULL * 1024ULL * 1024ULL * 1024ULL};
     std::string mount_point_prefix{"/virtual"};
 

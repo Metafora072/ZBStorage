@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -13,12 +14,14 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "../config/VirtualNodeConfig.h"
 #include "../../common/ObjectStore.h"
 #include "../../real_node/service/ArchiveFileMetaStore.h"
 #include "../../real_node/service/ArchiveObjectMetaStore.h"
 #include "../../../msg/storage_node_messages.h"
+#include "ModelStateStore.h"
 
 namespace zb::virtual_node {
 
@@ -69,6 +72,12 @@ struct FileArchiveCandidateStat {
     uint64_t version{0};
 };
 
+struct IoResourceSnapshot {
+    uint32_t outstanding{0};
+    uint32_t concurrent_limit{0};
+    uint32_t queue_limit{0};
+};
+
 class VirtualStorageServiceImpl {
 public:
     explicit VirtualStorageServiceImpl(VirtualNodeConfig config);
@@ -89,6 +98,7 @@ public:
                                   const std::string& secondary_node_id,
                                   const std::string& secondary_address);
     ReplicationStatusSnapshot GetReplicationStatus() const;
+    IoResourceSnapshot GetIoResourceSnapshot() const;
 
     zb::msg::WriteObjectReply WriteObject(const zb::msg::WriteObjectRequest& request);
     zb::msg::ReadObjectReply ReadObject(const zb::msg::ReadObjectRequest& request);
@@ -104,6 +114,7 @@ public:
     zb::msg::AllocateFileWriteReply AllocateFileWrite(const zb::msg::AllocateFileWriteRequest& request) const;
     zb::msg::CommitFileWriteReply CommitFileWrite(const zb::msg::CommitFileWriteRequest& request);
     void SetFileMetaStoreDir(const std::string& dir_path);
+    bool InitModelStateStore(const std::string& state_dir, std::string* error);
     bool InitArchiveMetaStore(const std::string& meta_dir,
                               size_t max_objects,
                               uint32_t snapshot_interval_ops,
@@ -123,6 +134,19 @@ public:
     std::vector<FileArchiveCandidateStat> CollectFileArchiveCandidates(uint32_t max_candidates, uint64_t min_age_ms) const;
     // Complete inventory for drain verification; errors leave objects empty.
     zb::msg::Status ListTrackedObjects(std::vector<real_node::ArchiveObjectMeta>* objects) const;
+    // Control-plane transfer for model-to-model drain. No user bytes are
+    // copied: both endpoints expose the same deterministic virtual payload.
+    zb::msg::Status ImportModelObject(const std::string& disk_id,
+                                      const std::string& object_id, uint64_t size);
+    zb::msg::Status ExportResidentModelObject(const std::string& disk_id,
+                                              const std::string& object_id,
+                                              uint64_t expected_size) const;
+    zb::msg::Status ExportModelFile(uint64_t inode_id, zb::msg::FileMeta* meta) const;
+    zb::msg::Status ImportModelFile(const zb::msg::FileMeta& meta);
+    zb::msg::Status VerifyModelArchiveSource(uint64_t inode_id,
+                                             const std::string& disk_id,
+                                             uint64_t expected_size,
+                                             uint64_t expected_version) const;
 
 private:
     struct PreloadedFileObjectInfo {
@@ -132,6 +156,7 @@ private:
 
     bool ApplyFileMetaInternal(const zb::msg::ApplyFileMetaRequest& request,
                                 const std::string* txid,
+                                const std::string* commit_signature,
                                 zb::msg::ApplyFileMetaReply* reply);
 
     struct ReplicationRepairTask {
@@ -147,7 +172,7 @@ private:
                               bool allow_dynamic_register,
                               std::string* effective_disk);
     bool ValidateDisk(const std::string& disk_id) const;
-    void SimulateIo(uint64_t bytes, bool is_read);
+    zb::msg::Status SimulateIo(uint64_t bytes, bool is_read);
     void TrackObjectAccess(const std::string& disk_id,
                            const std::string& object_id,
                            uint64_t end_offset,
@@ -180,6 +205,7 @@ private:
     bool InitFileMetaStorePath() const;
     bool LoadFileMetaStoreLocked(std::string* error) const;
     bool PersistFileMetaStoreLocked(std::string* error) const;
+    bool PersistFileMetaRowLocked(uint64_t inode_id, std::string* error);
 
     VirtualNodeConfig config_;
     std::unordered_set<std::string> disk_set_;
@@ -190,10 +216,18 @@ private:
     mutable std::unordered_map<uint64_t, zb::msg::FileMeta> file_meta_by_inode_;
     mutable std::unordered_map<uint64_t, PreloadedFileObjectInfo> preloaded_file_objects_;
     mutable std::unordered_map<uint64_t, std::string> last_commit_txid_by_inode_;
+    mutable std::unordered_map<uint64_t, std::string> last_commit_signature_by_inode_;
     mutable std::string file_meta_store_path_;
     mutable bool file_meta_loaded_{false};
+    std::unique_ptr<ModelStateStore> model_state_store_;
     mutable std::mutex rng_mu_;
     std::mt19937 rng_;
+    // Admission and reservations are node-local. No object or metadata lock is
+    // held while an RPC waits for its reserved completion time.
+    mutable std::mutex io_mu_;
+    std::vector<std::chrono::steady_clock::time_point> io_slot_available_;
+    std::chrono::steady_clock::time_point io_bandwidth_available_{};
+    uint32_t io_outstanding_{0};
 
     mutable std::mutex repl_mu_;
     ReplicationStatusSnapshot repl_;

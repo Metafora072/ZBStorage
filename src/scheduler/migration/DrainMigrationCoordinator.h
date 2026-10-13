@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -92,6 +93,15 @@ public:
                               uint32_t max_retries = 20);
 
     bool Start(const std::string& node_id, uint64_t now_ms, std::string* error);
+    // A non-mutating admission check lets the RPC reject unsupported logical
+    // drains before it changes the managed node to Draining.
+    bool CanStart(const std::string& node_id, std::string* error) const;
+    void SetLogicalSourceEmptyVerifier(
+        std::function<bool(const std::string&, std::string*)> verifier);
+    void SetLogicalEmptyDrainBegin(
+        std::function<bool(const std::string&, uint64_t, std::string*)> begin);
+    bool BeginManagedDrain(const std::string& node_id, uint64_t now_ms,
+                           std::string* error);
     void Tick(uint64_t now_ms);
     bool GetTask(const std::string& node_id, DrainMigrationTask* out) const;
     std::vector<DrainMigrationTask> ListTasks() const;
@@ -130,6 +140,8 @@ private:
     NodePowerManager* nodes_{};
     LifecycleManager* lifecycle_{};
     ObjectMigrationBackend* backend_{};
+    std::function<bool(const std::string&, std::string*)> logical_source_empty_;
+    std::function<bool(const std::string&, uint64_t, std::string*)> logical_empty_drain_begin_;
     uint64_t retry_base_ms_{1000};
     uint32_t max_retries_{20};
     uint64_t next_id_{1};

@@ -124,6 +124,7 @@ DiskState             -> storage_model::DeviceInventory
 | 身份 | `node_id`、`kind`、`execution_mode` | Scheduler注册和筛选 |
 | 逻辑规模 | `logical_node_count` | 一个虚拟节点进程代表多个逻辑节点 |
 | 技术代际 | `technology_generation` | 百年推演中的硬件代际；替换节点必须递增 |
+| 实例代际 | `instance_generation` | 逻辑节点当前实例的非零代际；Scheduler 快照/CMS 与 MDS 文件位置传播，数据路由据此拒绝旧实例请求。旧配置默认为 1；它不等于技术代际，也不会在普通进程重启时自动递增 |
 | 放置开关 | `participates_in_placement` | Scheduler判断节点是否可参与放置 |
 | 网络 | `external_network_bandwidth_bytes_per_sec` | 有效吞吐取内外带宽最小值 |
 | 延迟 | `fixed_access_latency_us` | HDD/SSD及光盘缓存命中 |
@@ -187,7 +188,7 @@ energy_microjoules += power_milliwatts × elapsed_milliseconds
 
 ### 4.6 `NodeRecord`
 
-`OpticalLibraryStatus` 是节点管理所需的光盘库聚合状态：是否已观测、槽位总数、本地光盘总数、Blank/Recording/Recorded/Defective分类计数、暂存区容量/用量、待处理写任务数及观测时间。详细 DiscID→Slot 映射仍属于 `OpticalModel.h`。Scheduler使用聚合状态判断只读降级和安全退役；CMS在暂存区使用率达到80%时停止向该库分配新归档。
+`OpticalLibraryStatus` 是节点管理所需的光盘库聚合状态：是否已观测、槽位总数、本地光盘总数、Blank/Recording/Recorded/Defective分类计数、暂存区容量/用量、待处理写任务数、待完成读任务数、忙碌光驱数及观测时间。详细 DiscID→Slot 映射仍属于 `OpticalModel.h`。Scheduler使用聚合状态判断只读降级、安全退役和后台任务期间的休眠保护；CMS在暂存区使用率达到80%时停止向该库分配新归档。
 
 `NodeRecord` 是 Scheduler 当前唯一的完整管理记录：
 

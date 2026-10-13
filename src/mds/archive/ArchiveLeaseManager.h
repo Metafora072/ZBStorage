@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <rocksdb/write_batch.h>
 
 #include "../storage/RocksMetaStore.h"
 #include "mds.pb.h"
@@ -29,6 +30,14 @@ public:
     bool Commit(const zb::rpc::CommitArchiveTaskRequest& request,
                 zb::rpc::CommitArchiveTaskReply* reply,
                 std::string* error);
+    bool ValidateModelLease(uint64_t inode_id, const std::string& node_id,
+                            const std::string& disk_id, const std::string& lease_id,
+                            std::string* error) const;
+    bool CommitModelLeaseWithInodeCas(uint64_t inode_id, const std::string& node_id,
+                                     const std::string& disk_id, const std::string& lease_id,
+                                     const std::string& expected_inode_payload,
+                                     rocksdb::WriteBatch* batch, bool* matched,
+                                     std::string* error);
 
 private:
     bool LoadOrInitRecordLocked(const std::string& lease_key,

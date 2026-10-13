@@ -14,6 +14,15 @@ message ArchiveFile {
   uint64 object_unit_size = 3;
   string target_node_id = 4;
   string target_disk_id = 5;
+  // Required for the in-process modeled archive protocol. Legacy physical
+  // optical nodes continue to ignore these additive fields.
+  string operation_id = 6;
+  string source_lease_id = 7;
+  string source_node_id = 8;
+  string source_disk_id = 9;
+  uint64 source_version = 10;
+  string disc_id = 11;
+  string image_id = 12;
 }
 
 message SendArchiveMetadataRequest {
@@ -132,6 +141,51 @@ message ReleasePreparedReadReply {
   OpticalStatus status = 1;  // OPTICAL_OK 表示准备引用已释放，不再为该任务创建新读会话
 }
 
+// ----------------------------------------------------------------------------
+// 兼容旧调用方的读接口（deprecated）。
+// 新链路统一使用上面的 6 个读接口（SubscribeReadEvents / PrepareRead / AcquireReadSession /
+// ReadPreparedFile / ReleaseReadSession / ReleasePreparedRead）。以下 3 个 RPC 及其消息
+// 仅为既有调用方（如 FUSE 客户端、scheduler 进程内模拟光盘服务）保留，待其迁移完成后删除。
+// ----------------------------------------------------------------------------
+
+// 客户端向光盘库节点提交异步读任务：立即返回 task_id，随后用 ReadObjectByTaskId 取分片。
+// disk_id 形如 "optical-disk-<seq>"、image_id 形如 "img-<seq>"，节点在服务层取出尾部 <seq>
+// 换算成本地 disk_id / volume_id。
+message RequestAsyncReadFileRequest {
+  string disk_id = 1;
+  string image_id = 2;
+  uint64 inode_id = 3;
+}
+
+message RequestAsyncReadFileReply {
+  MdsStatus status = 1;   // MDS_OK 表示任务已受理，task_id 有效
+  uint64 task_id = 2;
+}
+
+// 按 task_id 读取 [offset, offset+read_size) 区间；末片读成功后服务端释放读产物。
+message ReadObjectByTaskIdRequest {
+  uint64 task_id = 1;
+  uint64 offset = 2;
+  uint64 read_size = 3;
+}
+
+message ReadObjectByTaskIdReply {
+  MdsStatus status = 1;
+  bytes data = 2;
+}
+
+// 按 inode_id 读取最近一次 RequestAsyncReadFile(inode_id) 产物的区间。
+message ReadObjectByInodeIdRequest {
+  uint64 inode_id = 1;
+  uint64 offset = 2;
+  uint64 read_size = 3;
+}
+
+message ReadObjectByInodeIdReply {
+  MdsStatus status = 1;
+  bytes data = 2;
+}
+
 // 光盘库节点对外提供的服务：归档入口（MDS 下发文件信息）+ 数据面读 + 读取通知订阅。
 service OpticalNodeService {
   rpc SendArchiveMetadata(SendArchiveMetadataRequest) returns (ArchiveReply);
@@ -148,4 +202,14 @@ service OpticalNodeService {
   rpc ReleaseReadSession(ReleaseReadSessionRequest) returns (ReleaseReadSessionReply);
 
   rpc ReleasePreparedRead(ReleasePreparedReadRequest) returns (ReleasePreparedReadReply);
+
+  // Deprecated：仅为旧调用方保留，新链路请使用上面的 6 个读接口。
+  rpc RequestAsyncReadFile(RequestAsyncReadFileRequest)
+      returns (RequestAsyncReadFileReply);
+
+  rpc ReadObjectByTaskId(ReadObjectByTaskIdRequest)
+      returns (ReadObjectByTaskIdReply);
+
+  rpc ReadObjectByInodeId(ReadObjectByInodeIdRequest)
+      returns (ReadObjectByInodeIdReply);
 }

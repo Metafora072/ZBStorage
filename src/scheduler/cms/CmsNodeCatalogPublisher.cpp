@@ -4,6 +4,7 @@
 #include <brpc/controller.h>
 
 #include <unordered_map>
+#include <limits>
 #include <utility>
 
 #include "../model/ClusterState.h"
@@ -38,15 +39,75 @@ bool CmsNodeCatalogPublisher::EnsureChannelLocked(std::string* error) {
     return true;
 }
 
+bool CmsNodeCatalogPublisher::ReconcileGenerationLocked(NodePowerManager* nodes,
+                                                         std::string* error) {
+    if (generation_reconciled_) return true;
+    zb::rpc::GetCmsNodeCatalogRequest request;
+    zb::rpc::GetCmsNodeCatalogReply response;
+    brpc::Controller controller;
+    zb::rpc::MdsService_Stub stub(channel_.get());
+    stub.GetCmsNodeCatalog(&controller, &request, &response, nullptr);
+    if (controller.Failed()) {
+        if (error) *error = "CMS catalog read RPC failed: " + controller.ErrorText();
+        channel_.reset();
+        return false;
+    }
+    if (response.status().code() != zb::rpc::MDS_OK) {
+        if (error) *error = "CMS rejected catalog read: " + response.status().message();
+        return false;
+    }
+    std::unordered_map<std::string, ManagedNodeRuntime> local;
+    for (const auto& node : nodes->ListNodes()) local.emplace(node.profile.node_id, node);
+    for (const auto& entry : response.nodes()) {
+        if (!entry.has_managed_view() || !entry.managed_view().has_spec()) {
+            if (error) *error = "CMS catalog contains an invalid managed node";
+            return false;
+        }
+        const auto& committed = entry.managed_view();
+        const auto& id = committed.spec().node_id();
+        auto found = local.find(id);
+        if (found == local.end()) {
+            if (error) *error = "Scheduler snapshot omits CMS member: " + id;
+            return false;
+        }
+        zb::rpc::ManagedNodeView current;
+        FillManagedNodeView(found->second, &current);
+        const auto old_instance = committed.spec().instance_generation();
+        const auto new_instance = current.spec().instance_generation();
+        if (committed.spec().kind() != current.spec().kind() ||
+            (old_instance == 0 ? 1 : old_instance) !=
+                (new_instance == 0 ? 1 : new_instance) ||
+            current.lifecycle() < committed.lifecycle()) {
+            if (error) *error = "Scheduler snapshot conflicts with CMS member: " + id;
+            return false;
+        }
+    }
+    const uint64_t source = nodes->generation();
+    const uint64_t committed = response.scheduler_generation();
+    if (source <= committed) {
+        if (committed == std::numeric_limits<uint64_t>::max()) {
+            if (error) *error = "CMS scheduler generation exhausted";
+            return false;
+        }
+        generation_offset_ = committed - source + 1;
+    }
+    last_cms_generation_ = response.cms_generation();
+    generation_reconciled_ = true;
+    return true;
+}
+
 bool CmsNodeCatalogPublisher::Publish(ClusterState* cluster,
                                       NodePowerManager* nodes,
-                                      std::string* error) {
+                                      std::string* error,
+                                      std::vector<std::string>* committed_retired_ids) {
+    if (committed_retired_ids) committed_retired_ids->clear();
     if (!cluster || !nodes) {
         if (error) *error = "CMS catalog publisher is missing Scheduler state";
         return false;
     }
     std::lock_guard<std::mutex> lock(mu_);
     if (!EnsureChannelLocked(error)) return false;
+    if (!ReconcileGenerationLocked(nodes, error)) return false;
 
     // A first CMS commit may assign compact IDs and increment the local
     // generation. Publish once more so the committed CMS view contains them.
@@ -59,10 +120,17 @@ bool CmsNodeCatalogPublisher::Publish(ClusterState* cluster,
 
         const uint64_t source_generation = nodes->generation();
         zb::rpc::CommitCmsNodeCatalogRequest request;
-        request.set_scheduler_generation(source_generation);
+        if (source_generation > std::numeric_limits<uint64_t>::max() - generation_offset_) {
+            if (error) *error = "Scheduler catalog generation exhausted";
+            return false;
+        }
+        request.set_scheduler_generation(source_generation + generation_offset_);
+        std::vector<std::string> retired_in_request;
         for (const auto& node : nodes->ListNodes()) {
             auto* entry = request.add_nodes();
             FillManagedNodeView(node, entry->mutable_managed_view());
+            if (node.lifecycle == LifecycleState::kRetired)
+                retired_in_request.push_back(node.profile.node_id);
             auto found = placement_by_id.find(node.profile.node_id);
             if (found != placement_by_id.end()) {
                 FillLegacyNodeView(found->second, entry->mutable_placement_view());
@@ -91,6 +159,7 @@ bool CmsNodeCatalogPublisher::Publish(ClusterState* cluster,
                 return false;
             }
         }
+        if (committed_retired_ids) *committed_retired_ids = std::move(retired_in_request);
         if (nodes->generation() == source_generation) return true;
     }
     // The second commit is already a valid CMS snapshot. A concurrent

@@ -11,6 +11,14 @@ inline std::string InodeKey(uint64_t inode_id) {
     return "I/" + std::to_string(inode_id);
 }
 
+inline std::string DiskFileLocationKey(uint64_t inode_id) {
+    return "DL/" + std::to_string(inode_id);
+}
+
+inline std::string OpticalFileLocationKey(uint64_t inode_id) {
+    return "OL/" + std::to_string(inode_id);
+}
+
 inline std::string DentryKey(uint64_t parent_inode, const std::string& name) {
     return "D/" + std::to_string(parent_inode) + "/" + name;
 }
@@ -21,6 +29,10 @@ inline std::string DentryPrefix(uint64_t parent_inode) {
 
 inline std::string FileArchiveStateKey(uint64_t inode_id) {
     return "AF/" + std::to_string(inode_id);
+}
+
+inline std::string ModelOpticalArchiveCommitKey(const std::string& operation_id) {
+    return "MOA/" + operation_id;
 }
 
 inline std::string FileArchiveStatePrefix() {

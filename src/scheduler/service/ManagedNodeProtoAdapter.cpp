@@ -179,6 +179,7 @@ void FillSpec(const ManagedNodeProfile& profile, zb::rpc::ManagedNodeSpec* outpu
     output->set_execution_mode(ExecutionModeToProto(profile.execution_mode));
     output->set_logical_node_count(profile.logical_node_count);
     output->set_technology_generation(profile.technology_generation);
+    output->set_instance_generation(profile.instance_generation);
     output->set_participates_in_placement(profile.participates_in_placement);
     output->set_participates_in_placement_set(true);
     output->set_external_network_bandwidth_bytes_per_sec(
@@ -268,6 +269,9 @@ bool ManagedNodeProfileFromProto(const zb::rpc::ManagedNodeSpec& input,
     profile.logical_node_count = std::max<uint32_t>(1, input.logical_node_count());
     if (input.technology_generation() != 0) {
         profile.technology_generation = input.technology_generation();
+    }
+    if (input.instance_generation() != 0) {
+        profile.instance_generation = input.instance_generation();
     }
     if (input.participates_in_placement_set() || input.participates_in_placement()) {
         profile.participates_in_placement = input.participates_in_placement();
@@ -423,6 +427,8 @@ bool OpticalLibraryStatusFromProto(const zb::rpc::ManagedOpticalLibraryStatus& i
     status.staging_capacity_bytes = input.staging_capacity_bytes();
     status.staging_used_bytes = input.staging_used_bytes();
     status.pending_write_tasks = input.pending_write_tasks();
+    status.pending_read_tasks = input.pending_read_tasks();
+    status.busy_drives = input.busy_drives();
     status.observed_at_ms = input.observed_at_ms();
     if (!zb::storage_model::ValidateOpticalLibraryStatus(status, error)) return false;
     *output = status;
@@ -492,6 +498,8 @@ void FillManagedNodeView(const ManagedNodeRuntime& node, zb::rpc::ManagedNodeVie
     optical->set_staging_capacity_bytes(node.optical_library.staging_capacity_bytes);
     optical->set_staging_used_bytes(node.optical_library.staging_used_bytes);
     optical->set_pending_write_tasks(node.optical_library.pending_write_tasks);
+    optical->set_pending_read_tasks(node.optical_library.pending_read_tasks);
+    optical->set_busy_drives(node.optical_library.busy_drives);
     optical->set_observed_at_ms(node.optical_library.observed_at_ms);
     output->set_wake_count(node.wake_count);
     output->set_standby_transition_count(node.standby_transition_count);

@@ -247,6 +247,64 @@ bool ArchiveLeaseManager::Commit(const zb::rpc::CommitArchiveTaskRequest& reques
     return true;
 }
 
+bool ArchiveLeaseManager::ValidateModelLease(uint64_t inode_id,
+                                             const std::string& node_id,
+                                             const std::string& disk_id,
+                                             const std::string& lease_id,
+                                             std::string* error) const {
+    if (!store_ || inode_id == 0 || node_id.empty() || disk_id.empty() || lease_id.empty()) {
+        if (error) *error = "incomplete modeled archive lease";
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    std::string payload;
+    if (!store_->Get(FileArchiveStateKey(inode_id), &payload, error)) {
+        if (error && error->empty()) *error = "archive lease not found";
+        return false;
+    }
+    zb::rpc::ArchiveLeaseRecord record;
+    if (!record.ParseFromString(payload) ||
+        record.state() != zb::rpc::ARCHIVE_STATE_ARCHIVING ||
+        record.owner_node_id() != node_id || record.owner_disk_id() != disk_id ||
+        record.lease_id() != lease_id ||
+        record.lease_expire_ts_ms() <= NowMilliseconds()) {
+        if (error) *error = "archive lease changed or expired";
+        return false;
+    }
+    return true;
+}
+
+bool ArchiveLeaseManager::CommitModelLeaseWithInodeCas(
+    uint64_t inode_id, const std::string& node_id, const std::string& disk_id,
+    const std::string& lease_id, const std::string& expected_inode_payload,
+    rocksdb::WriteBatch* batch, bool* matched, std::string* error) {
+    if (!store_ || !batch || !matched || inode_id == 0 || node_id.empty() ||
+        disk_id.empty() || lease_id.empty()) {
+        if (error) *error = "incomplete modeled archive commit";
+        return false;
+    }
+    // Serializes Claim/Renew/Commit against the inode CAS and lease deletion.
+    std::lock_guard<std::mutex> lock(mu_);
+    const std::string key = FileArchiveStateKey(inode_id);
+    std::string payload;
+    if (!store_->Get(key, &payload, error)) {
+        if (error && error->empty()) *error = "archive lease not found";
+        return false;
+    }
+    zb::rpc::ArchiveLeaseRecord record;
+    if (!record.ParseFromString(payload) ||
+        record.state() != zb::rpc::ARCHIVE_STATE_ARCHIVING ||
+        record.owner_node_id() != node_id || record.owner_disk_id() != disk_id ||
+        record.lease_id() != lease_id ||
+        record.lease_expire_ts_ms() <= NowMilliseconds()) {
+        if (error) *error = "archive lease changed or expired";
+        return false;
+    }
+    batch->Delete(key);
+    return store_->WriteBatchIfValueEquals(InodeKey(inode_id), expected_inode_payload,
+                                           batch, matched, error);
+}
+
 bool ArchiveLeaseManager::LoadOrInitRecordLocked(const std::string& lease_key,
                                                  uint64_t inode_id,
                                                  zb::rpc::ArchiveLeaseRecord* record,

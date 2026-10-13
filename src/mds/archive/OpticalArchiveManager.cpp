@@ -1899,11 +1899,19 @@ bool OpticalArchiveManager::SaveOpticalFileLocation(uint64_t inode_id,
         UnifiedInodeRecord record;
         if (MetaCodec::DecodeUnifiedInodeRecord(inode_payload, &record, nullptr)) {
             ApplyOpticalLocationToUnifiedRecord(location, &record);
+            record.file_archive_state = static_cast<uint32_t>(zb::rpc::INODE_ARCHIVE_ARCHIVED);
             std::string encoded;
             if (!MetaCodec::EncodeUnifiedInodeRecord(record, &encoded, error)) {
                 return false;
             }
+            std::string full_location;
+            if (!location.SerializeToString(&full_location)) {
+                if (error) *error = "cannot encode full optical location";
+                return false;
+            }
             batch->Put(InodeKey(inode_id), encoded);
+            batch->Put(OpticalFileLocationKey(inode_id), full_location);
+            batch->Delete(DiskFileLocationKey(inode_id));
             return true;
         }
         if (error) {
@@ -1928,6 +1936,7 @@ bool OpticalArchiveManager::DeleteDiskFileLocation(uint64_t inode_id,
         }
         return false;
     }
+    batch->Delete(DiskFileLocationKey(inode_id));
     std::string inode_payload;
     std::string local_error;
     if (store_->Get(InodeKey(inode_id), &inode_payload, &local_error)) {

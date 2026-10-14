@@ -3321,7 +3321,7 @@ namespace optical_node_manager {
                     task.state == WR_task::WRTaskState::READY &&
                     task.read_expire_at_ms != 0 &&
                     now_ms >= task.read_expire_at_ms &&
-                    !read_sessions_.HasReaders(task_id)) {
+                    read_sessions_.ExpireIfIdle(task_id)) {
                     CleanupPreparedArtifact(task_id);
                     // 刚被置为 FINISH：只有这一种情况需要取当前态落日志。
                     auto current = task_map_->Get(task_id);

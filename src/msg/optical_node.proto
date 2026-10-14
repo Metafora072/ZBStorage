@@ -34,6 +34,120 @@ message ArchiveReply {
   MdsStatus status = 1;
 }
 
+// —— 光盘读接口（客户端与真实光盘库节点的文件读取）——
+// 光盘读取接口采用独立定义的状态类型，不复用 MDS 状态类型。
+enum OpticalStatusCode {
+  OPTICAL_OK = 0;                  // 本次 RPC 成功，具体完成内容由接口语义确定
+  OPTICAL_INVALID_ARGUMENT = 1;    // 参数不符合接口约定
+  OPTICAL_NOT_FOUND = 2;           // 引用的文件 / 会话 / 任务不存在
+  OPTICAL_NOT_READY = 3;           // 文件准备尚未完成，不能建立读取会话
+  OPTICAL_INTERNAL_ERROR = 4;      // 光盘库内部处理失败
+}
+
+message OpticalStatus {
+  OpticalStatusCode code = 1;
+  string message = 2;
+}
+
+// 客户端建立准备完成通知通道：RPC 上附带一个 brpc Stream（传输层对象，非 proto 字段），
+// 服务端接受 Stream 后返回 session_id；后续 PrepareRead 用它指定通知接收通道。
+message SubscribeReadEventsRequest {
+  string client_id = 1;  // 标识本次建立通知连接的 FUSE 客户端实例
+}
+
+message SubscribeReadEventsReply {
+  OpticalStatus status = 1;
+  uint64 session_id = 2;  // 后续 PrepareRead 用它指定通知接收通道
+}
+
+// 客户端提交整文件异步准备任务：光盘库登记任务并入队后立即返回，不等待取盘/解压。
+// 成功只表示受理（ACCEPTED），不代表文件可读；可读由后续 ReadReady 通知。
+message PrepareReadRequest {
+  uint64 session_id = 1;   // 已建立的通知会话，决定完成后向哪个 Stream 发送事件
+  string request_id = 2;   // 客户端准备请求编号，用于关联响应、完成通知和本地回调
+  uint64 inode_id = 3;
+  string disk_id = 4;
+  string image_id = 5;
+  uint64 file_size = 6;    // 已有元数据给出的逻辑文件大小，用于核对准备结果
+  // proto3 3.12 无 optional：用显式标志位保留 file_version「未提供」的含义，
+  // 不以缺省值擅自推断版本。
+  bool   has_file_version = 7;
+  uint64 file_version = 8;
+}
+
+message PrepareReadReply {
+  OpticalStatus status = 1;  // OPTICAL_OK 表示任务已登记并入队，不表示可读
+  string request_id = 2;     // 原样返回，关联客户端已有记录
+  uint64 task_id = 3;        // 光盘库创建的准备任务编号
+}
+
+// 光盘库主动推送给客户端的准备完成事件（序列化后写入通知 Stream，不是 RPC）。
+// 消息本身表示成功就绪，不携带 status；通道已确定节点与会话，不重复携带 session_id。
+message ReadReadyEvent {
+  string request_id = 1;   // 找到客户端在提交前登记的准备请求
+  uint64 task_id = 2;      // 后续读会话接口使用的任务编号
+  uint64 inode_id = 3;     // 核对通知对应的文件身份
+  uint64 file_size = 4;    // 完整产物的实际逻辑大小
+  // proto3 3.12 无 optional：用显式标志位保留 file_version「未提供」的含义。
+  bool   has_file_version = 5;
+  uint64 file_version = 6;
+}
+
+// 客户端为一次独立打开建立读取会话：文件已 READY 且准备引用仍存在时调用。
+// 不触发新的准备工作，也不等待尚未完成的任务；每次调用返回独立的 read_handle。
+message AcquireReadSessionRequest {
+  uint64 task_id = 1;  // 当前文件对应的 READY 准备任务
+}
+
+message AcquireReadSessionReply {
+  OpticalStatus status = 1;
+  uint64 read_handle = 2;     // 本次独立打开专属的读取会话
+  uint64 file_size = 3;       // 当前准备文件的完整大小
+  uint32 max_read_bytes = 4;  // 本会话允许的单次读取上限，必须 > 0，会话期间固定
+}
+
+// 在已建立的读会话上同步读取文件区间；offset 为目标文件内绝对偏移，size ≤ max_read_bytes。
+// eof 只表示本次请求到达文件末尾，不代表关闭会话或释放缓存。
+message ReadPreparedFileRequest {
+  uint64 read_handle = 1;
+  uint64 offset = 2;
+  uint64 size = 3;
+}
+
+message ReadPreparedFileReply {
+  OpticalStatus status = 1;
+  bytes data = 2;          // 该文件区间的真实字节内容
+  uint64 bytes_read = 3;   // 实际返回长度，必须等于 data 的长度
+  bool eof = 4;            // 本次请求到达文件末尾
+}
+
+// 关闭一次读取会话：对应一次独立打开的最终关闭。
+// 只减少读取引用，不释放准备引用；close 后仍可对同一 READY 任务再次建立读会话。
+message ReleaseReadSessionRequest {
+  uint64 read_handle = 1;  // 要结束的读取会话
+}
+
+message ReleaseReadSessionReply {
+  OpticalStatus status = 1;  // OPTICAL_OK 表示该会话已关闭、读取引用已释放
+}
+
+// 结束本轮准备结果的使用：撤销准备引用，之后不再为该任务创建新读会话。
+// 现有已打开的读会话继续可读；准备引用与读取引用都归零后清理本次准备的临时产物。
+message ReleasePreparedReadRequest {
+  uint64 task_id = 1;  // 本轮准备任务
+}
+
+message ReleasePreparedReadReply {
+  OpticalStatus status = 1;  // OPTICAL_OK 表示准备引用已释放，不再为该任务创建新读会话
+}
+
+// ----------------------------------------------------------------------------
+// 兼容旧调用方的读接口（deprecated）。
+// 新链路统一使用上面的 6 个读接口（SubscribeReadEvents / PrepareRead / AcquireReadSession /
+// ReadPreparedFile / ReleaseReadSession / ReleasePreparedRead）。以下 3 个 RPC 及其消息
+// 仅为既有调用方（如 FUSE 客户端、scheduler 进程内模拟光盘服务）保留，待其迁移完成后删除。
+// ----------------------------------------------------------------------------
+
 // 客户端向光盘库节点提交异步读任务：立即返回 task_id，随后用 ReadObjectByTaskId 取分片。
 // disk_id 形如 "optical-disk-<seq>"、image_id 形如 "img-<seq>"，节点在服务层取出尾部 <seq>
 // 换算成本地 disk_id / volume_id。
@@ -72,10 +186,24 @@ message ReadObjectByInodeIdReply {
   bytes data = 2;
 }
 
-// 光盘库节点对外提供的服务：归档入口（MDS 下发文件信息）+ 数据面异步读。
+// 光盘库节点对外提供的服务：归档入口（MDS 下发文件信息）+ 数据面读 + 读取通知订阅。
 service OpticalNodeService {
   rpc SendArchiveMetadata(SendArchiveMetadataRequest) returns (ArchiveReply);
 
+  rpc SubscribeReadEvents(SubscribeReadEventsRequest)
+      returns (SubscribeReadEventsReply);
+
+  rpc PrepareRead(PrepareReadRequest) returns (PrepareReadReply);
+
+  rpc AcquireReadSession(AcquireReadSessionRequest) returns (AcquireReadSessionReply);
+
+  rpc ReadPreparedFile(ReadPreparedFileRequest) returns (ReadPreparedFileReply);
+
+  rpc ReleaseReadSession(ReleaseReadSessionRequest) returns (ReleaseReadSessionReply);
+
+  rpc ReleasePreparedRead(ReleasePreparedReadRequest) returns (ReleasePreparedReadReply);
+
+  // Deprecated：仅为旧调用方保留，新链路请使用上面的 6 个读接口。
   rpc RequestAsyncReadFile(RequestAsyncReadFileRequest)
       returns (RequestAsyncReadFileReply);
 

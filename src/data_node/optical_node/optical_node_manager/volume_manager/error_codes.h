@@ -28,7 +28,7 @@ enum class ErrorCode {
     TASK_NOT_FINISH,       //任务未完成
     TASK_ALREADY_FINISH,   //任务已结束（FINISH 终态，读产物已消费）
     INVALID_PARAMETER,     // 无效参数
-    MANAGER_NOT_READY,     // 管理器未处于 RUNNING 状态（WriteObject / ReadFile / ReadObjectByTaskId 调用前置守卫使用）
+    MANAGER_NOT_READY,     // 管理器未处于 RUNNING 状态（各对外接口调用前置守卫使用）
     VOLUME_FULL_NO_READABLE, // image_dir_ 已满且没有 READ 镜像可换出（MoveFrom 专用）
     // ----- 任务阶段失败错误码（TODO-04）-----
     // 这些错误码用于把"任务在某一阶段失败"显式暴露给上层，避免 ZipTaskProcessor /

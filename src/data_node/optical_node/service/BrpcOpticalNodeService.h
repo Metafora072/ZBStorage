@@ -16,19 +16,34 @@ public:
                              zb::rpc::ArchiveReply* response,
                              google::protobuf::Closure* done) override;
 
-    void RequestAsyncReadFile(google::protobuf::RpcController* cntl_base,
-                              const zb::rpc::RequestAsyncReadFileRequest* request,
-                              zb::rpc::RequestAsyncReadFileReply* response,
-                              google::protobuf::Closure* done) override;
+    void SubscribeReadEvents(google::protobuf::RpcController* cntl_base,
+                             const zb::rpc::SubscribeReadEventsRequest* request,
+                             zb::rpc::SubscribeReadEventsReply* response,
+                             google::protobuf::Closure* done) override;
 
-    void ReadObjectByTaskId(google::protobuf::RpcController* cntl_base,
-                            const zb::rpc::ReadObjectByTaskIdRequest* request,
-                            zb::rpc::ReadObjectByTaskIdReply* response,
+    void PrepareRead(google::protobuf::RpcController* cntl_base,
+                     const zb::rpc::PrepareReadRequest* request,
+                     zb::rpc::PrepareReadReply* response,
+                     google::protobuf::Closure* done) override;
+
+    void AcquireReadSession(google::protobuf::RpcController* cntl_base,
+                            const zb::rpc::AcquireReadSessionRequest* request,
+                            zb::rpc::AcquireReadSessionReply* response,
                             google::protobuf::Closure* done) override;
 
-    void ReadObjectByInodeId(google::protobuf::RpcController* cntl_base,
-                             const zb::rpc::ReadObjectByInodeIdRequest* request,
-                             zb::rpc::ReadObjectByInodeIdReply* response,
+    void ReadPreparedFile(google::protobuf::RpcController* cntl_base,
+                          const zb::rpc::ReadPreparedFileRequest* request,
+                          zb::rpc::ReadPreparedFileReply* response,
+                          google::protobuf::Closure* done) override;
+
+    void ReleaseReadSession(google::protobuf::RpcController* cntl_base,
+                            const zb::rpc::ReleaseReadSessionRequest* request,
+                            zb::rpc::ReleaseReadSessionReply* response,
+                            google::protobuf::Closure* done) override;
+
+    void ReleasePreparedRead(google::protobuf::RpcController* cntl_base,
+                             const zb::rpc::ReleasePreparedReadRequest* request,
+                             zb::rpc::ReleasePreparedReadReply* response,
                              google::protobuf::Closure* done) override;
 
 private:

@@ -11,6 +11,7 @@
 #include <queue>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -408,7 +409,7 @@ namespace optical_node_manager {
 
     // mmap 文件的 [offset, offset+read_size) 区间，追加到 *out 末尾；
     // 越界时 clamp 到文件剩余；out_is_last 非空时写入 offset+read_size>=file_size；
-    // 不 unlink，由 ReadObjectByTaskId() 按 is_last 决定清理。
+    // 不 unlink；产物释放由调用方（ReadPreparedFile / 清理线程）自行处理。
     volumemanager::ErrorCode ReadFileToStringMmap(const std::string& file_path,
                                                   std::string* out,
                                                   uint64_t offset,
@@ -616,6 +617,8 @@ namespace optical_node_manager {
         // 恢复后的一致性校验与幂等补齐：补提未刻完的光盘、补登记已落地光盘的索引、
         // 清理半截物化产物。必须在起线程之前（单线程、且镜像管理表已就绪）。
         ReconcileAndReplay();
+        // 清理 read/ 中无任务认领的孤儿读产物（单线程重建阶段，与恢复结果一致）。
+        CleanupOrphanReadArtifacts();
 
         if (!StartBackgroundWorkers()) {
             // StartBackgroundWorkers 已写完整结构化 KV，直接转发给 SetStatus。
@@ -664,6 +667,9 @@ namespace optical_node_manager {
         // 先停线程再落盘：join 之后没有任何线程会再改 task_map_ / 队列 / 中间态，
         // 这是唯一的全局静止点（cd_manager 的活跃任务被 abandon，不触发回调）。
         StopBackgroundWorkers();
+
+        // 线程已 join，无并发访问：清空读会话表，避免下次 Run() 残留旧 read_handle。
+        read_sessions_.CloseAll();
 
         const bool persisted = PersistRuntimeState();
         SetStatus(manager_status::kStopped,
@@ -1112,8 +1118,7 @@ namespace optical_node_manager {
     //   [RuntimeStateMetaHeader][kCounters][kAvailableIds][kTasks][kQueues]
     //   [kArchiveQueue][kVolumeReadIndex][kPendingFiles][kImages]
     // 不落盘的状态（重启后由任务 + 磁盘产物重放恢复）：
-    //   in_progress_writes_（分片上传中间态）、pending_pack_inode_ids_（单步临时集合）、
-    //   inode_to_read_task_id_（由 task_map_ 重建）、cd_manager 活跃任务。
+    //   pending_pack_inode_ids_（单步临时集合）、cd_manager 活跃任务。
     bool OpticalNodeManager::PersistRuntimeState() {
         if (log_dir_.empty()) {
             last_sidecar_failure_reason_buf_ = FormatFailureDetail(
@@ -1514,13 +1519,12 @@ namespace optical_node_manager {
                     if (task.isTaskTerminal()) {
                         continue;
                     }
-                    task_map_->Insert(task);
-                    // inode_id → 最近一次读任务：由任务表重建，与运行期行为一致。
-                    if (task.type == WR_task::WRTaskType::READ && !task.inode_id.empty()) {
-                        std::lock_guard<std::mutex> lock(inode_to_read_task_id_mutex_);
-                        uint64_t& latest = inode_to_read_task_id_[task.inode_id];
-                        latest = std::max(latest, task.task_id);
+                    // 重建时刷新读产物有效期（不检查是否超时）：重启后重新计时。
+                    if (task.type == WR_task::WRTaskType::READ &&
+                        task.state == WR_task::WRTaskState::READY) {
+                        task.read_expire_at_ms = WR_task::NowMs() + kReadTaskTtlMs;
                     }
+                    task_map_->Insert(task);
                 }
             }
         }
@@ -2152,17 +2156,15 @@ namespace optical_node_manager {
         return volumemanager::ErrorCode::SUCCESS;
     }
 
-    volumemanager::ErrorCode OpticalNodeManager::RequestAsyncReadFile(const std::string& disk_id,
-                                                          const std::string& volume_id,
-                                                          const std::string& inode_id,
-                                                          uint64_t* task_id) {
-        if(!task_id){
+    volumemanager::ErrorCode OpticalNodeManager::SubmitPrepareTask(const PrepareReadParams& params,
+                                                                   uint64_t* task_id) {
+        if (!task_id) {
             return volumemanager::ErrorCode::INVALID_PARAMETER;
         }
 
-        // 仅 RUNNING 接受读任务；其它状态返回 NOT_READY。
+        // 仅 RUNNING 接受准备任务；其它状态返回 NOT_READY。
         if (GetStatus() != manager_status::kRunning) {
-            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReadFile, "not_ready",
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kPrepareRead, "not_ready",
                 "status=" + GetStatus());
             return volumemanager::ErrorCode::MANAGER_NOT_READY;
         }
@@ -2171,329 +2173,311 @@ namespace optical_node_manager {
         const uint64_t generated_task_id = GenerateTaskId();
 
         WR_task::WRTask task(generated_task_id, WR_task::WRTaskType::READ);
-        task.SetReadTask(disk_id, volume_id, inode_id);
+        task.SetReadTask(params.disk_id, params.volume_id, params.inode_id);
+        task.SetPrepareContext(params.request_id, params.session_id, params.expected_file_size,
+                               params.has_file_version, params.file_version);
 
+        // 先登记（含 session_id / request_id 关联），再入队：
+        // 保证后台线程开始执行前，通知关系已经就绪。
         task_map_->Insert(std::move(task));
         zip_task_queue_->Push(WR_task::WRTaskShort(generated_task_id, WR_task::WRTaskType::READ));
-
-        // 记录 inode_id -> task_id，供 ReadObjectByInodeId 反查；同 inode 多次请求只保留最新。
-        {
-            std::lock_guard<std::mutex> lock(inode_to_read_task_id_mutex_);
-            inode_to_read_task_id_[inode_id] = generated_task_id;
-        }
 
         *task_id = generated_task_id;
         return volumemanager::ErrorCode::READ_DELAY;
     }
 
-    volumemanager::ErrorCode OpticalNodeManager::ReadObjectByTaskId(const uint64_t& task_id,
-                                                    std::string* out,
-                                                    uint64_t offset,
-                                                    uint64_t read_size){
-        if(!out){
-            const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "invalid_parameter",
-                "out=null task_id=" + std::to_string(task_id));
-            last_failure_reason_buf_ = detail;
-            return volumemanager::ErrorCode::INVALID_PARAMETER;
+    void OpticalNodeManager::SetPreparedFileReadyCallback(PreparedFileReadyCallback cb) {
+        prepared_file_ready_callback_ = std::move(cb);
+    }
+
+    void OpticalNodeManager::NotifyPreparedFileReady(uint64_t task_id) {
+        if (!prepared_file_ready_callback_) {
+            return;
+        }
+        // 用 task_id 重新取任务：调用点的本地副本可能已被 task_map_->Update(std::move(...)) 移空。
+        auto task_opt = task_map_->Get(task_id);
+        if (!task_opt.has_value()) {
+            return;
+        }
+        const WR_task::WRTask& task = *task_opt;
+        // session_id==0：快照恢复任务等无通知目标，跳过发送。
+        if (task.session_id == 0) {
+            return;
         }
 
-        // 仅 RUNNING 接受重读；其它状态拒绝。
+        PreparedFileReadyEvent ev;
+        ev.task_id = task.task_id;
+        ev.session_id = task.session_id;
+        ev.request_id = task.request_id;
+        ev.inode_id = task.inode_id_num;
+        // 实际产物大小：优先 stat 产物文件，失败回退提交时给出的期望值。
+        ev.file_size = task.expected_file_size;
+        struct stat st;
+        if (!task.file_path.empty() && ::stat(task.file_path.c_str(), &st) == 0 &&
+            S_ISREG(st.st_mode)) {
+            ev.file_size = static_cast<uint64_t>(st.st_size);
+        }
+        ev.has_file_version = task.has_file_version;
+        ev.file_version = task.file_version;
+        prepared_file_ready_callback_(ev);
+    }
+
+    volumemanager::ErrorCode OpticalNodeManager::AcquireReadSession(uint64_t task_id,
+                                                                   AcquireReadSessionResult* out) {
+        if (out == nullptr) {
+            return volumemanager::ErrorCode::INVALID_PARAMETER;
+        }
         if (GetStatus() != manager_status::kRunning) {
-            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "not_ready",
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kAcquireReadSession, "not_ready",
                 "status=" + GetStatus());
             return volumemanager::ErrorCode::MANAGER_NOT_READY;
         }
 
         auto task_opt = task_map_->Get(task_id);
         if (!task_opt.has_value()) {
-            // 任务不存在：可能已被 Erase（消费过一次）或 task_id 传错。
-            const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "task_not_found",
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kAcquireReadSession, "task_not_found",
                 "task_id=" + std::to_string(task_id));
-            last_failure_reason_buf_ = detail;
             return volumemanager::ErrorCode::TASK_NOT_FOUND;
         }
         const WR_task::WRTask& task = *task_opt;
         if (task.type != WR_task::WRTaskType::READ) {
-            // type 不匹配：把 WRITE 任务的 task_id 传给了 ReadObjectByTaskId。
-            const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "invalid_type",
-                "task_id=" + std::to_string(task_id) + " type=" + std::to_string(static_cast<int>(task.type)));
-            last_failure_reason_buf_ = detail;
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kAcquireReadSession, "invalid_type",
+                "task_id=" + std::to_string(task_id) +
+                " type=" + std::to_string(static_cast<int>(task.type)));
             return volumemanager::ErrorCode::INVALID_PARAMETER;
         }
-        // FAILED → 返回细分错误码；FINISH（已读完）→ TASK_ALREADY_FINISH；
-        // READY 前的中间态 → TASK_NOT_FINISH；READY → 走 mmap 分片读取，末片置 FINISH。
         if (task.state == WR_task::WRTaskState::FAILED) {
-            const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "task_failed",
-                "task_id=" +
-                std::to_string(task_id) +
-                " code=" +
-                volumemanager::GetErrorMessage(task.last_error_code) +
-                " code_int=" +
-                std::to_string(static_cast<int>(task.last_error_code)) +
-                " attempt=" +
-                std::to_string(task.attempt_count) +
-                "/" +
-                std::to_string(attempt_count_max_) +
-                " detail=" +
-                task.last_error_detail);
-            last_failure_reason_buf_ = detail;
+            // FAILED 返回细分失败码；未记录具体码时回 READ_FAILED。
             return task.last_error_code == volumemanager::ErrorCode::SUCCESS
                 ? volumemanager::ErrorCode::READ_FAILED
                 : task.last_error_code;
         }
         if (task.state == WR_task::WRTaskState::FINISH) {
-            // 任务已读完（读产物已 unlink），不可再读。
-            const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "task_already_finish",
-                "task_id=" + std::to_string(task_id));
-            last_failure_reason_buf_ = detail;
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kAcquireReadSession,
+                "task_already_finish", "task_id=" + std::to_string(task_id));
             return volumemanager::ErrorCode::TASK_ALREADY_FINISH;
         }
+        // READY 之前（START/WAITING/LOADING）：不等待未完成任务，快速返回未就绪。
         if (!task.isReadTaskReady()) {
-            const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "task_not_finish",
-                "task_id=" + std::to_string(task_id) + " state=" + std::to_string(static_cast<int>(task.state)));
-            last_failure_reason_buf_ = detail;
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kAcquireReadSession, "task_not_finish",
+                "task_id=" + std::to_string(task_id) +
+                " state=" + std::to_string(static_cast<int>(task.state)));
             return volumemanager::ErrorCode::TASK_NOT_FINISH;
         }
-        // 分片读取 [offset, offset+read_size)；helper 内部按 offset+read_size>=file_size 判定末片。
-        bool is_last = false;
-        volumemanager::ErrorCode ret = ReadFileToStringMmap(task.file_path, out, offset, read_size, &is_last);
-        // mmap 阶段失败：不改 task_map_，FINISH 任务的 IO 失败由调用方决定下一步。
-        if (ret != volumemanager::ErrorCode::SUCCESS) {
-            const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "mmap_failed",
-                "task_id=" +
-                std::to_string(task_id) +
-                " code=" +
-                volumemanager::GetErrorMessage(ret) +
-                " code_int=" +
-                std::to_string(static_cast<int>(ret)) +
-                " file_path=" +
-                task.file_path);
-            last_failure_reason_buf_ = detail;
-            return ret;
-        }
-        // 服务端按 is_last 判定末片：unlink 读产物 + 置 FINISH（由清理线程稍后 Erase）；
-        // 非末片保留文件供后续分片继续读。
-        if (is_last) {
-            if (::unlink(task.file_path.c_str()) != 0 && errno != ENOENT) {
-                last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReadObjectByTaskId, "post_success_unlink_failed",
-                    std::string("code=") +
-                    volumemanager::GetErrorMessage(volumemanager::ErrorCode::IO_ERROR) +
-                    " code_int=" +
-                    std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
-                    " task_id=" +
-                    std::to_string(task_id) +
-                    " file_path=" +
-                    task.file_path +
-                    " errno=" +
-                    std::to_string(errno));
-            }
-            // 读产物已消费：置 FINISH 终态，交由清理线程从 task_map_ 移除。
-            MarkTaskState(task_id, WR_task::WRTaskState::FINISH);
-            // inode_id -> task_id 索引同步清除（仅当仍指向本 task 时）。
-            std::lock_guard<std::mutex> lock(inode_to_read_task_id_mutex_);
-            auto idx_it = inode_to_read_task_id_.find(task.inode_id);
-            if (idx_it != inode_to_read_task_id_.end() && idx_it->second == task_id) {
-                inode_to_read_task_id_.erase(idx_it);
-            }
-        }
-        return ret;
-    }
 
-    volumemanager::ErrorCode OpticalNodeManager::ReadObjectByInodeId(const std::string& inode_id,
-                                                      std::string* out,
-                                                      uint64_t offset,
-                                                      uint64_t read_size) {
-        // inode_id -> task_id 反查；仅多这一步，其余逻辑全部复用 ReadObjectByTaskId。
-        uint64_t task_id = 0;
-        {
-            std::lock_guard<std::mutex> lock(inode_to_read_task_id_mutex_);
-            auto idx_it = inode_to_read_task_id_.find(inode_id);
-            if (idx_it == inode_to_read_task_id_.end()) {
-                const std::string detail = FormatFailureDetail(start_failure_phase::kReadObjectByInodeId, "inode_not_found",
-                    "inode_id=" + inode_id);
-                last_failure_reason_buf_ = detail;
-                return volumemanager::ErrorCode::TASK_NOT_FOUND;
-            }
-            task_id = idx_it->second;
-        }
-        return ReadObjectByTaskId(task_id, out, offset, read_size);
-    }
-
-    volumemanager::ErrorCode OpticalNodeManager::WriteObject(
-            const std::string& inode_id,
-            const char* data,
-            uint64_t data_size,
-            uint64_t offset,
-            uint64_t total_size) {
-        if (!data && data_size > 0) {
-            const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "invalid_parameter",
-                "data=null data_size=" + std::to_string(data_size) + " inode_id=" + inode_id);
-            last_failure_reason_buf_ = detail;
-            return volumemanager::ErrorCode::INVALID_PARAMETER;
+        // READY：产物大小优先取实际值，失败回退提交时的期望值。
+        uint64_t file_size = task.expected_file_size;
+        struct stat st;
+        if (!task.file_path.empty() && ::stat(task.file_path.c_str(), &st) == 0 &&
+            S_ISREG(st.st_mode)) {
+            file_size = static_cast<uint64_t>(st.st_size);
         }
 
-        // 仅 RUNNING 接受写数据；其它状态拒绝。
-        if (GetStatus() != manager_status::kRunning) {
-            const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "not_ready",
-                "status=" + GetStatus());
-            last_failure_reason_buf_ = detail;
-            return volumemanager::ErrorCode::MANAGER_NOT_READY;
+        uint64_t read_handle = 0;
+        const ReadSessionTable::AcquireOutcome outcome =
+            read_sessions_.Acquire(task_id, task.file_path, file_size, kMaxReadBytes, &read_handle);
+        if (outcome == ReadSessionTable::AcquireOutcome::kPrepareReleased) {
+            // 准备引用已释放：不再允许为该任务创建新读会话。
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kAcquireReadSession,
+                "prepare_released", "task_id=" + std::to_string(task_id));
+            return volumemanager::ErrorCode::TASK_NOT_FOUND;
+        }
+        if (outcome != ReadSessionTable::AcquireOutcome::kAcquired) {
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kAcquireReadSession,
+                "acquire_session_failed",
+                "task_id=" + std::to_string(task_id) + " file_path=" + task.file_path);
+            return volumemanager::ErrorCode::IO_ERROR;
         }
 
-        const std::string file_name = inode_id + ".bin";
-        const std::string output_path = input_file_dir_ + file_name;
-
-        std::lock_guard<std::mutex> lock(in_progress_writes_mutex_);
-
-        // 首次见到此 inode：截断 temp file、记录 total_size。
-        auto it = in_progress_writes_.find(inode_id);
-        if (it == in_progress_writes_.end()) {
-            if (total_size == 0) {
-                // 空文件：直接创建空文件 + 任务 + 入压缩队列。
-                std::ofstream trunc(output_path, std::ios::binary | std::ios::trunc);
-                if (!trunc) {
-                    const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "open_failed",
-                        std::string("code=") +
-                        volumemanager::GetErrorMessage(volumemanager::ErrorCode::IO_ERROR) +
-                        " code_int=" +
-                        std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
-                        " path=" +
-                        output_path);
-                    last_failure_reason_buf_ = detail;
-                    return volumemanager::ErrorCode::IO_ERROR;
-                }
-                trunc.close();
-
-                const uint64_t generated_task_id = GenerateTaskId();
-                WR_task::WRTask task(generated_task_id, WR_task::WRTaskType::WRITE);
-                task.SetWriteTask(inode_id);
-                task.file_path = file_name;
-                task_map_->Insert(std::move(task));
-                zip_task_queue_->Push(WR_task::WRTaskShort(generated_task_id, WR_task::WRTaskType::WRITE));
-                last_failure_reason_buf_.clear();
-                return volumemanager::ErrorCode::SUCCESS;
-            }
-
-            std::ofstream trunc(output_path, std::ios::binary | std::ios::trunc);
-            if (!trunc) {
-                const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "open_failed",
-                    std::string("code=") +
-                    volumemanager::GetErrorMessage(volumemanager::ErrorCode::IO_ERROR) +
-                    " code_int=" +
-                    std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
-                    " path=" +
-                    output_path);
-                last_failure_reason_buf_ = detail;
-                return volumemanager::ErrorCode::IO_ERROR;
-            }
-            trunc.close();
-
-            InProgressWriteState new_state;
-            new_state.total_size = total_size;
-            in_progress_writes_.emplace(inode_id, new_state);
-            it = in_progress_writes_.find(inode_id);
-        }
-
-        InProgressWriteState& state = it->second;
-
-        // total_size 必须与首次调用一致；不一致视为参数错误。
-        if (state.total_size != total_size) {
-            const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "invalid_parameter",
-                "total_size_mismatch expected=" +
-                std::to_string(state.total_size) +
-                " got=" +
-                std::to_string(total_size) +
-                " inode_id=" +
-                inode_id);
-            last_failure_reason_buf_ = detail;
-            return volumemanager::ErrorCode::INVALID_PARAMETER;
-        }
-
-        // offset 必须严格等于已累积字节数；不接受乱序或重复写。
-        if (offset != state.bytes_received) {
-            const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "invalid_parameter",
-                "offset_mismatch expected=" +
-                std::to_string(state.bytes_received) +
-                " got=" +
-                std::to_string(offset) +
-                " inode_id=" +
-                inode_id);
-            last_failure_reason_buf_ = detail;
-            return volumemanager::ErrorCode::INVALID_PARAMETER;
-        }
-
-        if (data_size > 0) {
-            // in+out 打开（已截断创建）；seekp 定位到 offset。
-            std::fstream fs(output_path,
-                            std::ios::binary | std::ios::in | std::ios::out);
-            if (!fs) {
-                const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "open_failed",
-                    std::string("code=") +
-                    volumemanager::GetErrorMessage(volumemanager::ErrorCode::IO_ERROR) +
-                    " code_int=" +
-                    std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
-                    " path=" +
-                    output_path);
-                last_failure_reason_buf_ = detail;
-                return volumemanager::ErrorCode::IO_ERROR;
-            }
-            fs.seekp(static_cast<std::streamoff>(offset), std::ios::beg);
-            if (!fs.good()) {
-                fs.close();
-                const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "seek_failed",
-                    "offset=" + std::to_string(offset) + " path=" + output_path);
-                last_failure_reason_buf_ = detail;
-                return volumemanager::ErrorCode::IO_ERROR;
-            }
-            fs.write(data, static_cast<std::streamsize>(data_size));
-            if (!fs.good()) {
-                fs.close();
-                // 写失败：清状态 + 删残留文件；删失败走 sidecar。
-                in_progress_writes_.erase(it);
-                const std::string detail = FormatFailureDetail(start_failure_phase::kWriteObject, "write_failed",
-                    std::string("code=") +
-                    volumemanager::GetErrorMessage(volumemanager::ErrorCode::IO_ERROR) +
-                    " code_int=" +
-                    std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
-                    " offset=" +
-                    std::to_string(offset) +
-                    " data_size=" +
-                    std::to_string(data_size) +
-                    " path=" +
-                    output_path);
-                last_failure_reason_buf_ = detail;
-                if (::unlink(output_path.c_str()) != 0 && errno != ENOENT) {
-                    last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kWriteObject, "residual_unlink_failed",
-                        std::string("code=") +
-                        volumemanager::GetErrorMessage(volumemanager::ErrorCode::IO_ERROR) +
-                        " code_int=" +
-                        std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
-                        " path=" +
-                        output_path +
-                        " errno=" +
-                        std::to_string(errno));
-                }
-                return volumemanager::ErrorCode::IO_ERROR;
-            }
-            fs.close();
-        }
-
-        state.bytes_received += data_size;
-
-        // 累计 == total_size：创建 WRITE 任务 + 入压缩队列，从 in_progress 移除。
-        if (state.bytes_received >= state.total_size) {
-            const uint64_t generated_task_id = GenerateTaskId();
-            WR_task::WRTask task(generated_task_id, WR_task::WRTaskType::WRITE);
-            task.SetWriteTask(inode_id);
-            task.file_path = file_name;
-            task_map_->Insert(std::move(task));
-            zip_task_queue_->Push(WR_task::WRTaskShort(generated_task_id, WR_task::WRTaskType::WRITE));
-            in_progress_writes_.erase(it);
-        }
-
+        out->read_handle = read_handle;
+        out->file_size = file_size;
+        out->max_read_bytes = kMaxReadBytes;
         last_failure_reason_buf_.clear();
         return volumemanager::ErrorCode::SUCCESS;
     }
+
+    volumemanager::ErrorCode OpticalNodeManager::ReadPreparedFile(uint64_t read_handle,
+                                                                 uint64_t offset,
+                                                                 uint64_t size,
+                                                                 std::string* out,
+                                                                 ReadPreparedFileResult* result) {
+        if (out == nullptr || result == nullptr) {
+            return volumemanager::ErrorCode::INVALID_PARAMETER;
+        }
+        if (GetStatus() != manager_status::kRunning) {
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReadPreparedFile, "not_ready",
+                "status=" + GetStatus());
+            return volumemanager::ErrorCode::MANAGER_NOT_READY;
+        }
+
+        ReadSession session;
+        if (!read_sessions_.Get(read_handle, &session)) {
+            // 会话不存在：已关闭 / read_handle 传错。
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReadPreparedFile, "session_not_found",
+                "read_handle=" + std::to_string(read_handle));
+            return volumemanager::ErrorCode::TASK_NOT_FOUND;
+        }
+        // 单次读取不得超过会话建立时固定的上限。
+        if (size > session.max_read_bytes) {
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReadPreparedFile, "size_exceeds_max",
+                "read_handle=" + std::to_string(read_handle) +
+                " size=" + std::to_string(size) +
+                " max_read_bytes=" + std::to_string(session.max_read_bytes));
+            return volumemanager::ErrorCode::INVALID_PARAMETER;
+        }
+
+        // 复用 mmap 区间读取：内部一次性映射目标区间，不产生短读，也不 unlink 产物。
+        const std::size_t before = out->size();
+        bool eof = false;
+        const volumemanager::ErrorCode ret =
+            ReadFileToStringMmap(session.artifact_path, out, offset, size, &eof);
+        if (ret != volumemanager::ErrorCode::SUCCESS) {
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReadPreparedFile, "read_failed",
+                std::string("code=") + volumemanager::GetErrorMessage(ret) +
+                " code_int=" + std::to_string(static_cast<int>(ret)) +
+                " read_handle=" + std::to_string(read_handle) +
+                " artifact_path=" + session.artifact_path);
+            return ret;
+        }
+
+        result->bytes_read = static_cast<uint64_t>(out->size() - before);
+        result->eof = eof;
+        last_failure_reason_buf_.clear();
+        return volumemanager::ErrorCode::SUCCESS;
+    }
+
+    volumemanager::ErrorCode OpticalNodeManager::ReleaseReadSession(uint64_t read_handle) {
+        if (GetStatus() != manager_status::kRunning) {
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReleaseReadSession, "not_ready",
+                "status=" + GetStatus());
+            return volumemanager::ErrorCode::MANAGER_NOT_READY;
+        }
+        bool cleanable = false;
+        const uint64_t task_id = read_sessions_.Release(read_handle, &cleanable);
+        if (task_id == 0) {
+            // 会话不存在：已关闭 / read_handle 传错。
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReleaseReadSession,
+                "session_not_found", "read_handle=" + std::to_string(read_handle));
+            return volumemanager::ErrorCode::TASK_NOT_FOUND;
+        }
+        // 只释放本次打开的读取引用，不释放准备引用；
+        // 若准备引用已释放且这是最后一个读会话，则此刻清理产物。
+        if (cleanable) {
+            CleanupPreparedArtifact(task_id);
+        }
+        last_failure_reason_buf_.clear();
+        return volumemanager::ErrorCode::SUCCESS;
+    }
+
+    volumemanager::ErrorCode OpticalNodeManager::ReleasePreparedRead(uint64_t task_id) {
+        if (GetStatus() != manager_status::kRunning) {
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReleasePreparedRead, "not_ready",
+                "status=" + GetStatus());
+            return volumemanager::ErrorCode::MANAGER_NOT_READY;
+        }
+
+        auto task_opt = task_map_->Get(task_id);
+        if (!task_opt.has_value()) {
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReleasePreparedRead, "task_not_found",
+                "task_id=" + std::to_string(task_id));
+            return volumemanager::ErrorCode::TASK_NOT_FOUND;
+        }
+        const WR_task::WRTask& task = *task_opt;
+        if (task.type != WR_task::WRTaskType::READ) {
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReleasePreparedRead, "invalid_type",
+                "task_id=" + std::to_string(task_id) +
+                " type=" + std::to_string(static_cast<int>(task.type)));
+            return volumemanager::ErrorCode::INVALID_PARAMETER;
+        }
+        if (task.state == WR_task::WRTaskState::FINISH) {
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReleasePreparedRead,
+                "task_already_finish", "task_id=" + std::to_string(task_id));
+            return volumemanager::ErrorCode::TASK_ALREADY_FINISH;
+        }
+        // 本阶段不定义准备中的取消：要求任务已 READY。
+        if (!task.isReadTaskReady()) {
+            last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReleasePreparedRead, "task_not_ready",
+                "task_id=" + std::to_string(task_id) +
+                " state=" + std::to_string(static_cast<int>(task.state)));
+            return volumemanager::ErrorCode::TASK_NOT_FINISH;
+        }
+
+        // 撤销准备引用：停止接受新读会话。若此刻已无读会话，则立即清理产物。
+        if (read_sessions_.ReleasePrepare(task_id)) {
+            CleanupPreparedArtifact(task_id);
+        }
+        last_failure_reason_buf_.clear();
+        return volumemanager::ErrorCode::SUCCESS;
+    }
+
+    void OpticalNodeManager::CleanupPreparedArtifact(uint64_t task_id) {
+        auto task_opt = task_map_->Get(task_id);
+        if (!task_opt.has_value()) {
+            return;
+        }
+        const std::string artifact_path = task_opt->file_path;
+        if (!artifact_path.empty() && artifact_path != "none") {
+            if (::unlink(artifact_path.c_str()) != 0 && errno != ENOENT) {
+                last_sidecar_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kReleasePreparedRead,
+                    "artifact_unlink_failed",
+                    std::string("code=") + volumemanager::GetErrorMessage(volumemanager::ErrorCode::IO_ERROR) +
+                    " code_int=" + std::to_string(static_cast<int>(volumemanager::ErrorCode::IO_ERROR)) +
+                    " task_id=" + std::to_string(task_id) +
+                    " file_path=" + artifact_path +
+                    " errno=" + std::to_string(errno));
+            }
+        }
+        // 引用已归零且产物已清理 → 置 FINISH 终态，交由清理线程移除任务记录。
+        MarkTaskState(task_id, WR_task::WRTaskState::FINISH);
+    }
+
+    void OpticalNodeManager::CleanupOrphanReadArtifacts() {
+        if (read_dir_.empty()) {
+            return;
+        }
+        // 重建阶段单线程执行：先收集仍被 READ 任务认领的产物路径。
+        std::unordered_set<std::string> referenced;
+        for (const WR_task::WRTask& task : task_map_->SnapshotAll()) {
+            if (task.type == WR_task::WRTaskType::READ &&
+                !task.file_path.empty() && task.file_path != "none") {
+                referenced.insert(task.file_path);
+            }
+        }
+
+        DIR* dir = ::opendir(read_dir_.c_str());
+        if (dir == nullptr) {
+            last_sidecar_failure_reason_buf_ = FormatFailureDetail(
+                start_failure_phase::kCleanupOrphanReadArtifacts, "opendir_failed",
+                "read_dir=" + read_dir_ + " errno=" + std::to_string(errno));
+            return;
+        }
+        for (;;) {
+            errno = 0;
+            struct dirent* entry = ::readdir(dir);
+            if (entry == nullptr) {
+                break;
+            }
+            const std::string name = entry->d_name;
+            if (name == "." || name == "..") {
+                continue;
+            }
+            const std::string path = read_dir_ + name;
+            // 只处理普通文件；目录或非常规文件跳过。
+            if (!IsRegularFile(path)) {
+                continue;
+            }
+            if (referenced.find(path) != referenced.end()) {
+                continue;  // 仍被任务认领，保留。
+            }
+            if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
+                last_sidecar_failure_reason_buf_ = FormatFailureDetail(
+                    start_failure_phase::kCleanupOrphanReadArtifacts, "orphan_unlink_failed",
+                    "path=" + path + " errno=" + std::to_string(errno));
+            }
+        }
+        ::closedir(dir);
+    }
+
 // #endregion
 
 // #region 6. ID / 任务状态 / 通用工具
@@ -2555,6 +2539,11 @@ namespace optical_node_manager {
 
         current->state = new_state;
         current->state_changed_at_ms = WR_task::NowMs();
+        // READ 任务进入 READY 时刷新读产物有效期（当前时间 + TTL）。
+        if (new_state == WR_task::WRTaskState::READY &&
+            current->type == WR_task::WRTaskType::READ) {
+            current->read_expire_at_ms = current->state_changed_at_ms + kReadTaskTtlMs;
+        }
         if (!task_map_->Update(std::move(*current))) {
             return false;
         }
@@ -2781,6 +2770,7 @@ namespace optical_node_manager {
                     full_task->file_path = std::move(output_path);
                     task_map_->Update(std::move(*full_task));
                     MarkTaskState(task.task_id, WR_task::WRTaskState::READY);
+                    NotifyPreparedFileReady(task.task_id);
                     continue;
                 }
 
@@ -2815,6 +2805,7 @@ namespace optical_node_manager {
                             full_task->file_path = std::move(output_path);
                             task_map_->Update(std::move(*full_task));
                             MarkTaskState(task.task_id, WR_task::WRTaskState::READY);
+                            NotifyPreparedFileReady(task.task_id);
                             continue;
                         }
                         // Mount 成功但 inode 缺席：真实业务错误，重试不会变 SUCCESS。
@@ -2969,6 +2960,7 @@ namespace optical_node_manager {
                         sub->file_path = std::move(output_path);
                         task_map_->Update(std::move(*sub));
                         MarkTaskState(sub_tid, WR_task::WRTaskState::READY);
+                        NotifyPreparedFileReady(sub_tid);
                     } else {
                         MarkTaskFailed(sub_tid,
                                        volumemanager::ErrorCode::READ_FAILED,
@@ -3314,22 +3306,37 @@ namespace optical_node_manager {
             }
             elapsed = std::chrono::milliseconds(0);
 
-            // 收集所有 FINISH 终态任务，逐个 Erase 并清理 inode 索引。
-            const std::vector<uint64_t> finish_ids = task_map_->CollectFinishTaskIds();
-            for (uint64_t finish_id : finish_ids) {
-                // 读 inode_id 用于索引清理；任务可能已被并发移除，取不到则跳过。
-                auto finish_task = task_map_->Get(finish_id);
-                if (finish_task.has_value()) {
-                    // 先落审计日志再 Erase；日志写失败不影响清理。
-                    AppendTaskDoneLog(finish_task.value());
+            // 本轮只取一次当前时间，供所有任务的有效期判定复用（避免逐个取时间）。
+            const uint64_t now_ms = WR_task::NowMs();
 
-                    std::lock_guard<std::mutex> lock(inode_to_read_task_id_mutex_);
-                    auto idx_it = inode_to_read_task_id_.find(finish_task->inode_id);
-                    if (idx_it != inode_to_read_task_id_.end() && idx_it->second == finish_id) {
-                        inode_to_read_task_id_.erase(idx_it);
+            // 一次遍历同时做两件事：
+            //   1) 回收过期的读任务（仅 READ、已 READY、有有效期、已超时、且无读取引用）：
+            //      释放产物并置 FINISH；
+            //   2) 清理 FINISH 终态任务：落审计日志后 Erase（含本轮刚被回收的）。
+            for (const WR_task::WRTask& task : task_map_->SnapshotAll()) {
+                const uint64_t task_id = task.task_id;
+
+                // 过期的读任务：释放产物并置 FINISH。
+                if (task.type == WR_task::WRTaskType::READ &&
+                    task.state == WR_task::WRTaskState::READY &&
+                    task.read_expire_at_ms != 0 &&
+                    now_ms >= task.read_expire_at_ms &&
+                    !read_sessions_.HasReaders(task_id)) {
+                    CleanupPreparedArtifact(task_id);
+                    // 刚被置为 FINISH：只有这一种情况需要取当前态落日志。
+                    auto current = task_map_->Get(task_id);
+                    if (current.has_value() && current->isTaskFinish()) {
+                        AppendTaskDoneLog(*current);
+                        task_map_->Erase(task_id);
                     }
+                    continue;
                 }
-                task_map_->Erase(finish_id);
+
+                // 其余任务直接用快照副本判断，无需再查一次 task_map_。
+                if (task.isTaskFinish()) {
+                    AppendTaskDoneLog(task);
+                    task_map_->Erase(task_id);
+                }
             }
         }
     }

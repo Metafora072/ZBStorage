@@ -32,7 +32,9 @@ volume images, packs those images onto optical discs, burns the discs, and serve
   release after a burn.
 - Simulate optical library scheduling (read / pack / burn) through `cd_manager_sim`. Timing uses
   built-in defaults (e.g. `burn_bandwidth_mbps`), and is not configurable from the node config file.
-- Serve the brpc service `OpticalNodeService` (archive entry + data-plane read).
+- Serve the brpc service `OpticalNodeService`: the archive entry (`SendArchiveMetadata`) plus the
+  data-plane read chain (`SubscribeReadEvents` → `PrepareRead` → `ReadReady` push → `AcquireReadSession`
+  → `ReadPreparedFile` → `ReleaseReadSession` / `ReleasePreparedRead`).
 
 ## Implementation status
 - Archive engine is wired in: constructing `OpticalStorageServiceImpl(config)` immediately runs
@@ -65,9 +67,21 @@ volume images, packs those images onto optical discs, burns the discs, and serve
   export a device inventory or task telemetry yet, so the heartbeat keeps the node in `JOINING` with
   `readiness_message = "archive engine running; awaiting optical inventory and task telemetry"`
   instead of publishing fabricated empty inventory / idle measurements.
+- The data-plane read chain is wired end to end. `SubscribeReadEvents` accepts a client brpc Stream and
+  registers it in `ReadEventSessionRegistry` (`session_id → server Stream`); `PrepareRead` registers a
+  READ task with its `request_id` / `session_id` **before** enqueueing, so completion can never race the
+  registration; when the prepared artifact is READY the manager invokes `PreparedFileReadyCallback`,
+  which serializes a `ReadReadyEvent` and pushes it onto that session's Stream. `AcquireReadSession`
+  opens one independent read session per open (`read_handle → task_id`) and takes a read reference,
+  `ReadPreparedFile` returns file ranges with `bytes_read` / `eof` (no implicit cursor; EOF does not
+  release anything), and `ReleaseReadSession` / `ReleasePreparedRead` drop the read / prepare
+  references — the extracted artifact is unlinked only when both reach zero. Notification sessions and
+  read sessions are **process-local and not persisted**: after a restart the client re-subscribes, and a
+  recovered task (whose `session_id` was not persisted) is never sent `ReadReady`.
 - The optical node does not register `RealNodeService`; data-plane reads are served by
-  `OpticalNodeService` (`RequestAsyncReadFile` / `ReadObjectByTaskId` / `ReadObjectByInodeId`).
-  Optical nodes are excluded from normal replica placement by default.
+  `OpticalNodeService` via the 6 read RPCs (`SubscribeReadEvents` / `PrepareRead` /
+  `AcquireReadSession` / `ReadPreparedFile` / `ReleaseReadSession` / `ReleasePreparedRead`) plus the
+  server-pushed `ReadReady` event. Optical nodes are excluded from normal replica placement by default.
 
 ## Config
 `KEY=VALUE` text, parsed by `OpticalNodeConfig::LoadFromFile`. `#` starts a comment.
@@ -118,9 +132,7 @@ START_OPTICAL=true scripts/start_demo_stack.sh
 ## Tests
 `tests/optical_node/` runs the whole lifecycle in-process against fake real_node / scheduler / MDS
 clients as one ctest case (`optical_node`): archive batch shapes → download back pressure → pack →
-seal → burn → disc read-back → LRU eviction → graceful shutdown and restart recovery. See
-`tests/optical_node/README.md`.
-
-## Design docs
-- `optical_node_manager/MDS归档接口9_12.md` - MDS file-archive interface design.
-- `optical_node_manager/节点状态持久化与恢复方案.md` - runtime-state snapshot / restart-recovery design.
+seal → burn → data-plane read over the 6 read RPCs (subscribe / prepare / ReadReady push / acquire /
+range read / two-level release) with CD read-back and cache hits → read-session & reference lifecycle
+→ LRU eviction → graceful shutdown and restart recovery. The corpus is synthesized in-process (no
+external jpg). See `tests/optical_node/README.md`.

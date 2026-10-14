@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <queue>
@@ -23,15 +24,6 @@
 namespace brpc { class Channel; }
 
 namespace optical_node_manager {
-
-// LoadRuntimeState() 的结果。区分「本来就没有快照」与「有快照但没读成功」：
-// 前者是首次启动的正常退化，后者是异常，需要显式告知上层
-//（sidecar 是单槽字符串，运行期其它失败会把它覆盖掉）。
-enum class RuntimeStateLoadResult {
-    kNoSnapshot,   // 没有快照文件（首次启动 / 上次非正常退出）—— 正常
-    kLoaded,       // 快照载入成功
-    kLoadFailed,   // 快照存在但读取 / 解析失败 —— 异常
-};
 
 // 顶层读写管理：协调 volume_manager 缓存、cd_manager 异步光盘调度与后台工作线程。
 class OpticalNodeManager {
@@ -102,39 +94,40 @@ public:
     // 本接口不等待这些阶段完成。
     volumemanager::ErrorCode SendArchiveMetadata(const SendArchiveMetadataRequest& request);
 
-    // 提交异步读任务，立即返回 task_id；调用方通过 ReadObjectByTaskId 取结果。
-    volumemanager::ErrorCode RequestAsyncReadFile(const std::string& disk_id,
-                                                  const std::string& volume_id,
-                                                  const std::string& inode_id,
-                                                  uint64_t* task_id);
+    // 提交整文件异步准备任务（对应 OpticalNodeService.PrepareRead），立即返回 task_id。
+    // 先登记任务（含 session_id / request_id 关联），再入队，保证后台执行前通知关系已就绪。
+    // 成功（READ_DELAY）只表示受理，不代表文件可读；可读由后续 READY / ReadReady 表达。
+    // 不写 inode→task 索引：新链路按 task_id 定位，不按 inode 取最近任务。
+    volumemanager::ErrorCode SubmitPrepareTask(const PrepareReadParams& params, uint64_t* task_id);
 
-    // 按 task_id 读取已就绪（READY）读任务的 [offset, offset+read_size) 区间到 *out 末尾；
-    // 服务端按 offset+read_size>=file_size 自动判定末片，末片读成功后 unlink 读产物并置 FINISH。
-    // 客户端按固定 read_size 顺序调用即可，无需感知末片。
-    // FAILED 返回细分错误码。
-    volumemanager::ErrorCode ReadObjectByTaskId(const uint64_t& task_id,
-                                                std::string* out,
-                                                uint64_t offset,
-                                                uint64_t read_size);
+    // 准备完成回调：准备任务变为 READY 时由后台线程调用，把通知上下文交给协调层发送 ReadReady。
+    // 须在 Run() 之前注册；注册后不再变更，后台线程只读，无需加锁。
+    using PreparedFileReadyCallback = std::function<void(const PreparedFileReadyEvent&)>;
+    void SetPreparedFileReadyCallback(PreparedFileReadyCallback cb);
 
-    // 按 inode_id 读取最近一次 RequestAsyncReadFile(inode_id) 产物的 [offset, offset+read_size) 区间；
-    // 内部先查 inode_id→task_id 索引，再走 ReadObjectByTaskId 同一管线（is_last / unlink / Erase 一致）。
-    // 索引由 RequestAsyncReadFile 写入、ReadObjectByTaskId 末片清除。
-    // 未发起过对应 read 请求或已读完时返回 TASK_NOT_FOUND。
-    volumemanager::ErrorCode ReadObjectByInodeId(const std::string& inode_id,
-                                                std::string* out,
-                                                uint64_t offset,
-                                                uint64_t read_size);
+    // 为一次独立打开建立读会话（对应 OpticalNodeService.AcquireReadSession）。
+    // 仅对 READY 的 READ 任务有效；不触发新准备、不等待未完成任务；
+    // 每次调用产生独立 read_handle 并增加该任务的读取引用。
+    volumemanager::ErrorCode AcquireReadSession(uint64_t task_id, AcquireReadSessionResult* out);
 
-    // 写一段数据到 input_file_dir_/<inode_id>.bin 的 [offset, offset+data_size) 区间；
-    // 服务端按 inode_id 跟踪分片累积：累计字节 == total_size 时才创建 WRITE 任务并入压缩 / 刻录队列。
-    // 客户端按固定 data_size 顺序调用即可，offset 必须严格等于已累计字节数。
-    // 同 inode 多次调用串行；不同 inode 可并发（内部有互斥保护）。
-    volumemanager::ErrorCode WriteObject(const std::string& inode_id,
-                                         const char* data,
-                                         uint64_t data_size,
-                                         uint64_t offset,
-                                         uint64_t total_size);
+    // 在已建立的读会话上同步读取文件区间（对应 OpticalNodeService.ReadPreparedFile）。
+    // offset 为文件内绝对偏移，size 不得超过会话的 max_read_bytes；数据追加到 *out 末尾。
+    // eof 仅表示本次请求到达文件末尾，不释放会话或缓存；服务端不维护隐式读游标。
+    volumemanager::ErrorCode ReadPreparedFile(uint64_t read_handle,
+                                              uint64_t offset,
+                                              uint64_t size,
+                                              std::string* out,
+                                              ReadPreparedFileResult* result);
+
+    // 关闭一次读取会话（对应 OpticalNodeService.ReleaseReadSession）。
+    // 只删除读会话并减少读取引用；不释放准备引用、不清理产物，
+    // 因此 close 后仍可对同一 READY 任务再次 AcquireReadSession。
+    volumemanager::ErrorCode ReleaseReadSession(uint64_t read_handle);
+
+    // 释放本轮准备的准备引用（对应 OpticalNodeService.ReleasePreparedRead）。
+    // 之后不再接受该任务的新 AcquireReadSession；已有读会话继续可读。
+    // 准备引用与读取引用都归零时清理本次准备的临时产物。
+    volumemanager::ErrorCode ReleasePreparedRead(uint64_t task_id);
 
 private:
     // #endregion
@@ -266,6 +259,20 @@ private:
     // 把即将被清理的终态任务摘要追加写入 log_dir_/task_done_<yyyymmdd>.log；
     // 同一天追加，文件不存在时新建。写入失败仅记录 sidecar 原因，不影响清理主流程。
     void AppendTaskDoneLog(const WR_task::WRTask& task);
+
+    // 准备任务 READY 后触发完成回调：读取 task_id 对应任务，组装 PreparedFileReadyEvent
+    // 交给已注册的回调（session_id==0 或未注册回调时静默跳过）。
+    // 只用 task_id 重新取任务，不使用可能已被 Update(std::move(...)) 移空的本地副本。
+    void NotifyPreparedFileReady(uint64_t task_id);
+
+    // 准备引用与读取引用都归零后清理该任务的准备产物：
+    // unlink 提取出来的临时文件，并把任务置 FINISH（交由清理线程移除记录）。
+    // 只清理本任务产物，不删除光盘归档原件、不改元数据。调用方须已确认引用归零。
+    void CleanupPreparedArtifact(uint64_t task_id);
+
+    // 重建阶段（单线程、起线程之前）扫描 read_dir_，删除没有被任何 READ 任务
+    // file_path 认领的孤儿产物文件。只删普通文件，不删目录。
+    void CleanupOrphanReadArtifacts();
     // #endregion
 
     // #region 7. 线程主体（进程循环）
@@ -411,6 +418,12 @@ private:
     // 任务元数据索引（按 task_id）。
     WR_task::WRTaskMap* task_map_;
 
+    // 准备完成回调；仅 Run() 之前的 SetPreparedFileReadyCallback 写入，之后只读。
+    PreparedFileReadyCallback prepared_file_ready_callback_;
+
+    // 读会话表：read_handle -> 会话，并跟踪每个任务的读取引用数。
+    ReadSessionTable read_sessions_;
+
     // 可用 volume_id 的 FIFO 池；容量为 available_id_count_，取用时按需向 MDS 补齐。
     std::queue<uint64_t> available_volume_ids;
     // 可用 disk_id 的 FIFO 池；容量同为 available_id_count_，取用/消费语义与 volume 池一致：
@@ -445,21 +458,6 @@ private:
     std::atomic<uint64_t> next_volume_id_{1};
     // 本地 disk_id（对应 MDS disc_id）单调递增计数器。
     std::atomic<uint64_t> next_disk_id_{1};
-
-    // WriteObject 分片上传中的 inode 状态：累计字节数 + 预期总大小。
-    // 累计 == total_size 时创建 WRITE 任务并从 map 移除；中途失败或客户端放弃则残留。
-    struct InProgressWriteState {
-        uint64_t bytes_received = 0;
-        uint64_t total_size = 0;
-    };
-    std::unordered_map<std::string, InProgressWriteState> in_progress_writes_;
-    std::mutex in_progress_writes_mutex_;
-
-    // inode_id -> 最近一次 RequestAsyncReadFile 创建的 READ 任务 id。
-    // 用于 ReadObjectByInodeId 反查；同 inode 多次请求只保留最新 task_id。
-    // 末片读取成功后由 ReadObjectByTaskId 清理。
-    std::unordered_map<std::string, uint64_t> inode_to_read_task_id_;
-    std::mutex inode_to_read_task_id_mutex_;
 
     // 待打包 inode_id 集合：ZipTaskProcessor 在每次 AddFileToCollect 前登记本次 inode，
     // 封装触发后扫描 temp_dir_ 剩余 temp_*.compressed，diff 出本次被打包的 inode_id 并移除。
@@ -536,6 +534,12 @@ private:
 
     // 单任务重试上限；超限后由 ShouldGiveUpRetry 强制置 FAILED。
     static constexpr uint32_t attempt_count_max_ = 32;
+
+    // AcquireReadSession 返回给客户端的单次读取上限；须 > 0，会话期间固定。
+    static constexpr uint32_t kMaxReadBytes = 4 * 1024 * 1024;
+
+    // 读产物有效期：READY 后保留 2 小时；到期且无读取引用时由清理线程回收产物。
+    static constexpr uint64_t kReadTaskTtlMs = 2ull * 60ull * 60ull * 1000ull;
 
     // 清理线程扫描间隔：每 10 分钟移除一次 task_map_ 中的 FINISH 任务。
     static constexpr std::chrono::seconds cleanup_interval_ = std::chrono::seconds(600);

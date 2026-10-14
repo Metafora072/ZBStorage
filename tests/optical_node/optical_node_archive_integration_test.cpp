@@ -1,22 +1,24 @@
 // optical_node 单模块集成测试（单一综合场景，ctest 用例名 optical_node）：
 //   进程内起真光节点 server（OpticalStorageServiceImpl + BrpcOpticalNodeService），
 //   配合假 real_node / scheduler 两个 brpc server，以及假 MDS / client 两个 brpc 客户端，
-//   在小规模参数（卷镜像 10MiB、每文件 1MiB 按 256KiB 切成 4 个对象分片、光盘容量 100MiB、
-//   image_dir 上限 14 / 背压上限 12）下仿真完整生命周期：
+//   在小规模参数（卷镜像 10MiB、每文件 1MiB 按 256KiB 切成 4 个对象分片、语料压缩比 ≈0.97、
+//   光盘容量 100MiB、image_dir 上限 14 / 背压上限 12）下仿真完整生命周期：
 //     归档下发（四种批次形态）→ （下载侧背压节流）从 real_node 按分片下载 → 压缩封装
 //     → 打包汇报（控制台）→ 按容量积攒 → 装满封印为一张光盘（disc_sim/disc_<id>.vdisc）→ 刻录
 //     → 逐个释放 image_dir 中的镜像副本 → 刻录汇报（控制台）
-//     数据面读 → 镜像被释放时按元数据偏移从 vdisc 提取回 image_dir（CD_READ）
-//     → 分片读到 FINISH → 满载后的 LRU 淘汰与重新提取
+//     数据面读（新 6 接口链路）：SubscribeReadEvents（附带 Stream）→ PrepareRead
+//     → ReadReady 主动通知 → AcquireReadSession → ReadPreparedFile 区间读
+//     → ReleaseReadSession → ReleasePreparedRead；镜像被释放时按元数据偏移从 vdisc 提取回 image_dir（CD_READ）
+//     → 满载后的 LRU 淘汰与重新提取
 //     → 正常关机落盘（log/runtime_state_snapshot）→ 以同一 archive_root 重启恢复
-//       → 在途读任务继续推进到终态
+//       → 在途准备任务继续推进到可读并被读回
 //
 // 用法: optical_node_archive_integration_test --corpus <dir> --work-dir <dir>
 // 输出: 全程日志写到 stderr（由 run_optical_node_archive_test.py 落盘为 <work-dir>/output.log）。
 //       日志按"测试点"组织：
 //         [CASE] A3.1 第 1/12 卷：数据面读 + CD_READ 重载
 //             测试目标 / 期望 / 验证方法
-//           [STEP] 读 volume_1 inode=1000（镜像在光盘库，预期触发一次 CD_READ 装载）
+//           [STEP] 准备 volume_1 inode=1000（镜像在光盘库，预期触发一次 CD_READ 装载）
 //           [PASS] 读回数据与语料逐字节一致（inode=1000，共 1048576 字节，耗时 21043ms）
 //         [CASE-END] A3.1 result=PASS checks=5 failed=0
 //       末尾输出"测试点汇总"表与各测试点目标清单；测试点编号见 README.md。
@@ -32,6 +34,7 @@
 #include "OpticalStorageServiceImpl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <ctime>
@@ -49,8 +52,8 @@ using namespace zb::optical_node;
 using namespace zb::optical_node::test;
 
 // 小规模测试参数（与 prepare_archive_corpus.py 的假设一致）。
-// 卷镜像 10 MiB × 每卷 10 个 1 MiB 文件（实测压缩率 ≈0.983）→ 单镜像 ≈ 10.1 MiB；
-// 光盘容量 100 MiB → 单盘恰好容纳 10 个镜像，因此需要 >10 个卷才会封印出第一张盘。
+// 卷镜像 10 MiB × 每卷 10 个 1 MiB 文件（语料压缩比 ≈0.97）→ 单镜像 ≈ 9.7 MiB；
+// 光盘容量 100 MiB → 单盘容纳 10 个镜像，因此需要 >10 个卷才会封印出第一张盘。
 constexpr uint64_t kVolumeSizeBytes = 10ull * 1024 * 1024;
 constexpr double kSizeThreshold = 0.9;
 constexpr uint64_t kDiscCapacityBytes = 100ull * 1024 * 1024;
@@ -64,7 +67,10 @@ constexpr uint64_t kFileSizeBytes = 1024ull * 1024;
 constexpr size_t kShardsPerFile = static_cast<size_t>(kFileSizeBytes / kObjectUnitBytes);
 
 constexpr uint8_t kAvailableIdCount = 5;
-constexpr uint64_t kReadShardBytes = 4ull * 1024 * 1024;
+
+// 读会话单次读取上限（OpticalNodeManager::kMaxReadBytes）。PrepareRead 成功后
+// AcquireReadSession 返回的 max_read_bytes 必须等于该值且 > 0。
+constexpr uint32_t kExpectedMaxReadBytes = 4u * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // 单一综合档位：容量约束参数只有一个取值，覆盖「写链路顺跑」与「容量满载边界」两类观察面。
@@ -107,10 +113,11 @@ constexpr const char* kCaseA0Objective =
 constexpr const char* kCaseA0Expectation =
     "语料分组数 > 0 且每卷文件数一致；档位参数满足「单盘镜像数 < 背压上限 < image_dir 容量」；"
     "OpticalNodeManager 状态为 RUNNING（IsArchiveEngineReady 为真）；"
+    "SubscribeReadEvents 建立通知通道并返回 >0 的 session_id；"
     "光节点、假 real_node、假 scheduler 三个 brpc server 均成功监听；archive 工作目录已创建。";
 constexpr const char* kCaseA0Method =
     "载入 manifest.tsv 并交叉校验 expected_pack_plan.tsv；调用 IsArchiveEngineReady()/GetArchiveStatusDetail()；"
-    "读取各 LocalServer 的 listen_address()；stat 各工作目录。";
+    "以附带 brpc Stream 的方式订阅通知并校验 session_id；读取各 LocalServer 的 listen_address()；stat 各工作目录。";
 
 constexpr const char* kCaseA1Objective =
     "验证写链路：MDS 下发的归档文件应被节点按 target_node_id/target_disk_id 从 real_node 分片下载、"
@@ -152,24 +159,29 @@ constexpr const char* kCaseA2Method =
     "并交叉校验每个文件的分片数与分片大小（多分片形态确实生效）。";
 
 constexpr const char* kCaseA3Objective =
-    "验证读链路在镜像已刻录（不在 image_dir）时的行为：读请求必须触发 CD_READ，把对应卷镜像"
-    "按元数据记录的偏移从 vdisc 光盘文件中复制回 image_dir，再把目标 inode 从镜像中按分片读出，"
-    "末片读完后任务进入 FINISH；vdisc 作为光盘本体持久保留、不被读取搬移或删除。";
+    "验证新 6 接口读链路在镜像已刻录（不在 image_dir）时的完整闭环：PrepareRead 立即可受理并返回"
+    " task_id，准备完成后节点经通知 Stream 主动推送 ReadReady，客户端据 task_id 建立读会话并按"
+    "文件绝对偏移区间读取，镜像在此过程中被 CD_READ 从 vdisc 复制回 image_dir；vdisc 作为光盘本体"
+    "持久保留、不被读取搬移或删除。";
 constexpr const char* kCaseA3Expectation =
-    "读回数据与语料原始 jpg 数据逐字节一致；镜像回到 image_dir；disc_sim 中的 vdisc 数量保持不变"
-    "（读回只复制、不搬移）；末片读完后 ReadObjectByInodeId 返回 MDS_NOT_FOUND（FINISH 时 inode→task 索引被清除）。";
+    "PrepareRead 返回 OPTICAL_OK 与 task_id；收到 request_id/task_id/inode_id/file_size 匹配的 ReadReady；"
+    "AcquireReadSession 返回 read_handle、file_size 与 max_read_bytes(>0 且为 4MiB)；"
+    "分段读回的字节与语料逐字节一致、末段 eof=true 且 bytes_read 等于 data 长度；"
+    "ReleaseReadSession/ReleasePreparedRead 均返回 OPTICAL_OK；镜像回到 image_dir，"
+    "disc_sim 中的 vdisc 数量保持不变（读回只复制、不搬移）。";
 constexpr const char* kCaseA3Method =
-    "RequestAsyncReadFile 取 task_id，按 4MiB 分片轮询读并拼接后与本地语料比对；"
-    "用 RPC 状态码作为 FINISH 证据；每步等待均记录实际耗时。";
+    "客户端 SubscribeReadEvents 建立通知通道后 PrepareRead 取 task_id，阻塞等待匹配 request_id 的"
+    "ReadReady；再 AcquireReadSession/ReadPreparedFile 按 max_read_bytes 分段读并拼接与本地语料比对；"
+    "以 RPC 状态码与 eof 标志作为判定证据，每步等待均记录实际耗时。";
 
 constexpr const char* kCaseA4Objective =
     "验证同一卷内第二次读不重复走光盘装载：镜像已在 image_dir 时应直接命中缓存，"
-    "避免无谓的 CD_READ（单次装载约 20~30s）。";
+    "从 PrepareRead 到 ReadReady 的耗时远小于一次 CD_READ（单次装载约 20~30s）。";
 constexpr const char* kCaseA4Expectation =
-    "第二次读耗时 < 3000ms（远小于一次 CD 装载的仿真时长）；image_dir 与 disc_sim 的目录内容"
-    "在第二次读前后完全不变；读回数据仍与语料一致。";
+    "第二次读的「PrepareRead → ReadReady」耗时 < 3000ms；image_dir 与 disc_sim 的目录内容"
+    "在第二次读前后完全不变；读回数据仍与语料一致，并在结束后正常释放两级引用。";
 constexpr const char* kCaseA4Method =
-    "记录读前读后的目录快照并比对，同时以读耗时作为交叉证据（两者需同时成立）。";
+    "记录读前读后的目录快照并比对，同时以「准备到就绪」耗时作为交叉证据（两者需同时成立）。";
 
 constexpr const char* kCaseA5Objective =
     "验证 image_dir 达到容量上限后读入新卷时，节点应淘汰一个已有的 READ 镜像（直接删除缓存副本）"
@@ -182,6 +194,21 @@ constexpr const char* kCaseA5Method =
     "先读满 image_dir 再读一个「已刻录但不在 image_dir」的卷，随后对比读前/读后目录快照求出 victim，"
     "再对 victim 发起一次完整读（含字节比对）。";
 
+constexpr const char* kCaseA9Objective =
+    "验证新读接口的会话与引用语义：同一 READY 任务可被多次独立 AcquireReadSession（各自持有读取引用）；"
+    "EOF 只表示本次请求到达文件末尾，不关闭会话、不释放缓存；同一会话支持随机读、重复读与先读尾部再读头部；"
+    "读取上限之外的单次请求被拒；ReleaseReadSession 只减少读取引用（close 后仍可再次 open），"
+    "ReleasePreparedRead 才撤销新打开资格，且两者归零后清理临时产物。";
+constexpr const char* kCaseA9Expectation =
+    "同一任务先后两次 AcquireReadSession 得到不同 read_handle，且任一 read_handle 都能读到正确字节；"
+    "读尾区间 eof=true、offset≥file_size 返回 0 字节且 eof=true、size=0 返回 0 字节且 eof=false；"
+    "单次 size>max_read_bytes 返回 OPTICAL_INVALID_ARGUMENT；关闭其中一个句柄后另一个仍可读；"
+    "关闭会话后再次 AcquireReadSession 仍成功（准备引用尚在）；ReleasePreparedRead 之后再 AcquireReadSession"
+    "返回 OPTICAL_NOT_FOUND（不再允许新会话）。";
+constexpr const char* kCaseA9Method =
+    "对已在 image_dir 的卷选一个 inode，走完整准备链路后逐个调用上述接口，"
+    "以返回码、bytes_read/eof 与逐字节比对结果作为判定证据。";
+
 constexpr const char* kCaseA6Objective =
     "验证归档流程结束后不残留中间产物：input/ 中不应留下已归档文件，log/ 目录应存在"
     "（任务终态日志按 600s 周期清理生成，测试期内不出现属已知缺口）。";
@@ -193,18 +220,21 @@ constexpr const char* kCaseA6Method =
 constexpr const char* kCaseA8Objective =
     "验证正常关机的状态持久化与重启恢复：Shutdown() 应把运行期内存态（任务表 / 队列 / ID 计数器"
     "与可用 ID 池 / 归档断点 / 未封盘文件集 / 镜像管理表）落到 log/runtime_state_snapshot，"
-    "重启后读回并让关机前未完成的任务继续推进到终态——这是「节点重启不丢在途工作」的核心保证。";
+    "重启后读回并让关机前未完成的准备任务继续推进到 READY 并被读回——这是「节点重启不丢在途工作」的核心保证。"
+    "通知会话（ReadEventSessionRegistry）与读会话表属于进程内易失状态、不落盘，故重启后对该恢复任务"
+    "不再有 ReadReady，客户端以 AcquireReadSession 返回 OPTICAL_NOT_READY/OPTICAL_OK 作为就绪判据。";
 constexpr const char* kCaseA8Expectation =
     "关机快照文件生成且非空；重启后节点状态为 RUNNING 且状态原因标明已恢复；"
     "快照被消费为 runtime_state_snapshot.loaded（不会重复重放）；"
     "image/ 与 disc_sim/ 的目录内容在重启前后完全一致（恢复不搬移、不删除物理镜像）；"
     "node_discs_meta 的追加块数与字节数在重启前后一致（未重复追加、未改写索引），"
     "且 meta/ 不出现残留的 disc_<id>_meta（封印定稿元数据不因重启被复原）；"
-    "关机前提交的读任务（READ + 其 CD_READ 装载）在重启后仍能读回完整数据"
-    "并与语料逐字节一致，末片读完后任务进入 FINISH。";
+    "关机前提交的准备任务（READ + 其 CD_READ 装载）在重启后仍能推进到 READY，"
+    "经 AcquireReadSession/ReadPreparedFile 读回完整数据并与语料逐字节一致。";
 constexpr const char* kCaseA8Method =
-    "先提交一次读请求拿到 task_id（不等待结果）后立即 Shutdown()，再以同一 archive_root 重建节点；"
-    "断言快照文件状态，并以该 task_id 继续分片读取直到读通（超时与单次 CD_READ 同量级）。";
+    "先 PrepareRead 拿到 task_id（不等待就绪）后立即 Shutdown()，再以同一 archive_root 重建节点；"
+    "断言快照文件状态，并以该 task_id 轮询 AcquireReadSession 直到 OPTICAL_OK（超时与单次 CD_READ 同量级），"
+    "随后区间读取并与语料比对，最后两级释放。";
 
 constexpr const char* kCaseB1Objective =
     "验证「MDS 批次切分」与「卷镜像分组」解耦：节点按文件顺序逐个压缩累加，因此批次边界"
@@ -462,140 +492,400 @@ std::string JoinVolumes(const std::set<size_t>& volumes) {
     return text;
 }
 
-// 一次读的结果。
+// 一次完整读（新 6 接口链路）的结果。
 struct ReadOutcome {
     bool ok{false};
-    double elapsed_ms{0.0};
+    double elapsed_ms{0.0};   // PrepareRead → 读完
+    double ready_ms{0.0};     // PrepareRead → 就绪（ReadReady / 轮询到 OPTICAL_OK）
     uint64_t task_id{0};
+    uint64_t read_handle{0};
+    uint64_t file_size{0};
+    uint32_t max_read_bytes{0};
+    std::string request_id;
     std::string data;
     std::string error;
 };
 
-// 提交异步读请求并返回 task_id（0 表示未被受理）；不等待读结果。
-// 单独暴露出来是为了让重启用例能在「任务刚建立、结果尚未就绪」时关机。
-uint64_t RequestReadTask(FakeReadClient* client,
-                         uint64_t volume_id,
-                         uint64_t inode_id,
-                         std::string* error) {
-    zb::rpc::MdsStatusCode status = zb::rpc::MDS_INTERNAL_ERROR;
-    std::string err;
-    uint64_t task_id = 0;
-    const std::string image_id = "img-" + std::to_string(volume_id);
-    if (!client->RequestRead("optical-disk-1", image_id, inode_id, &task_id, &status, &err)) {
-        if (error != nullptr) {
-            *error = "RequestAsyncReadFile 传输失败: " + err;
-        }
-        return 0;
-    }
-    if (status != zb::rpc::MDS_OK || task_id == 0) {
-        if (error != nullptr) {
-            *error = "RequestAsyncReadFile 未受理, status=" +
-                     std::to_string(static_cast<int>(status)) + " message=" + err;
-        }
-        return 0;
-    }
-    return task_id;
+// 已建立的读会话。
+struct AcquiredSession {
+    bool ok{false};
+    uint64_t read_handle{0};
+    uint64_t file_size{0};
+    uint32_t max_read_bytes{0};
+    std::string error;
+};
+
+// 进程内请求编号生成器（request_id 只需在客户端实例内唯一）。
+std::string NextRequestId() {
+    static std::atomic<uint64_t> counter{0};
+    return "req-" + std::to_string(counter.fetch_add(1) + 1);
 }
 
-// 按 task_id 取完该 inode 的全部分片并与语料原始字节比对。
-// task_id 由节点的任务表服务，因此可以跨「节点重启」使用（重启后任务表由快照恢复）。
-ReadOutcome ReadByTaskId(FakeReadClient* client,
-                         const Corpus& corpus,
-                         const Env& env,
-                         uint64_t inode_id,
-                         uint64_t task_id,
-                         int ready_timeout_ms) {
+// 光学状态码文本名，用于日志与失败详情。
+std::string OpticalStatusName(zb::rpc::OpticalStatusCode code) {
+    switch (code) {
+        case zb::rpc::OPTICAL_OK:
+            return "OPTICAL_OK";
+        case zb::rpc::OPTICAL_INVALID_ARGUMENT:
+            return "OPTICAL_INVALID_ARGUMENT";
+        case zb::rpc::OPTICAL_NOT_FOUND:
+            return "OPTICAL_NOT_FOUND";
+        case zb::rpc::OPTICAL_NOT_READY:
+            return "OPTICAL_NOT_READY";
+        case zb::rpc::OPTICAL_INTERNAL_ERROR:
+            return "OPTICAL_INTERNAL_ERROR";
+        default:
+            return "OPTICAL_UNKNOWN(" + std::to_string(static_cast<int>(code)) + ")";
+    }
+}
+
+// PrepareRead：提交整文件异步准备任务；成功回填 request_id / task_id，不等待就绪。
+bool SubmitPrepare(FakeReadClient* client,
+                   const Corpus& corpus,
+                   uint64_t session_id,
+                   uint64_t volume_id,
+                   uint64_t inode_id,
+                   std::string* request_id_out,
+                   uint64_t* task_id_out,
+                   std::string* error) {
+    const CorpusFile* file = corpus.Find(inode_id);
+    if (file == nullptr) {
+        if (error != nullptr) {
+            *error = "语料中不存在 inode=" + std::to_string(inode_id);
+        }
+        return false;
+    }
+    const std::string request_id = NextRequestId();
+    const std::string image_id = "img-" + std::to_string(volume_id);
+    zb::rpc::OpticalStatusCode status = zb::rpc::OPTICAL_INTERNAL_ERROR;
+    std::string err;
+    uint64_t task_id = 0;
+    if (!client->PrepareRead(session_id, request_id, inode_id, "optical-disk-1", image_id,
+                             file->file_size, &task_id, &status, &err)) {
+        if (error != nullptr) {
+            *error = "PrepareRead 传输失败: " + err;
+        }
+        return false;
+    }
+    if (status != zb::rpc::OPTICAL_OK || task_id == 0) {
+        if (error != nullptr) {
+            *error = "PrepareRead 未受理, status=" + OpticalStatusName(status) + " message=" + err;
+        }
+        return false;
+    }
+    if (request_id_out != nullptr) {
+        *request_id_out = request_id;
+    }
+    if (task_id_out != nullptr) {
+        *task_id_out = task_id;
+    }
+    return true;
+}
+
+// AcquireReadSession：为一次独立打开建立读会话。
+AcquiredSession AcquireSession(FakeReadClient* client, uint64_t task_id) {
+    AcquiredSession session;
+    zb::rpc::OpticalStatusCode status = zb::rpc::OPTICAL_INTERNAL_ERROR;
+    std::string err;
+    if (!client->AcquireReadSession(task_id, &session.read_handle, &session.file_size,
+                                    &session.max_read_bytes, &status, &err)) {
+        session.error = "AcquireReadSession 传输失败: " + err;
+        return session;
+    }
+    if (status != zb::rpc::OPTICAL_OK) {
+        session.error = "AcquireReadSession 失败 status=" + OpticalStatusName(status) +
+                        " message=" + err;
+        return session;
+    }
+    session.ok = true;
+    return session;
+}
+
+// ReadPreparedFile：读 [offset, offset+size)；成功时数据 append 到 *out。
+bool ReadRange(FakeReadClient* client,
+               uint64_t read_handle,
+               uint64_t offset,
+               uint64_t size,
+               std::string* out,
+               uint64_t* bytes_read,
+               bool* eof,
+               zb::rpc::OpticalStatusCode* status,
+               std::string* error) {
+    zb::rpc::OpticalStatusCode st = zb::rpc::OPTICAL_INTERNAL_ERROR;
+    uint64_t got = 0;
+    bool is_eof = false;
+    std::string err;
+    if (!client->ReadPreparedFile(read_handle, offset, size, out, &got, &is_eof, &st, &err)) {
+        if (error != nullptr) {
+            *error = "ReadPreparedFile 传输失败: " + err;
+        }
+        return false;
+    }
+    if (status != nullptr) {
+        *status = st;
+    }
+    if (bytes_read != nullptr) {
+        *bytes_read = got;
+    }
+    if (eof != nullptr) {
+        *eof = is_eof;
+    }
+    if (st != zb::rpc::OPTICAL_OK) {
+        if (error != nullptr) {
+            *error = "ReadPreparedFile 失败 status=" + OpticalStatusName(st) + " message=" + err;
+        }
+        return false;
+    }
+    return true;
+}
+
+// 在会话上读回全文件（按 max_read_bytes 分段），并与语料原始字节比对。
+bool ReadWholeFileOnSession(FakeReadClient* client,
+                            const Corpus& corpus,
+                            uint64_t inode_id,
+                            const AcquiredSession& session,
+                            std::string* out,
+                            std::string* error) {
+    const CorpusFile* file = corpus.Find(inode_id);
+    if (file == nullptr) {
+        if (error != nullptr) {
+            *error = "语料中不存在 inode=" + std::to_string(inode_id);
+        }
+        return false;
+    }
+    out->clear();
+    const uint64_t step = session.max_read_bytes;
+    for (uint64_t offset = 0; offset < file->file_size; offset += step) {
+        const uint64_t want = std::min<uint64_t>(step, file->file_size - offset);
+        std::string piece;
+        uint64_t got = 0;
+        bool eof = false;
+        zb::rpc::OpticalStatusCode status = zb::rpc::OPTICAL_INTERNAL_ERROR;
+        std::string err;
+        if (!ReadRange(client, session.read_handle, offset, want, &piece, &got, &eof, &status, &err)) {
+            if (error != nullptr) {
+                *error = err;
+            }
+            return false;
+        }
+        if (got != piece.size()) {
+            if (error != nullptr) {
+                *error = "bytes_read 与 data 长度不一致 offset=" + std::to_string(offset) +
+                         " bytes_read=" + std::to_string(got) + " data=" +
+                         std::to_string(piece.size());
+            }
+            return false;
+        }
+        if (got != want) {
+            if (error != nullptr) {
+                *error = "区间短读 offset=" + std::to_string(offset) + " want=" +
+                         std::to_string(want) + " got=" + std::to_string(got);
+            }
+            return false;
+        }
+        const bool expect_eof = (offset + want >= file->file_size);
+        if (eof != expect_eof) {
+            if (error != nullptr) {
+                *error = "eof 标志不符 offset=" + std::to_string(offset) +
+                         " got=" + std::string(eof ? "true" : "false") +
+                         " expected=" + std::string(expect_eof ? "true" : "false");
+            }
+            return false;
+        }
+        out->append(piece);
+    }
+    std::string expected;
+    if (!corpus.ReadFileContent(inode_id, &expected)) {
+        if (error != nullptr) {
+            *error = "读取语料原始数据失败 inode=" + std::to_string(inode_id);
+        }
+        return false;
+    }
+    if (*out != expected) {
+        if (error != nullptr) {
+            *error = "读回数据与语料不一致 inode=" + std::to_string(inode_id) +
+                     " actual_size=" + std::to_string(out->size()) +
+                     " expected_size=" + std::to_string(expected.size());
+        }
+        return false;
+    }
+    return true;
+}
+
+// ReleaseReadSession + ReleasePreparedRead：两级释放。
+bool ReleaseRead(FakeReadClient* client, uint64_t task_id, uint64_t read_handle, std::string* error) {
+    zb::rpc::OpticalStatusCode status = zb::rpc::OPTICAL_INTERNAL_ERROR;
+    std::string err;
+    if (!client->ReleaseReadSession(read_handle, &status, &err) ||
+        status != zb::rpc::OPTICAL_OK) {
+        if (error != nullptr) {
+            *error = "ReleaseReadSession 失败 status=" + OpticalStatusName(status) + " message=" + err;
+        }
+        return false;
+    }
+    status = zb::rpc::OPTICAL_INTERNAL_ERROR;
+    err.clear();
+    if (!client->ReleasePreparedRead(task_id, &status, &err) || status != zb::rpc::OPTICAL_OK) {
+        if (error != nullptr) {
+            *error = "ReleasePreparedRead 失败 status=" + OpticalStatusName(status) + " message=" + err;
+        }
+        return false;
+    }
+    return true;
+}
+
+// 正常链路读某卷某个 inode：SubmitPrepare → 等 ReadReady → AcquireReadSession →
+// 分段读并与语料比对；release_at_end 控制是否在读完后再做两级释放。
+ReadOutcome ReadInode(FakeReadClient* client,
+                      const Corpus& corpus,
+                      const Env& env,
+                      uint64_t session_id,
+                      uint64_t volume_id,
+                      uint64_t inode_id,
+                      int ready_timeout_ms,
+                      bool release_at_end) {
     ReadOutcome outcome;
+    const auto begin = std::chrono::steady_clock::now();
+    std::string error;
+    std::string request_id;
+    uint64_t task_id = 0;
+    if (!SubmitPrepare(client, corpus, session_id, volume_id, inode_id, &request_id, &task_id,
+                       &error)) {
+        outcome.error = error;
+        return outcome;
+    }
     outcome.task_id = task_id;
+    outcome.request_id = request_id;
+
+    // 节点在 MarkTaskState(READY) 之后推送 ReadReady，收到即代表可立即建立读会话。
+    ReadReadyNotice notice;
+    if (!client->WaitReadReady(request_id, &notice, ready_timeout_ms)) {
+        outcome.error = "未在 " + std::to_string(ready_timeout_ms) +
+                        "ms 内收到 ReadReady（request_id=" + request_id +
+                        " task_id=" + std::to_string(task_id) + "）";
+        return outcome;
+    }
+    outcome.ready_ms = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - begin).count();
+
     const CorpusFile* file = corpus.Find(inode_id);
     if (file == nullptr) {
         outcome.error = "语料中不存在 inode=" + std::to_string(inode_id);
         return outcome;
     }
-
-    zb::rpc::MdsStatusCode status = zb::rpc::MDS_INTERNAL_ERROR;
-    const auto begin = std::chrono::steady_clock::now();
-    std::string data;
-    // 首片轮询：镜像装载期间返回 MDS_INTERNAL_ERROR（TASK_NOT_FINISH 的映射），
-    // 因此这里把非 MDS_OK 一律视作"尚未就绪"。
-    const bool ready = WaitFor(
-        [&] {
-            data.clear();
-            std::string read_err;
-            if (!client->ReadByTask(task_id, 0, kReadShardBytes, &data, &status, &read_err)) {
-                return false;
-            }
-            return status == zb::rpc::MDS_OK;
-        },
-        ready_timeout_ms,
-        "读任务就绪（inode=" + std::to_string(inode_id) + "，镜像已从光盘库装载完成）", env.dirs());
-    if (!ready) {
-        outcome.error = "读任务未就绪";
+    if (notice.task_id != task_id || notice.inode_id != inode_id ||
+        notice.file_size != file->file_size) {
+        outcome.error = "ReadReady 与请求不匹配 task_id=" + std::to_string(notice.task_id) +
+                        " inode_id=" + std::to_string(notice.inode_id) + " file_size=" +
+                        std::to_string(notice.file_size) + "（期望 task_id=" +
+                        std::to_string(task_id) + " inode_id=" + std::to_string(inode_id) +
+                        " file_size=" + std::to_string(file->file_size) + "）";
         return outcome;
     }
 
-    for (uint64_t offset = kReadShardBytes; offset < file->file_size; offset += kReadShardBytes) {
-        const uint64_t read_size = std::min(kReadShardBytes, file->file_size - offset);
-        std::string piece;
-        std::string read_err;
-        if (!client->ReadByTask(task_id, offset, read_size, &piece, &status, &read_err)) {
-            outcome.error = "分片读传输失败 offset=" + std::to_string(offset) + ": " + read_err;
-            return outcome;
-        }
-        if (status != zb::rpc::MDS_OK) {
-            outcome.error = "分片读失败 offset=" + std::to_string(offset) +
-                            " status=" + std::to_string(static_cast<int>(status)) + " message=" + read_err;
-            return outcome;
-        }
-        data += piece;
+    const AcquiredSession session = AcquireSession(client, task_id);
+    if (!session.ok) {
+        outcome.error = session.error;
+        return outcome;
     }
+    outcome.read_handle = session.read_handle;
+    outcome.file_size = session.file_size;
+    outcome.max_read_bytes = session.max_read_bytes;
 
+    std::string data;
+    if (!ReadWholeFileOnSession(client, corpus, inode_id, session, &data, &error)) {
+        outcome.error = error;
+        return outcome;
+    }
     outcome.elapsed_ms = std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - begin).count();
     outcome.data = std::move(data);
 
-    std::string expected;
-    if (!corpus.ReadFileContent(inode_id, &expected)) {
-        outcome.error = "读取语料原始数据失败 inode=" + std::to_string(inode_id);
-        return outcome;
-    }
-    if (outcome.data != expected) {
-        outcome.error = "读回数据与语料不一致 inode=" + std::to_string(inode_id) +
-                        " actual_size=" + std::to_string(outcome.data.size()) +
-                        " expected_size=" + std::to_string(expected.size());
-        return outcome;
+    if (release_at_end) {
+        std::string release_error;
+        if (!ReleaseRead(client, task_id, session.read_handle, &release_error)) {
+            outcome.error = release_error;
+            return outcome;
+        }
     }
     outcome.ok = true;
     return outcome;
 }
 
-// 读某卷下某个 inode 的全部分片，并与语料原始字节比对（提交 + 等待一体）。
-ReadOutcome ReadInode(FakeReadClient* client,
-                      const Corpus& corpus,
-                      const Env& env,
-                      uint64_t volume_id,
-                      uint64_t inode_id,
-                      int ready_timeout_ms) {
+// 重启恢复链路读某 inode：通知会话不落盘，故按 task_id 轮询 AcquireReadSession 直到
+// OPTICAL_OK（未就绪时返回 OPTICAL_NOT_READY），再分段读并与语料比对。
+ReadOutcome ReadRestoredTask(FakeReadClient* client,
+                             const Corpus& corpus,
+                             uint64_t inode_id,
+                             uint64_t task_id,
+                             int ready_timeout_ms,
+                             bool release_at_end) {
     ReadOutcome outcome;
+    outcome.task_id = task_id;
+    const auto begin = std::chrono::steady_clock::now();
+
+    AcquiredSession session;
+    const bool ready = WaitFor(
+        [&] {
+            session = AcquireSession(client, task_id);
+            return session.ok;
+        },
+        ready_timeout_ms,
+        "恢复任务就绪（AcquireReadSession 返回 OPTICAL_OK，task_id=" + std::to_string(task_id) + "）");
+    if (!ready) {
+        outcome.error = "恢复任务未在 " + std::to_string(ready_timeout_ms) +
+                        "ms 内就绪（task_id=" + std::to_string(task_id) + "）";
+        return outcome;
+    }
+    outcome.ready_ms = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - begin).count();
+    outcome.read_handle = session.read_handle;
+    outcome.file_size = session.file_size;
+    outcome.max_read_bytes = session.max_read_bytes;
+
+    std::string data;
     std::string error;
-    const uint64_t task_id = RequestReadTask(client, volume_id, inode_id, &error);
-    if (task_id == 0) {
+    if (!ReadWholeFileOnSession(client, corpus, inode_id, session, &data, &error)) {
         outcome.error = error;
         return outcome;
     }
-    return ReadByTaskId(client, corpus, env, inode_id, task_id, ready_timeout_ms);
+    outcome.elapsed_ms = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - begin).count();
+    outcome.data = std::move(data);
+
+    if (release_at_end) {
+        std::string release_error;
+        if (!ReleaseRead(client, task_id, session.read_handle, &release_error)) {
+            outcome.error = release_error;
+            return outcome;
+        }
+    }
+    outcome.ok = true;
+    return outcome;
 }
 
-// 末片读完后任务应进入 FINISH：inode→task 索引被清除，故 ReadObjectByInodeId 返回 MDS_NOT_FOUND。
-void ExpectReadFinished(FakeReadClient* client, uint64_t inode_id) {
-    std::string extra;
-    zb::rpc::MdsStatusCode status = zb::rpc::MDS_INTERNAL_ERROR;
+// 建立通知通道（SubscribeReadEvents）：成功时把 session_id 写入 *out 并返回 true。
+bool EnsureNotificationChannel(FakeReadClient* client, uint64_t* out, std::string* error) {
+    zb::rpc::OpticalStatusCode status = zb::rpc::OPTICAL_INTERNAL_ERROR;
     std::string err;
-    client->ReadByInode(inode_id, 0, 4096, &extra, &status, &err);
-    ExpectWithDetail(status == zb::rpc::MDS_NOT_FOUND,
-                     "末片读完后任务进入 FINISH（ReadObjectByInodeId 返回 MDS_NOT_FOUND，inode=" +
-                         std::to_string(inode_id) + "）",
-                     "实际 status=" + std::to_string(static_cast<int>(status)));
+    uint64_t session_id = 0;
+    if (!client->SubscribeReadEvents("fake-fuse-1", &session_id, &status, &err)) {
+        if (error != nullptr) {
+            *error = "SubscribeReadEvents 传输失败: " + err;
+        }
+        return false;
+    }
+    if (status != zb::rpc::OPTICAL_OK || session_id == 0) {
+        if (error != nullptr) {
+            *error = "SubscribeReadEvents 失败 status=" + OpticalStatusName(status) +
+                     " message=" + err;
+        }
+        return false;
+    }
+    if (out != nullptr) {
+        *out = session_id;
+    }
+    return true;
 }
 
 // 打包汇报行 → 卷镜像 id 与 inode 集合。
@@ -895,7 +1185,7 @@ int RunOpticalNodeTest(const Options& options) {
               << "; 光盘容量=" << kDiscCapacityBytes
               << " 字节; 单盘标准镜像数=" << kStandardImagesPerDisc
               << "; 对象分片=" << kObjectUnitBytes << " 字节/片（每文件 " << kShardsPerFile << " 片）"
-              << "; 读分片=" << kReadShardBytes << " 字节" << std::endl;
+              << "; 读会话单次上限=" << kExpectedMaxReadBytes << " 字节" << std::endl;
     std::cerr << "超时设置: 打包汇报=" << kPackReportTimeoutMs << "ms; 刻录=" << kBurnTimeoutMs
               << "ms; CD_READ=" << kCdReadTimeoutMs << "ms; 缓存命中=" << kCacheHitTimeoutMs
               << "ms; 背压=" << kBackpressureTimeoutMs
@@ -934,6 +1224,9 @@ int RunOpticalNodeTest(const Options& options) {
     auto mds = std::make_unique<FakeMdsDriver>(node_server->Address());
     auto client = std::make_unique<FakeReadClient>(node_server->Address());
 
+    // 客户端通知会话（SubscribeReadEvents 建立），全程复用；重启后需重新订阅。
+    uint64_t notify_session_id = 0;
+
     // 测试点 A0：环境与配置就绪。
     {
         CaseScope scope("A0", "环境与配置就绪", kCaseA0Objective, kCaseA0Expectation, kCaseA0Method);
@@ -959,6 +1252,17 @@ int RunOpticalNodeTest(const Options& options) {
                    FileExists(env.read_dir) && FileExists(env.disc_sim_dir) && FileExists(env.meta_dir) &&
                    FileExists(env.log_dir),
                "archive 目录及 input/temp/image/read/disc_sim/meta/log 子目录均已创建");
+
+        Step("客户端 SubscribeReadEvents 建立准备完成通知通道（附带 brpc Stream）");
+        std::string subscribe_error;
+        const bool subscribed =
+            EnsureNotificationChannel(client.get(), &notify_session_id, &subscribe_error);
+        ExpectWithDetail(subscribed && notify_session_id > 0,
+                         "SubscribeReadEvents 成功且返回有效 session_id（=" +
+                             std::to_string(notify_session_id) + "）",
+                         subscribe_error);
+        Require(subscribed && notify_session_id > 0,
+                "通知通道已建立（后续 PrepareRead 依赖 session_id）");
     }
 
     StdoutCapture capture;
@@ -1312,30 +1616,30 @@ int RunOpticalNodeTest(const Options& options) {
         std::min<size_t>(disc_outcome.burned_count, profile.a3_read_volumes);
     Require(read_total > 0, "至少存在一个已刻录卷可供读回（CD_READ 前置条件）");
 
-    // 测试点 A8：正常关机落盘与重启恢复（在途读任务继续推进）。
+    // 测试点 A8：正常关机落盘与重启恢复（在途准备任务继续推进）。
     // 位置刻意放在 A3 之前：此处的 image_dir 只装未刻录尾盘，容量有余量，
     // 重启恢复后的读回不会与 A3 的 CD_READ 预期相互干扰。
     {
-        CaseScope scope("A8", "正常关机落盘与重启恢复（在途任务继续推进）", kCaseA8Objective,
+        CaseScope scope("A8", "正常关机落盘与重启恢复（在途准备任务继续推进）", kCaseA8Objective,
                         kCaseA8Expectation, kCaseA8Method);
         // 选一个「已刻录、且 A3/A5 都不会读到」的卷：已刻录前缀中跳过 A3 读取区间的那一个。
-        // 重启前只提交读请求、不取结果，于是关机时必然存在在途的 READ（及其 CD_READ 装载）任务。
+        // 重启前只提交准备任务、不等待就绪，于是关机时必然存在在途的 READ（及其 CD_READ 装载）任务。
         Require(disc_outcome.burned_count > read_total,
                 "存在第 " + std::to_string(read_total + 1) +
-                    " 个已刻录卷可用于在途读任务（已刻录 " +
+                    " 个已刻录卷可用于在途准备任务（已刻录 " +
                     std::to_string(disc_outcome.burned_count) + " 个）");
         const PackedVolume& probe = packed_volumes[read_total];
         const uint64_t probe_inode = probe.inodes.front();
-        Step("提交读请求但不取结果：volume_" + std::to_string(probe.volume_id) +
+        Step("PrepareRead 但不等待就绪：volume_" + std::to_string(probe.volume_id) +
              " inode=" + std::to_string(probe_inode) + "（制造在途 READ + CD_READ 任务）");
         std::string request_error;
-        const uint64_t in_flight_task_id =
-            RequestReadTask(client.get(), probe.volume_id, probe_inode, &request_error);
-        Require(in_flight_task_id != 0,
-                "在途读任务已受理（task_id=" + std::to_string(in_flight_task_id) + "）" +
+        uint64_t in_flight_task_id = 0;
+        Require(SubmitPrepare(client.get(), corpus, notify_session_id, probe.volume_id, probe_inode,
+                              nullptr, &in_flight_task_id, &request_error),
+                "在途准备任务已受理" +
                     (request_error.empty() ? std::string() : "；失败详情: " + request_error));
         Step("在途任务 task_id=" + std::to_string(in_flight_task_id) +
-             "；不等待结果，立即进入关机流程");
+             "；不等待就绪，立即进入关机流程");
 
         const std::vector<std::string> images_before = ListDirBySuffix(env.image_dir, ".vimg");
         const std::vector<std::string> discs_before = DiscFiles(env);
@@ -1402,18 +1706,27 @@ int RunOpticalNodeTest(const Options& options) {
         ExpectEqualU64(discs_meta_size_after, discs_meta_size_before,
                        "node_discs_meta 字节数在重启前后一致（恢复未改写已刻录索引）");
 
-        // 在途读任务继续推进：用原 task_id 取完数据（超时与单次 CD_READ 同量级）。
+        // 通知会话与读会话表均为进程内易失状态、不落盘：重启后对该恢复任务不再有 ReadReady。
+        // 重新订阅通道供后续 A3/A4/A5/A9 使用，并以 AcquireReadSession 轮询作为就绪判据。
+        Step("重启后重新 SubscribeReadEvents（通知会话不落盘，需重新建立）");
+        std::string resubscribe_error;
+        Require(EnsureNotificationChannel(client.get(), &notify_session_id, &resubscribe_error),
+                "重启后重新订阅通知通道" +
+                    (resubscribe_error.empty() ? std::string() : "；失败详情: " + resubscribe_error));
+
         Step("以原 task_id=" + std::to_string(in_flight_task_id) +
-             " 继续读取：验证在途任务在重启后被恢复并推进到终态");
-        const ReadOutcome resumed = ReadByTaskId(client.get(), corpus, env, probe_inode,
-                                                in_flight_task_id, kCdReadTimeoutMs);
+             " 轮询就绪并读回：验证在途任务在重启后被恢复并推进到可读");
+        const ReadOutcome resumed = ReadRestoredTask(client.get(), corpus, probe_inode,
+                                                     in_flight_task_id, kCdReadTimeoutMs,
+                                                     /*release_at_end=*/true);
         ExpectWithDetail(resumed.ok,
-                         "在途读任务在重启后仍能读回完整数据并与语料逐字节一致（inode=" +
+                         "在途准备任务在重启后仍能恢复并读回完整数据、与语料逐字节一致（inode=" +
                              std::to_string(probe_inode) + "，共 " +
-                             std::to_string(resumed.data.size()) + " 字节，耗时 " +
-                             std::to_string(static_cast<uint64_t>(resumed.elapsed_ms)) + "ms）",
+                             std::to_string(resumed.data.size()) + " 字节，准备耗时 " +
+                             std::to_string(static_cast<uint64_t>(resumed.ready_ms)) + "ms）",
                          resumed.error);
-        ExpectReadFinished(client.get(), probe_inode);
+        Expect(client->DrainReadReady().empty(),
+               "重启后未对恢复任务补发 ReadReady（恢复任务通知目标 session_id 不落盘，为 0）");
         Expect(FileExists(ImagePath(env, probe.volume_id)),
                "重启后完成读回的卷镜像落在 image_dir（volume_" +
                    std::to_string(probe.volume_id) + "）");
@@ -1424,23 +1737,30 @@ int RunOpticalNodeTest(const Options& options) {
     for (size_t i = 0; i < read_total; ++i) {
         const PackedVolume& packed = packed_volumes[i];
         const uint64_t first_inode = packed.inodes.front();
+        const CorpusFile* first_file = corpus.Find(first_inode);
         const std::string index_text = std::to_string(i + 1) + "/" + std::to_string(read_total);
 
-        // 测试点 A3.<i>：数据面读 + CD_READ 重载。
+        // 测试点 A3.<i>：新 6 接口读链路 + CD_READ 重载。
         {
             CaseScope scope("A3." + std::to_string(i + 1),
-                            "第 " + index_text + " 卷：数据面读 + CD_READ 重载", kCaseA3Objective,
-                            kCaseA3Expectation, kCaseA3Method);
-            Step("读 volume_" + std::to_string(packed.volume_id) + " inode=" +
+                            "第 " + index_text + " 卷：数据面读（新 6 接口）+ CD_READ 重载",
+                            kCaseA3Objective, kCaseA3Expectation, kCaseA3Method);
+            Step("PrepareRead volume_" + std::to_string(packed.volume_id) + " inode=" +
                  std::to_string(first_inode) + "（镜像在光盘库，预期触发一次 CD_READ 装载）");
             const ReadOutcome outcome =
-                ReadInode(client.get(), corpus, env, packed.volume_id, first_inode, kCdReadTimeoutMs);
+                ReadInode(client.get(), corpus, env, notify_session_id, packed.volume_id,
+                          first_inode, kCdReadTimeoutMs, /*release_at_end=*/true);
             ExpectWithDetail(outcome.ok,
                              "读回数据与语料逐字节一致（inode=" + std::to_string(first_inode) +
-                                 "，共 " + std::to_string(outcome.data.size()) + " 字节，耗时 " +
+                                 "，共 " + std::to_string(outcome.data.size()) + " 字节，准备耗时 " +
+                                 std::to_string(static_cast<uint64_t>(outcome.ready_ms)) + "ms，总耗时 " +
                                  std::to_string(static_cast<uint64_t>(outcome.elapsed_ms)) + "ms）",
                              outcome.error);
-            ExpectReadFinished(client.get(), first_inode);
+            ExpectEqualU64(static_cast<uint64_t>(outcome.max_read_bytes), kExpectedMaxReadBytes,
+                           "AcquireReadSession 返回 max_read_bytes=4MiB");
+            ExpectEqualU64(outcome.file_size,
+                           first_file != nullptr ? first_file->file_size : 0,
+                           "AcquireReadSession 返回 file_size 与语料一致");
             Expect(FileExists(ImagePath(env, packed.volume_id)),
                    "CD_READ 后镜像回到 image_dir（volume_" + std::to_string(packed.volume_id) + "）");
             ExpectEqualU64(static_cast<uint64_t>(DiscFiles(env).size()), disc_outcome.disc_count,
@@ -1459,19 +1779,20 @@ int RunOpticalNodeTest(const Options& options) {
             const uint64_t second_inode = packed.inodes[1];
             const std::vector<std::string> images_before = ImageFiles(env);
             const std::vector<std::string> discs_before = DiscFiles(env);
-            Step("读同卷第二个 inode=" + std::to_string(second_inode) +
+            Step("PrepareRead 同卷第二个 inode=" + std::to_string(second_inode) +
                  "，读前快照 image=[" + JoinNames(images_before) + "] disc_sim=[" +
                  JoinNames(discs_before) + "]");
             const ReadOutcome hit =
-                ReadInode(client.get(), corpus, env, packed.volume_id, second_inode, kCacheHitTimeoutMs);
+                ReadInode(client.get(), corpus, env, notify_session_id, packed.volume_id,
+                          second_inode, kCacheHitTimeoutMs, /*release_at_end=*/true);
             ExpectWithDetail(hit.ok,
                              "缓存命中读回数据与语料一致（inode=" + std::to_string(second_inode) + "）",
                              hit.error);
-            const uint64_t hit_ms = static_cast<uint64_t>(hit.elapsed_ms);
-            ExpectWithDetail(hit.elapsed_ms < 3000.0,
-                             "缓存命中耗时 < 3000ms（实测 " + std::to_string(hit_ms) +
-                                 "ms，远小于一次 CD 装载）",
-                             "耗时 " + std::to_string(hit_ms) + "ms，疑似再次走 CD_READ");
+            const uint64_t ready_ms = static_cast<uint64_t>(hit.ready_ms);
+            ExpectWithDetail(hit.ready_ms < 3000.0,
+                             "缓存命中「PrepareRead → ReadReady」耗时 < 3000ms（实测 " +
+                                 std::to_string(ready_ms) + "ms，远小于一次 CD 装载）",
+                             "耗时 " + std::to_string(ready_ms) + "ms，疑似再次走 CD_READ");
             const std::vector<std::string> images_after = ImageFiles(env);
             const std::vector<std::string> discs_after = DiscFiles(env);
             ExpectWithDetail(images_after == images_before && discs_after == discs_before,
@@ -1479,6 +1800,180 @@ int RunOpticalNodeTest(const Options& options) {
                              "读前 image=[" + JoinNames(images_before) + "] disc_sim=[" +
                                  JoinNames(discs_before) + "]；读后 image=[" + JoinNames(images_after) +
                                  "] disc_sim=[" + JoinNames(discs_after) + "]");
+        }
+    }
+
+    // 测试点 A9：读会话与引用生命周期（多次独立打开 / EOF 与随机重读 / 两级释放）。
+    // 选刚读过的最后一个已刻录卷：其镜像已在 image_dir，准备会快速命中缓存。
+    {
+        CaseScope scope("A9", "读会话与引用生命周期（多次独立打开 / EOF 与随机重读 / 两级释放）",
+                        kCaseA9Objective, kCaseA9Expectation, kCaseA9Method);
+        const PackedVolume& target = packed_volumes[read_total - 1];
+        const uint64_t inode_id = target.inodes.front();
+        const CorpusFile* file = corpus.Find(inode_id);
+        Require(file != nullptr, "语料中存在 inode=" + std::to_string(inode_id));
+
+        Step("PrepareRead volume_" + std::to_string(target.volume_id) + " inode=" +
+             std::to_string(inode_id) + "（镜像已在 image_dir，准备应快速完成）");
+        std::string request_id;
+        uint64_t task_id = 0;
+        std::string error;
+        Require(SubmitPrepare(client.get(), corpus, notify_session_id, target.volume_id, inode_id,
+                              &request_id, &task_id, &error),
+                "A9 准备任务已受理" + (error.empty() ? std::string() : "；失败详情: " + error));
+        ReadReadyNotice notice;
+        const bool notified = client->WaitReadReady(request_id, &notice, kCdReadTimeoutMs);
+        ExpectWithDetail(notified && notice.task_id == task_id,
+                         "收到匹配的 ReadReady（task_id=" + std::to_string(task_id) + "）",
+                         "未在超时内收到 ReadReady（request_id=" + request_id + "）");
+        Require(notified, "A9 准备已完成（后续会话断言依赖 READY 状态）");
+
+        // 两次独立打开：read_handle 不同、各自持引用。
+        const AcquiredSession a = AcquireSession(client.get(), task_id);
+        const AcquiredSession b = AcquireSession(client.get(), task_id);
+        ExpectWithDetail(a.ok && b.ok && a.read_handle != b.read_handle,
+                         "同一 READY 任务两次 AcquireReadSession 得到两个不同 read_handle（=" +
+                             std::to_string(a.read_handle) + "/" + std::to_string(b.read_handle) + "）",
+                         a.error + " " + b.error);
+        Require(a.ok && b.ok, "两个独立读会话均已建立");
+
+        // 随机读、重复读、先读尾部再读头部；并验证另一会话独立可用。
+        {
+            std::string tail;
+            uint64_t got = 0;
+            bool eof = false;
+            zb::rpc::OpticalStatusCode st = zb::rpc::OPTICAL_INTERNAL_ERROR;
+            std::string err;
+            const uint64_t tail_size = std::min<uint64_t>(4096, file->file_size);
+            const uint64_t tail_off = file->file_size - tail_size;
+            Expect(ReadRange(client.get(), a.read_handle, tail_off, tail_size, &tail, &got, &eof,
+                             &st, &err) &&
+                       st == zb::rpc::OPTICAL_OK && got == tail_size && eof,
+                   "先读尾部区间成功且 eof=true（offset=" + std::to_string(tail_off) + "）");
+            std::string expected;
+            Expect(corpus.ReadFileContent(inode_id, &expected) &&
+                       tail == expected.substr(static_cast<size_t>(tail_off), static_cast<size_t>(tail_size)),
+                   "尾部区间字节与语料一致");
+
+            std::string head;
+            got = 0;
+            eof = true;
+            st = zb::rpc::OPTICAL_INTERNAL_ERROR;
+            err.clear();
+            const uint64_t head_size = std::min<uint64_t>(8192, file->file_size);
+            Expect(ReadRange(client.get(), a.read_handle, 0, head_size, &head, &got, &eof, &st, &err) &&
+                       st == zb::rpc::OPTICAL_OK && got == head_size && !eof,
+                   "再读头部区间成功且 eof=false（随机/逆向读取不依赖隐式游标）");
+            Expect(corpus.ReadFileContent(inode_id, &expected) &&
+                       head == expected.substr(0, static_cast<size_t>(head_size)),
+                   "头部区间字节与语料一致");
+
+            std::string again;
+            got = 0;
+            eof = false;
+            st = zb::rpc::OPTICAL_INTERNAL_ERROR;
+            err.clear();
+            Expect(ReadRange(client.get(), a.read_handle, 0, head_size, &again, &got, &eof, &st, &err) &&
+                       again == head,
+                   "重复读同一区间返回一致字节（EOF 不释放会话、不改变引用）");
+
+            std::string via_b;
+            got = 0;
+            eof = false;
+            st = zb::rpc::OPTICAL_INTERNAL_ERROR;
+            err.clear();
+            Expect(ReadRange(client.get(), b.read_handle, 0, 1, &via_b, &got, &eof, &st, &err) &&
+                       via_b.size() == 1 && !expected.empty() && via_b[0] == expected[0],
+                   "另一读会话 b 独立读到正确首字节");
+        }
+
+        // 边界：offset≥file_size → 0 字节且 eof=true；size=0 → 0 字节且 eof=false；
+        // 单次 size>max_read_bytes → OPTICAL_INVALID_ARGUMENT。
+        {
+            std::string oob;
+            uint64_t got = 123;
+            bool eof = false;
+            zb::rpc::OpticalStatusCode st = zb::rpc::OPTICAL_INTERNAL_ERROR;
+            std::string err;
+            Expect(ReadRange(client.get(), a.read_handle, file->file_size, 16, &oob, &got, &eof, &st,
+                             &err) &&
+                       st == zb::rpc::OPTICAL_OK && got == 0 && oob.empty() && eof,
+                   "offset≥file_size 返回 0 字节且 eof=true");
+
+            std::string zero;
+            got = 123;
+            eof = true;
+            st = zb::rpc::OPTICAL_INTERNAL_ERROR;
+            err.clear();
+            Expect(ReadRange(client.get(), a.read_handle, 0, 0, &zero, &got, &eof, &st, &err) &&
+                       st == zb::rpc::OPTICAL_OK && got == 0 && !eof,
+                   "size=0 返回 0 字节且 eof=false");
+
+            std::string too_big;
+            got = 0;
+            eof = false;
+            st = zb::rpc::OPTICAL_OK;
+            err.clear();
+            const uint64_t over = static_cast<uint64_t>(a.max_read_bytes) + 1;
+            const bool rpc_ok = client->ReadPreparedFile(a.read_handle, 0, over, &too_big, &got, &eof,
+                                                         &st, &err);
+            Expect(rpc_ok && st == zb::rpc::OPTICAL_INVALID_ARGUMENT,
+                   "单次 size>max_read_bytes 返回 OPTICAL_INVALID_ARGUMENT（size=" +
+                       std::to_string(over) + "）");
+        }
+
+        // 关闭一个会话，另一个仍可用；全部关闭后仍可再次 open（准备引用尚在）。
+        {
+            zb::rpc::OpticalStatusCode st = zb::rpc::OPTICAL_INTERNAL_ERROR;
+            std::string err;
+            Expect(client->ReleaseReadSession(a.read_handle, &st, &err) && st == zb::rpc::OPTICAL_OK,
+                   "ReleaseReadSession(a) 返回 OPTICAL_OK（只减少读取引用）");
+            std::string one;
+            uint64_t got = 0;
+            bool eof = false;
+            st = zb::rpc::OPTICAL_INTERNAL_ERROR;
+            err.clear();
+            Expect(ReadRange(client.get(), b.read_handle, 0, 1, &one, &got, &eof, &st, &err) &&
+                       one.size() == 1,
+                   "关闭 a 后 b 仍可读（两个读会话相互独立）");
+            st = zb::rpc::OPTICAL_INTERNAL_ERROR;
+            err.clear();
+            Expect(client->ReleaseReadSession(b.read_handle, &st, &err) && st == zb::rpc::OPTICAL_OK,
+                   "ReleaseReadSession(b) 返回 OPTICAL_OK");
+        }
+
+        {
+            const AcquiredSession reopened = AcquireSession(client.get(), task_id);
+            ExpectWithDetail(reopened.ok && reopened.read_handle != a.read_handle &&
+                                 reopened.read_handle != b.read_handle,
+                             "关闭全部读会话后再次 AcquireReadSession 仍成功（read_handle=" +
+                                 std::to_string(reopened.read_handle) + "，准备引用尚在）",
+                             reopened.error);
+            Require(reopened.ok, "准备引用尚在，可再次建立读会话");
+            std::string one;
+            uint64_t got = 0;
+            bool eof = false;
+            zb::rpc::OpticalStatusCode st = zb::rpc::OPTICAL_INTERNAL_ERROR;
+            std::string err;
+            Expect(ReadRange(client.get(), reopened.read_handle, 0, 1, &one, &got, &eof, &st, &err) &&
+                       one.size() == 1,
+                   "再次打开的会话可读到正确字节");
+            st = zb::rpc::OPTICAL_INTERNAL_ERROR;
+            err.clear();
+            Expect(client->ReleaseReadSession(reopened.read_handle, &st, &err) &&
+                       st == zb::rpc::OPTICAL_OK,
+                   "ReleaseReadSession(再次打开) 返回 OPTICAL_OK");
+        }
+
+        {
+            zb::rpc::OpticalStatusCode st = zb::rpc::OPTICAL_INTERNAL_ERROR;
+            std::string err;
+            Expect(client->ReleasePreparedRead(task_id, &st, &err) && st == zb::rpc::OPTICAL_OK,
+                   "ReleasePreparedRead 返回 OPTICAL_OK（准备引用已释放）");
+            const AcquiredSession rejected = AcquireSession(client.get(), task_id);
+            ExpectWithDetail(!rejected.ok,
+                             "ReleasePreparedRead 后再 AcquireReadSession 被拒（不再允许新会话）",
+                             "意外成功：read_handle=" + std::to_string(rejected.read_handle));
         }
     }
 
@@ -1506,7 +2001,8 @@ int RunOpticalNodeTest(const Options& options) {
         Step("读 volume_" + std::to_string(last.volume_id) + " inode=" + std::to_string(last_inode) +
              "（image_dir 已满，预期淘汰一个 READ 受害者）");
         const ReadOutcome outcome =
-            ReadInode(client.get(), corpus, env, last.volume_id, last_inode, kCdReadTimeoutMs);
+            ReadInode(client.get(), corpus, env, notify_session_id, last.volume_id, last_inode,
+                      kCdReadTimeoutMs, /*release_at_end=*/true);
         ExpectWithDetail(outcome.ok, "满载后读入新卷仍可读通（字节与语料一致）", outcome.error);
 
         const std::vector<std::string> images_after = ImageFiles(env);
@@ -1552,7 +2048,8 @@ int RunOpticalNodeTest(const Options& options) {
                     "可定位被淘汰卷的 inode（victim=" + std::to_string(victim) + "）");
             Step("被淘汰的镜像 volume_" + std::to_string(victim) + "，重新读以验证可从 vdisc 重新提取");
             const ReadOutcome reload =
-                ReadInode(client.get(), corpus, env, victim, victim_inode, kCdReadTimeoutMs);
+                ReadInode(client.get(), corpus, env, notify_session_id, victim, victim_inode,
+                          kCdReadTimeoutMs, /*release_at_end=*/true);
             ExpectWithDetail(reload.ok, "被淘汰卷重载后可读通（字节与语料一致）", reload.error);
             Expect(FileExists(ImagePath(env, victim)),
                    "重载后被淘汰卷回到 image_dir（volume_" + std::to_string(victim) + "）");

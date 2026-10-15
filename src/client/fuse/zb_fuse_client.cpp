@@ -33,6 +33,10 @@
 #include "common/rpc/LogicalNodeRoute.h"
 #include "mds.pb.h"
 #include "optical_node.pb.h"
+#include "client/optical/OpticalReadClient.h"
+#include "client/control/PrepareControlServer.h"
+#include <filesystem>
+#include <climits>
 #include "real_node.pb.h"
 #include "scheduler.pb.h"
 
@@ -43,6 +47,10 @@ DEFINE_uint32(cluster_view_ttl_ms, 10000, "Max tolerated staleness of scheduler 
 DEFINE_uint32(default_replica, 1, "Default replica for create");
 DEFINE_uint64(default_object_unit_size, 4194304, "Default object unit size for create");
 DEFINE_int32(timeout_ms, 3000, "RPC timeout in ms");
+DEFINE_bool(optical_read_enabled, false, "Use notification-based prepared physical optical reads");
+DEFINE_string(prepare_control_socket, "", "Absolute local preparation socket path outside the mount");
+DEFINE_int32(optical_rpc_timeout_ms, 3000, "Timeout for each optical RPC, not background preparation");
+DEFINE_uint32(optical_read_chunk_bytes, 0, "Optional client chunk limit; 0 uses the server limit");
 DEFINE_uint32(optical_read_wait_ms, 120000,
               "Maximum wait for an asynchronous optical read task");
 DEFINE_int32(max_retry, 0, "RPC max retry");
@@ -1369,12 +1377,24 @@ struct FuseState {
     SchedulerClient scheduler;
     bool scheduler_enabled{false};
     DataNodeClient data_nodes;
+    std::unique_ptr<optical::OpticalReadClient> optical_reads;
+    std::unique_ptr<control::PrepareControlServer> prepare_control;
+    std::unordered_map<uint64_t, optical::OpticalReadClient::Session> optical_sessions;
+    std::string mount_path;
+    bool optical_start_failed{false};
     std::mutex mu;
     std::unordered_map<uint64_t, uint64_t> handle_to_inode;
     std::unordered_map<uint64_t, InodeCacheEntry> inode_cache;
     std::unordered_map<std::string, std::string> node_address_cache;
     uint64_t cluster_view_generation{0};
     uint64_t cluster_view_update_ms{0};
+
+    ~FuseState() {
+        // Also cover startup exits where libfuse never calls destroy. Stop
+        // resolver callbacks before the metadata clients and mutex are torn down.
+        if (prepare_control) prepare_control->Stop();
+        if (optical_reads) optical_reads->Stop();
+    }
 };
 
 FuseState* GetState() {
@@ -1861,6 +1881,11 @@ int FuseGetattr(const char* path, struct stat* st, struct fuse_file_info* fi) {
         if (!GetOrFetchAnchor(state, attr.inode_id(), &anchor, &status)) {
             return -StatusToErrno(status);
         }
+        if (state->optical_reads && anchor.storage_tier() == zb::rpc::STORAGE_TIER_OPTICAL) {
+            // Stable MDS attributes suffice; preparation is never triggered by stat.
+            FillStat(attr, st);
+            return 0;
+        }
         uint64_t file_size = attr.size();
         uint64_t object_unit_size = attr.object_unit_size() > 0
                                         ? attr.object_unit_size()
@@ -1911,8 +1936,32 @@ int FuseReaddir(const char* path, void* buf, fuse_fill_dir_t filler, off_t offse
     return 0;
 }
 
-int FuseOpen(const char* path, struct fuse_file_info* fi) {
-    auto* state = GetState();
+std::optional<uint64_t> OpticalVersion(const zb::rpc::InodeAttr& attr) {
+    return attr.version() == 0 ? std::nullopt : std::optional<uint64_t>(attr.version());
+}
+
+optical::FileInfo ResolveOpticalPrepare(FuseState* state, const std::string& path) {
+    zb::rpc::InodeAttr attr;
+    zb::rpc::MdsStatus status;
+    if (!state->mds.Lookup(path.c_str(), &attr, &status))
+        throw optical::ClientError(StatusToErrno(status), status.message());
+    if (attr.type() != zb::rpc::INODE_FILE)
+        throw optical::ClientError(EISDIR, "only regular optical files can be prepared");
+    zb::rpc::FileLocationView location;
+    if (!state->mds.GetFileLocationView(attr.inode_id(), &location, &status))
+        throw optical::ClientError(StatusToErrno(status), status.message());
+    zb::rpc::ReplicaLocation anchor;
+    if (!SelectLocationForIo(location, &anchor) || anchor.storage_tier() != zb::rpc::STORAGE_TIER_OPTICAL)
+        throw optical::ClientError(EINVAL, "file is not stored on an optical node");
+    if (!EnsureReplicaNodeAddress(state, &anchor, &status))
+        throw optical::ClientError(StatusToErrno(status), status.message());
+    UpdateInodeAttrCache(state, attr.inode_id(), location.attr());
+    UpdateInodeAnchorCache(state, attr.inode_id(), anchor);
+    return {anchor.node_address(), attr.inode_id(), anchor.disk_id(), anchor.image_id(),
+            location.attr().size(), OpticalVersion(location.attr())};
+}
+
+int OpenRequest(FuseState* state, const char* path, struct fuse_file_info* fi) {
     zb::rpc::FileLocationView location;
     zb::rpc::ReplicaLocation open_anchor;
     zb::rpc::MdsStatus status;
@@ -1921,6 +1970,21 @@ int FuseOpen(const char* path, struct fuse_file_info* fi) {
         LogMdsFailure("Open", path, status);
         return -StatusToErrno(status);
     }
+    // Open may allocate an MDS handle before the optical READY check fails.
+    struct OpenRollback {
+        FuseState* state;
+        uint64_t handle;
+        bool committed{false};
+        ~OpenRollback() {
+            if (committed) return;
+            {
+                std::lock_guard<std::mutex> lock(state->mu);
+                state->handle_to_inode.erase(handle);
+            }
+            zb::rpc::MdsStatus ignored;
+            state->mds.Close(handle, &ignored);
+        }
+    } rollback{state, handle_id};
     const zb::rpc::InodeAttr& attr = location.attr();
     {
         std::lock_guard<std::mutex> lock(state->mu);
@@ -1947,7 +2011,17 @@ int FuseOpen(const char* path, struct fuse_file_info* fi) {
             if (IsWriteOpenFlags(static_cast<uint32_t>(fi->flags))) {
                 return -EROFS;
             }
+            if (state->optical_reads) {
+                try {
+                    auto session = state->optical_reads->Open(attr.inode_id(), OpticalVersion(attr));
+                    std::lock_guard<std::mutex> lock(state->mu);
+                    state->optical_sessions.emplace(handle_id, std::move(session));
+                } catch (const optical::ClientError& e) {
+                    return -e.code();
+                }
+            }
             fi->fh = handle_id;
+            rollback.committed = true;
             return 0;
         }
         uint64_t file_size = attr.size();
@@ -1974,22 +2048,38 @@ int FuseOpen(const char* path, struct fuse_file_info* fi) {
         }
     }
     fi->fh = handle_id;
+    rollback.committed = true;
     return 0;
 }
 
-int FuseRelease(const char* path, struct fuse_file_info* fi) {
-    (void)path;
-    auto* state = GetState();
+int FuseOpen(const char* path, struct fuse_file_info* fi) {
+    return OpenRequest(GetState(), path, fi);
+}
+
+int ReleaseRequest(FuseState* state, struct fuse_file_info* fi) {
     zb::rpc::MdsStatus status;
-    uint64_t handle_id = fi->fh;
+    const uint64_t handle_id = fi->fh;
+    optical::OpticalReadClient::Session session;
     {
         std::lock_guard<std::mutex> lock(state->mu);
+        auto it = state->optical_sessions.find(handle_id);
+        if (it != state->optical_sessions.end()) {
+            session = it->second;
+            state->optical_sessions.erase(it);
+        }
         state->handle_to_inode.erase(handle_id);
     }
-    if (!state->mds.Close(handle_id, &status)) {
-        return -StatusToErrno(status);
+    int error = 0;
+    if (session) {
+        try { state->optical_reads->Close(session); }
+        catch (const optical::ClientError& e) { error = e.code(); }
     }
-    return 0;
+    if (!state->mds.Close(handle_id, &status) && !error) error = StatusToErrno(status);
+    return -error;
+}
+
+int FuseRelease(const char*, struct fuse_file_info* fi) {
+    return ReleaseRequest(GetState(), fi);
 }
 
 int FuseCreate(const char* path, mode_t mode, struct fuse_file_info* fi) {
@@ -2160,6 +2250,19 @@ int FuseReadImpl(FuseState* state, const char* path, char* buf, size_t size, off
     GetCachedInodeMetaHint(state, inode_id, &hint_file_size, &hint_object_unit_size);
 
     if (anchor.storage_tier() == zb::rpc::STORAGE_TIER_OPTICAL) {
+        if (state->optical_reads) {
+            optical::OpticalReadClient::Session session;
+            {
+                std::lock_guard<std::mutex> lock(state->mu);
+                auto it = state->optical_sessions.find(fi ? fi->fh : 0);
+                if (it == state->optical_sessions.end()) return -EBADF;
+                session = it->second;
+            }
+            if (size > static_cast<size_t>(INT_MAX)) return -EINVAL;
+            try {
+                return static_cast<int>(state->optical_reads->Read(session, request_offset, size, buf, trace));
+            } catch (const optical::ClientError& e) { return -e.code(); }
+        }
         if (hint_object_unit_size == 0) {
             hint_object_unit_size = FLAGS_default_object_unit_size;
         }
@@ -2500,8 +2603,38 @@ bool PrepareLatency(FuseState* state, int argc, char** argv, std::string* error)
     return true;
 }
 
+bool PrepareOpticalConfig(FuseState* state, int argc, char** argv, std::string* error) {
+    if (!FLAGS_optical_read_enabled) return true;
+    struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+    struct fuse_cmdline_opts opts = {};
+    int parsed = fuse_parse_cmdline(&args, &opts);
+    fuse_opt_free_args(&args);
+    std::string mount = opts.mountpoint ? opts.mountpoint : "";
+    std::free(opts.mountpoint);
+    if (parsed || mount.empty() || FLAGS_prepare_control_socket.empty() || FLAGS_optical_rpc_timeout_ms <= 0) {
+        *error = "optical reads require a mount, --prepare_control_socket and a positive RPC timeout";
+        return false;
+    }
+    state->mount_path = std::filesystem::absolute(mount).lexically_normal().string();
+    return true;
+}
+
 void* FuseInit(struct fuse_conn_info*, struct fuse_config*) {
     auto* state = GetState();
+    if (FLAGS_optical_read_enabled) {
+        try {
+            state->optical_reads = std::make_unique<optical::OpticalReadClient>(
+                optical::Options{FLAGS_optical_rpc_timeout_ms, FLAGS_optical_read_chunk_bytes});
+            state->prepare_control = std::make_unique<control::PrepareControlServer>(
+                *state->optical_reads, state->mount_path, FLAGS_prepare_control_socket,
+                [state](const std::string& path) { return ResolveOpticalPrepare(state, path); });
+            state->prepare_control->Start();
+        } catch (const std::exception& e) {
+            state->optical_start_failed = true;
+            std::fprintf(stderr, "[optical] startup failed: %s\n", e.what());
+            fuse_exit(fuse_get_context()->fuse);
+        }
+    }
     if (state->latency) {
         std::string error;
         if (!state->latency->Start(&error)) {
@@ -2515,6 +2648,8 @@ void* FuseInit(struct fuse_conn_info*, struct fuse_config*) {
 
 void FuseDestroy(void* data) {
     auto* state = static_cast<FuseState*>(data);
+    if (state->prepare_control) state->prepare_control->Stop();
+    if (state->optical_reads) state->optical_reads->Stop();
     if (state->latency) state->latency->Stop();
 }
 
@@ -2530,6 +2665,10 @@ int main(int argc, char* argv[]) {
     std::string latency_error;
     if (!zb::client::fuse_client::PrepareLatency(&state, argc, argv, &latency_error)) {
         std::fprintf(stderr, "[io_latency] startup failed: %s\n", latency_error.c_str());
+        return 1;
+    }
+    if (!zb::client::fuse_client::PrepareOpticalConfig(&state, argc, argv, &latency_error)) {
+        std::fprintf(stderr, "[optical] configuration failed: %s\n", latency_error.c_str());
         return 1;
     }
     if (!state.mds.Init(FLAGS_mds)) {
@@ -2580,7 +2719,7 @@ int main(int argc, char* argv[]) {
 
     const int result = fuse_main(argc, argv, &ops, &state);
     if (state.latency) state.latency->Stop();
-    return state.latency_start_failed ? 1 : result;
+    return (state.latency_start_failed || state.optical_start_failed) ? 1 : result;
 }
 
 #endif // ZBSTORAGE_FUSE_CLIENT_NO_MAIN

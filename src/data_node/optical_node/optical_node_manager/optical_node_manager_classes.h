@@ -919,6 +919,18 @@ public:
         return it != task_read_refs_.end() && it->second > 0;
     }
 
+    // Node-owned TTL eviction: atomically check idle and prevent any new Acquire.
+    // A separate HasReaders() check followed by unlink would race a new open.
+    bool ExpireIfIdle(uint64_t task_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = task_read_refs_.find(task_id);
+        if (it != task_read_refs_.end() && it->second > 0) return false;
+        prepare_released_.insert(task_id);
+        if (!IsCleanableLocked(task_id)) return false;
+        artifact_cleaned_.insert(task_id);
+        return true;
+    }
+
     // 关闭会话并减读取引用；返回所属 task_id（0 表示会话不存在）。
     // *out_cleanable = true 表示此刻「准备引用已释放且读取引用归零」且为首次判定，
     // 调用方应清理该任务的准备产物。

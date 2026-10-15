@@ -1,0 +1,18 @@
+syntax = "proto3";
+package zb.client.control;
+
+// One request per local Unix socket connection. Watch has a single delayed
+// response, so there is no task polling or cross-connection response matching.
+enum Operation { SUBMIT = 0; WATCH = 1; RELEASE = 2; }
+message Request {
+  Operation operation = 1;
+  string path = 2;
+  string prepare_handle = 3;
+}
+message Reply {
+  int32 error_code = 1; // Local errno, not an MDS or optical status.
+  string message = 2;
+  string prepare_handle = 3;
+  string path = 4;
+  uint64 size = 5;
+}

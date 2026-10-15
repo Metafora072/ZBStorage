@@ -6,6 +6,7 @@
 
 #include <optical_node_manager.h>
 
+#include "common/metrics/NodeMetricsCollector.h"
 #include "../config/OpticalNodeConfig.h"
 #include "ReadEventSessionRegistry.h"
 
@@ -109,6 +110,11 @@ public:
     // 转发给 OpticalNodeManager；供对外上报（心跳设备清单 / 光盘库状态）读取。
     optical_node_manager::OpticalLibraryInventory GetLibraryInventory() const;
 
+    // 数据面 I/O 指标采集器（供心跳线程 ReportCollectedMetrics 读取并上报）。
+    // cache_hit：客户端缓存命中的区间读；disc：归档下载写 + 从光盘回读镜像的 I/O。
+    zb::metrics::NodeMetricsCollector* metrics_cache_hit() { return &metrics_cache_hit_; }
+    zb::metrics::NodeMetricsCollector* metrics_disc() { return &metrics_disc_; }
+
 private:
     // 准备任务 READY 后（后台线程回调）把 ReadReady 序列化并写入对应通知 Stream；
     // 会话已关闭或写入失败时仅记录，本阶段不重试。
@@ -121,6 +127,11 @@ private:
 
     // 读取完成通知通道（session_id -> brpc Stream）；由 SubscribeReadEvents 登记。
     ReadEventSessionRegistry read_event_sessions_;
+
+    // 数据面 I/O 指标采集器：按访问路径分开——ReadPreparedFile（缓存命中区间读）计入 cache_hit，
+    // 归档下载写与光盘回读镜像计入 disc；心跳线程分别上报。线程安全由各自内部 mutex 保证。
+    zb::metrics::NodeMetricsCollector metrics_cache_hit_;
+    zb::metrics::NodeMetricsCollector metrics_disc_;
 
     // 本节点的归档引擎：接收 MDS 下发的归档文件、驱动镜像封装与刻录，
     // 并承载数据面读链路（PrepareRead / AcquireReadSession / ReadPreparedFile）。

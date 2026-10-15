@@ -20,8 +20,9 @@
 #include <space_manager/space_manager.h>
 #include <volume_manager/volume_manager.h>
 
-// 仅用于 scheduler 出站 channel 的不透明持有，避免在头文件引入 brpc 依赖。
+// 仅用于调度器出站 channel / 指标采集器的不透明持有，避免在头文件引入 brpc / metrics 依赖。
 namespace brpc { class Channel; }
+namespace zb::metrics { class NodeMetricsCollector; }
 
 namespace optical_node_manager {
 
@@ -74,6 +75,12 @@ public:
     // 采集一次光盘库库存快照（光驱忙闲 / 盘片 / 暂存区 / 后台任务）。
     // 线程安全、纯只读；未初始化或组件缺失的项保持为 0。
     OpticalLibraryInventory GetInventory() const;
+
+    // 注入数据面指标采集器（延迟绑定：须在 Run() 之前调用）。
+    // cache_hit：客户端缓存命中的区间读；disc：归档下载写 + 从光盘回读镜像的 I/O。
+    // 为空则对应路径不记账。
+    void SetMetricsCollectors(zb::metrics::NodeMetricsCollector* cache_hit,
+                              zb::metrics::NodeMetricsCollector* disc);
     // #endregion
 
     // #region 2. 生命周期（启动 / 关机）
@@ -467,10 +474,6 @@ private:
     // 本地 disk_id（对应 MDS disc_id）单调递增计数器。
     std::atomic<uint64_t> next_disk_id_{1};
 
-    // 累计写入字节：ZipTaskProcessor 每压缩一个归档文件（压缩前原始大小）累加一次。
-    // 供心跳 accumulated_write_bytes 上报；持久化到快照并在重启时恢复。
-    std::atomic<uint64_t> accumulated_write_bytes_{0};
-
     // 待打包 inode_id 集合：ZipTaskProcessor 在每次 AddFileToCollect 前登记本次 inode，
     // 封装触发后扫描 temp_dir_ 剩余 temp_*.compressed，diff 出本次被打包的 inode_id 并移除。
     // 仅 ZipTaskProcessor 单线程访问，仍加锁以满足线程安全要求。
@@ -510,6 +513,11 @@ private:
 
     // 光盘库/模拟参数（构造注入，运行期不变），InitializeDir 时下发给 cd_manager。
     cd_manager_sim::CDManagerConfig cd_manager_config_{};
+
+    // 数据面指标采集器（延迟注入，须在 Run() 之前经 SetMetricsCollectors 设置）。
+    // 指针在 Run() 前确定、运行期不变；采集器内部自带锁，跨线程写入安全。
+    zb::metrics::NodeMetricsCollector* metrics_cache_hit_{nullptr};
+    zb::metrics::NodeMetricsCollector* metrics_disc_{nullptr};
 
     // 下载侧背压阈值：image_dir 中允许同时存在的写镜像数上限（含「已封印、等刻录释放」的）。
     // 由归档下载批次在开始前检查，超过即暂停下载，等 Zip 压缩 / 刻录释放降低占用。

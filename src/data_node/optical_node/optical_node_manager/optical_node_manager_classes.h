@@ -42,7 +42,6 @@ struct OpticalLibraryInventory {
     uint64_t staging_read_images{0};      // 读镜像数
     uint64_t pending_read_tasks{0};       // 非终态读任务（READ / CD_READ）
     uint64_t pending_write_tasks{0};      // 非终态写任务（WRITE）
-    uint64_t accumulated_write_bytes{0};  // 累计写入字节（压缩归档文件时累加）
 };
 
 namespace manager_status {
@@ -1536,7 +1535,6 @@ enum class RuntimeStateSectionTag : uint32_t {
     kPendingFiles = 7,     // volume_manager_ 的 pending_files_ / pending_size_
     kImages = 8,           // space_manager_ 管理表全量快照（volume_id + category，按 LRU 由旧到新）
     kDiscUsage = 9,        // cd_manager 的已使用光盘数（总光盘数由启动配置决定，不落盘）
-    kWriteStats = 10,      // 累计写入字节（ZipTaskProcessor 压缩时累加）
 };
 
 /**

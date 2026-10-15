@@ -47,6 +47,7 @@ public:
     std::atomic<int> get_cluster_view_calls{0};
     std::atomic<int> register_calls{0};
     std::atomic<int> optical_status_calls{0};
+    std::atomic<int> node_metrics_calls{0};
 
     void GetClusterView(google::protobuf::RpcController* controller,
                         const zb::rpc::GetClusterViewRequest* request,
@@ -67,6 +68,11 @@ public:
                                     const zb::rpc::ReportOpticalLibraryStatusRequest* request,
                                     zb::rpc::ManagedNodeReply* response,
                                     google::protobuf::Closure* done) override;
+
+    void ReportNodeMetrics(google::protobuf::RpcController* controller,
+                           const zb::rpc::ReportNodeMetricsRequest* request,
+                           zb::rpc::ManagedNodeReply* response,
+                           google::protobuf::Closure* done) override;
 };
 
 // loopback 临时端口上的 brpc server；端口取 0 由内核分配，避免端口冲突。

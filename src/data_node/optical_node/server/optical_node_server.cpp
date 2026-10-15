@@ -15,6 +15,7 @@
 #include "../config/OpticalNodeConfig.h"
 #include "../service/BrpcOpticalNodeService.h"
 #include "../service/OpticalStorageServiceImpl.h"
+#include "common/metrics/SchedulerMetricsClient.h"
 #include "scheduler.pb.h"
 
 DEFINE_string(config, "", "Path to optical node config file");
@@ -33,7 +34,6 @@ uint64_t NowMs() {
 struct HeartbeatInventoryConfig {
     uint64_t volume_size_bytes{0};           // 单卷镜像大小（换算 cache 容量）
     uint64_t disc_capacity_bytes{0};         // 单盘容量
-    uint64_t capacity_in_images{0};          // image_dir 镜像数上限
     uint64_t cache_read_bytes_per_sec{0};    // hdd-cache 读带宽
     uint64_t cache_write_bytes_per_sec{0};   // hdd-cache 写带宽
     uint64_t drive_read_bytes_per_sec{0};    // 单光驱读带宽
@@ -242,9 +242,9 @@ private:
         const uint32_t recording =
             static_cast<uint32_t>(std::min<uint64_t>(inv.disc_burning, disc_count - recorded));
         const uint64_t staging_capacity =
-            inventory_config_.capacity_in_images * inventory_config_.volume_size_bytes;
+            inv.staging_capacity_images * inventory_config_.volume_size_bytes;
         const uint64_t staging_used =
-            std::min(inv.staging_used_images, inventory_config_.capacity_in_images) *
+            std::min(inv.staging_used_images, inv.staging_capacity_images) *
             inventory_config_.volume_size_bytes;
 
         zb::rpc::ReportOpticalLibraryStatusRequest request;
@@ -311,7 +311,7 @@ private:
                 zb::rpc::DiskHeartbeat* cache = request.add_disks();
                 cache->set_disk_id("hdd-cache");
                 cache->set_device_kind(zb::rpc::MANAGED_DEVICE_HDD);
-                const uint64_t capacity_images = inventory_config_.capacity_in_images;
+                const uint64_t capacity_images = inv.staging_capacity_images;
                 const uint64_t used_images = std::min(inv.staging_used_images, capacity_images);
                 cache->set_capacity_bytes(capacity_images * inventory_config_.volume_size_bytes);
                 cache->set_free_bytes(
@@ -319,8 +319,8 @@ private:
                 cache->set_is_healthy(true);
                 cache->set_read_bandwidth_bytes_per_sec(inventory_config_.cache_read_bytes_per_sec);
                 cache->set_write_bandwidth_bytes_per_sec(inventory_config_.cache_write_bytes_per_sec);
-                // 累计写入字节挂在写入目标（image_dir 缓存）上；调度器按设备求和，位置不影响汇总。
-                cache->set_accumulated_write_bytes(inv.accumulated_write_bytes);
+                // 累计写入字节不随心跳上报（与 real_node 口径一致），统一由 ReportNodeMetrics 的
+                // write_bytes 窗口承担，避免服务端 max(心跳绝对值) 与 累加(指标增量) 重复计数。
             }
             {
                 zb::rpc::DiskHeartbeat* disc = request.add_disks();
@@ -364,6 +364,26 @@ private:
                 }
                 // 同一通道、同一节拍上报光盘库专属状态；失败只记日志，不影响心跳循环。
                 ReportLibraryStatus(stub);
+
+                // 数据面 I/O 指标窗口：按访问路径分两个采集器（cache-hit / disc-miss）。
+                // 无活动时 helper 内部直接跳过；成功后确认本地窗口避免重复计数。
+                std::string metrics_error;
+                if (!zb::metrics::ReportCollectedMetrics(channel.get(),
+                                                         node_id_,
+                                                         service_->metrics_cache_hit(),
+                                                         zb::rpc::MANAGED_ACCESS_OPTICAL_CACHE_HIT,
+                                                         NowMs(),
+                                                         &metrics_error)) {
+                    std::cerr << "Scheduler cache-hit metrics report failed: " << metrics_error << std::endl;
+                }
+                if (!zb::metrics::ReportCollectedMetrics(channel.get(),
+                                                         node_id_,
+                                                         service_->metrics_disc(),
+                                                         zb::rpc::MANAGED_ACCESS_OPTICAL_DISC,
+                                                         NowMs(),
+                                                         &metrics_error)) {
+                    std::cerr << "Scheduler disc metrics report failed: " << metrics_error << std::endl;
+                }
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_));
@@ -455,7 +475,6 @@ HeartbeatInventoryConfig BuildHeartbeatInventoryConfig(const zb::optical_node::O
     HeartbeatInventoryConfig out;
     out.volume_size_bytes = cfg.volume_size_bytes;
     out.disc_capacity_bytes = cfg.disc_capacity_bytes;
-    out.capacity_in_images = cfg.capacity_in_images;
     out.cache_read_bytes_per_sec = cfg.cache_read_bytes_per_sec;
     out.cache_write_bytes_per_sec = cfg.cache_write_bytes_per_sec;
     out.drive_read_bytes_per_sec = cfg.drive_read_bytes_per_sec;

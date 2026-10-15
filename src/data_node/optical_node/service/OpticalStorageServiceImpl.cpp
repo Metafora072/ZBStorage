@@ -75,6 +75,8 @@ OpticalStorageServiceImpl::OpticalStorageServiceImpl(const OpticalNodeConfig& co
     // 在 Run() 拉起后台线程之前注册完成回调：任何准备任务 READY 都能通知到客户端。
     optical_node_manager_.SetPreparedFileReadyCallback(
         [this](const optical_node_manager::PreparedFileReadyEvent& ev) { SendReadReady(ev); });
+    // 在 Run() 启动后台线程之前注入指标采集器：缓存命中区间读走 cache_hit，归档写与光盘回读走 disc。
+    optical_node_manager_.SetMetricsCollectors(&metrics_cache_hit_, &metrics_disc_);
     optical_node_manager_.Run();
 }
 
@@ -168,7 +170,15 @@ volumemanager::ErrorCode OpticalStorageServiceImpl::AcquireReadSession(
 volumemanager::ErrorCode OpticalStorageServiceImpl::ReadPreparedFile(
         uint64_t read_handle, uint64_t offset, uint64_t size, std::string* out,
         optical_node_manager::ReadPreparedFileResult* result) {
-    return optical_node_manager_.ReadPreparedFile(read_handle, offset, size, out, result);
+    // 缓存命中路径记账：区间读由本地 image/ 镜像（HDD 缓存）提供，成功时累计实际返回字节。
+    // 需要回读光盘时的镜像加载另行计入 disc 采集器（见 OnCDReadComplete）。
+    auto operation = metrics_cache_hit_.Start(zb::metrics::OperationKind::kRead);
+    const volumemanager::ErrorCode ret =
+        optical_node_manager_.ReadPreparedFile(read_handle, offset, size, out, result);
+    if (ret == volumemanager::ErrorCode::SUCCESS && result != nullptr) {
+        operation.SetBytes(result->bytes_read);
+    }
+    return ret;
 }
 
 volumemanager::ErrorCode OpticalStorageServiceImpl::ReleaseReadSession(uint64_t read_handle) {

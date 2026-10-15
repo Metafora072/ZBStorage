@@ -65,15 +65,20 @@ volume images, packs those images onto optical discs, burns the discs, and serve
   state, `cd_manager_sim` active tasks (their burns restart from zero), and the download round quota.
 - Scheduler heartbeat reports readiness from `IsArchiveEngineReady()` and now carries a device
   inventory aligned with the profile's three groups: one `hdd-cache` (`CAPACITY_IN_IMAGES ×
-  VOLUME_SIZE_BYTES`, free derived from `staging_used_images`, carries `accumulated_write_bytes`),
+  VOLUME_SIZE_BYTES`, free derived from `staging_used_images`),
   one aggregated `disc` (`DISC_CAPACITY_BYTES × disc_count`, free from `disc_count − disc_used`),
   and one `optical-drive` per drive (`optical-drive-<i>`, per-drive read/write bandwidth).
-  `accumulated_write_bytes` accumulates archive-file sizes at compression time and is persisted in
-  the runtime snapshot (restored on restart). With a non-empty inventory the scheduler derives
+  Accumulated write bytes are reported only via `ReportNodeMetrics` (`write_bytes`, archive-file
+  sizes at compression time), matching the real node; the heartbeat does not carry
+  `accumulated_write_bytes`. With a non-empty inventory the scheduler derives
   `inventory_ready = true`, so the node leaves `JOINING`. Disc classification counts, staging
   pressure, background tasks and busy drives are reported on the same cadence via
    `ReportOpticalLibraryStatus` (`total_slots = SLOT_COUNT`, `local_disc_count = TOTAL_DISC_COUNT`,
    `recorded = used discs`, `recording = active burn tasks`, `blank = local − recorded − recording`).
+   Data-plane reads and archive downloads (hot node → optical node) are additionally reported
+   via `ReportNodeMetrics`, split by access path into two collectors: the client cache-hit range
+   reads carry `access_path = MANAGED_ACCESS_OPTICAL_CACHE_HIT`, while the archive-download write and
+   the image read-back from the optical disc (a DISC miss) carry `MANAGED_ACCESS_OPTICAL_DISC`.
 - At startup, before the heartbeat loop begins, the node runs a **one-shot** `RegisterManagedNode`
   (`kind = MANAGED_KIND_OPTICAL_LIBRARY`, `MANAGED_EXECUTION_PHYSICAL`, `participates_in_placement =
   false`, `activate_immediately = false`) so the scheduler keeps it in `JOINING` until real inventory

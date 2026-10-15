@@ -478,9 +478,9 @@ namespace optical_node_manager {
                                            uint64_t disc_capacity_bytes,
                                            uint32_t standard_images_per_disc,
                                            uint64_t disc_block_size_bytes,
-                                           uint64_t total_disc_count,
                                            uint32_t max_write_images,
-                                           const std::string& scheduler_addr)
+                                           const std::string& scheduler_addr,
+                                           cd_manager_sim::CDManagerConfig cd_manager_config)
         : volume_manager_(volume_size, size_threshold),
           cd_read_task_queue_(new WR_task::WRTaskQueue()),
           zip_task_queue_(new WR_task::WRTaskQueue()),
@@ -496,7 +496,7 @@ namespace optical_node_manager {
         disc_capacity_bytes_ = disc_capacity_bytes;
         standard_images_per_disc_ = standard_images_per_disc;
         disc_block_size_bytes_ = disc_block_size_bytes;
-        total_disc_count_ = total_disc_count;
+        cd_manager_config_ = std::move(cd_manager_config);
         max_write_images_ = max_write_images < 1 ? 1 : max_write_images;
     }
 
@@ -929,10 +929,8 @@ namespace optical_node_manager {
             cd_manager_.reset();
         }
 
-        cd_manager_sim::CDManagerConfig config{};
+        cd_manager_sim::CDManagerConfig config = cd_manager_config_;
         config.workspace_root = disc_sim_dir_;
-        // 库内总光盘数由启动配置注入 cd_manager（运行期不变；已使用数走快照恢复）。
-        config.total_disc_count = total_disc_count_;
         try {
             cd_manager_ = std::make_unique<cd_manager_sim::CDManager>(config);
         } catch (const std::exception& e) {

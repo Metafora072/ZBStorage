@@ -63,10 +63,19 @@ volume images, packs those images onto optical discs, burns the discs, and serve
   drop half-written `vdisc.tmp`) and renames the file to `runtime_state_snapshot.loaded` so it is
   replayed only once. Not persisted (must be redone after a restart): in-progress `WriteObject` shard
   state, `cd_manager_sim` active tasks (their burns restart from zero), and the download round quota.
-- Scheduler heartbeat reports readiness from `IsArchiveEngineReady()`. The archive engine does not
-  export a device inventory or task telemetry yet, so the heartbeat keeps the node in `JOINING` with
+- Scheduler heartbeat reports readiness from `IsArchiveEngineReady()`. The archive engine does not export a device inventory or task telemetry yet, so the heartbeat keeps the node in `JOINING` with
   `readiness_message = "archive engine running; awaiting optical inventory and task telemetry"`
   instead of publishing fabricated empty inventory / idle measurements.
+- At startup, before the heartbeat loop begins, the node runs a **one-shot** `RegisterManagedNode`
+  (`kind = MANAGED_KIND_OPTICAL_LIBRARY`, `MANAGED_EXECUTION_PHYSICAL`, `participates_in_placement =
+  false`, `activate_immediately = false`) so the scheduler keeps it in `JOINING` until real inventory
+  arrives. Registration is retried a bounded number of times (transient transport failures only; a
+  definitive server rejection stops retries), then is never sent again — the loop that follows is
+  pure heartbeat. If registration is not confirmed, the heartbeat's implicit auto-registration
+  applies instead (degrading the profile to the scheduler default optical template).
+  The spec's device groups (hdd-cache / disc / optical-drive), four-level power, reliability and
+  optical latencies are built from the node config (see the config table below), not from the
+  scheduler defaults; `SCHED_ALREADY_EXISTS` (e.g. after a node restart) is treated as success.
 - The data-plane read chain is wired end to end. `SubscribeReadEvents` accepts a client brpc Stream and
   registers it in `ReadEventSessionRegistry` (`session_id → server Stream`); `PrepareRead` registers a
   READ task with its `request_id` / `session_id` **before** enqueueing, so completion can never race the
@@ -110,6 +119,36 @@ Values are also clamped to safe defaults when zero/invalid (see `OpticalNodeConf
 | `TOTAL_DISC_COUNT` | `1000` | total disc slots in the library; startup-only, reported as optical capacity |
 | `DISC_BLOCK_SIZE_BYTES` | `2048` | disc block size; superblock, metadata area and every image are aligned to it |
 | `MAX_WRITE_IMAGES` | `128` | max concurrent WRITE images; download back-pressure threshold |
+
+Library hardware / simulation parameters passed through to `cd_manager` (formerly hard-coded in
+`cd_manager.cpp`) and to the `RegisterManagedNode` device groups:
+
+| key | default | meaning |
+| --- | --- | --- |
+| `DRIVE_COUNT` | `20` | number of optical drives |
+| `ARM_COUNT` | `4` | number of mechanical arms |
+| `BURN_IMAGE_SIZE_BYTES` | `10737418240` | fallback burn size when the real image size is unknown |
+| `BURN_BANDWIDTH_MBPS` | `20.0` | burn bandwidth (MB/s) |
+| `BURN_FIXED_SECONDS` | `1.0` | fixed burn latency (s) |
+| `READ_BANDWIDTH_MBPS` | `100.0` | disc read bandwidth (MB/s) |
+| `READ_FIXED_SECONDS` | `0.5` | fixed disc read latency (s) |
+| `DRIVE_LOAD_SECONDS` / `DRIVE_EJECT_SECONDS` | `12.0` / `3.0` | drive load / eject time (s) |
+| `GRASP_SECONDS` | `2.0` | arm grasp time (s) |
+| `ARM_SPEED_X` / `ARM_SPEED_Y` / `ARM_SPEED_Z` | `2.0` / `1.0` / `1.0` | arm speed per axis (m/s) |
+| `RACK_ROWS` / `RACK_COLS` / `RACK_DEPTH` | `50` / `200` / `10` | rack geometry (random slot placement) |
+| `SLOT_WIDTH` / `SLOT_HEIGHT` / `SLOT_DEPTH` | `0.015` / `0.15` / `0.3` | single slot size (m) |
+| `EXTERNAL_NETWORK_BANDWIDTH_BYTES_PER_SEC` | `10000000000` | node external network cap |
+| `FIXED_ACCESS_LATENCY_US` | `500` | fixed (cache-hit) access latency |
+| `OPTICAL_LOAD_LATENCY_US` / `OPTICAL_SEEK_LATENCY_US` | `60000000` / `500000` | disc load / seek latency |
+| `CACHE_READ_BYTES_PER_SEC` / `CACHE_WRITE_BYTES_PER_SEC` | `200000000` | hdd-cache group read/write bandwidth |
+| `DRIVE_READ_BYTES_PER_SEC` / `DRIVE_WRITE_BYTES_PER_SEC` | `100000000` / `10000000` | optical-drive group read/write bandwidth |
+| `POWER_PEAK_MILLIWATTS` / `POWER_MEDIUM_MILLIWATTS` / `POWER_STANDBY_MILLIWATTS` / `POWER_OFF_MILLIWATTS` | `400000` / `200000` / `50000` / `0` | four power levels (mW); must be non-increasing |
+| `RELIABILITY_MEAN_LIFETIME_MS` / `RELIABILITY_LIFETIME_STDDEV_MS` / `RELIABILITY_MINIMUM_LIFETIME_MS` | 10 / 2 / 1 years | node lifetime model (ms) |
+| `TECHNOLOGY_GENERATION` / `INSTANCE_GENERATION` | `1` / `1` | hardware technology generation / service instance generation |
+
+The `hdd-cache` device group capacity is derived from `CAPACITY_IN_IMAGES × VOLUME_SIZE_BYTES`
+(the `image/` total size); the `disc` group uses `DISC_CAPACITY_BYTES × TOTAL_DISC_COUNT`; the
+`optical-drive` group uses `DRIVE_COUNT`.
 
 Constraint across `STANDARD_IMAGES_PER_DISC`, `MAX_WRITE_IMAGES` and `CAPACITY_IN_IMAGES`:
 **images per disc < `MAX_WRITE_IMAGES` < `CAPACITY_IN_IMAGES`**.

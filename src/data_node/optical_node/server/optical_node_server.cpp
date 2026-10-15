@@ -28,6 +28,130 @@ uint64_t NowMs() {
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
+// 一次性注册光盘库受管节点身份。启动阶段同步执行，带有限次重试；成功后进程内不再发送
+// 注册请求（重复发送也会被服务端 ALREADY_EXISTS 幂等吸收）。
+// 与心跳上报分离：注册只在生命周期入口执行一次，心跳是周期性运行态上报。
+class OpticalNodeSchedulerRegistrar {
+public:
+    OpticalNodeSchedulerRegistrar(std::string scheduler_addr,
+                                  zb::rpc::RegisterManagedNodeRequest register_request,
+                                  uint32_t interval_ms)
+        : scheduler_addr_(std::move(scheduler_addr)),
+          register_request_(std::move(register_request)),
+          interval_ms_(interval_ms == 0 ? 2000 : interval_ms) {}
+
+    // 同步注册：返回是否已确认（SCHED_OK / SCHED_ALREADY_EXISTS）。
+    // 传输层失败重试至多 kMaxAttempts 次；服务端明确拒绝则立即停止并回填 *error。
+    bool Register(std::string* error) {
+        for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+            if (!EnsureChannel()) {
+                if (attempt < kMaxAttempts) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_));
+                }
+                continue;
+            }
+            std::string attempt_error;
+            const RegisterOutcome outcome = TryRegister(&attempt_error);
+            if (outcome == RegisterOutcome::kRegistered) {
+                return true;
+            }
+            if (error) *error = attempt_error;
+            if (outcome == RegisterOutcome::kRejected) {
+                return false;
+            }
+            std::cerr << "Scheduler managed-node registration failed (attempt " << attempt << "/"
+                      << kMaxAttempts << "): " << attempt_error << std::endl;
+            channel_.reset();
+            if (attempt < kMaxAttempts) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_));
+            }
+        }
+        return false;
+    }
+
+private:
+    // 单次注册尝试的结果：已注册（含 ALREADY_EXISTS）/ 服务端明确拒绝 / 传输层失败可重试。
+    enum class RegisterOutcome { kRegistered, kRejected, kTransient };
+
+    // 出站 channel 懒初始化；失败返回 false，由调用方按间隔重试。
+    bool EnsureChannel() {
+        if (channel_) {
+            return true;
+        }
+        auto channel = std::make_unique<brpc::Channel>();
+        brpc::ChannelOptions options;
+        options.protocol = "baidu_std";
+        options.timeout_ms = 2000;
+        options.max_retry = 0;
+        if (channel->Init(scheduler_addr_.c_str(), &options) != 0) {
+            std::cerr << "Failed to init Scheduler channel: " << scheduler_addr_ << std::endl;
+            return false;
+        }
+        channel_ = std::move(channel);
+        return true;
+    }
+
+    // 发送一次 RegisterManagedNode。请求内容由 BuildRegisterRequest 从节点配置逐项构建
+    // （设备组、功率、可靠性、光盘延迟、代际），此处只补 join_time_ms / activate_immediately。
+    RegisterOutcome TryRegister(std::string* error) {
+        zb::rpc::RegisterManagedNodeRequest request = register_request_;
+        request.set_join_time_ms(NowMs());
+        // 不立即激活：真实盘片/任务清单由心跳与 ReportOpticalLibraryStatus 补齐，
+        // 节点须在库存就绪后才进入 WORKING，避免仅凭注册就取得写入准入。
+        request.set_activate_immediately(false);
+
+        zb::rpc::SchedulerService_Stub stub(channel_.get());
+        zb::rpc::ManagedNodeReply response;
+        brpc::Controller cntl;
+        stub.RegisterManagedNode(&cntl, &request, &response, nullptr);
+        if (cntl.Failed()) {
+            if (error) *error = cntl.ErrorText();
+            return RegisterOutcome::kTransient;
+        }
+        if (response.status().code() == zb::rpc::SCHED_OK ||
+            response.status().code() == zb::rpc::SCHED_ALREADY_EXISTS) {
+            WarnIfProfileMismatch(request.spec(), response);
+            return RegisterOutcome::kRegistered;
+        }
+        if (error) *error = response.status().message();
+        return RegisterOutcome::kRejected;
+    }
+
+    // 校验服务端最终采纳的 profile 是否等于我们发送的 spec，防止被静默覆盖：
+    //   - SCHED_OK 下应完全一致；
+    //   - SCHED_ALREADY_EXISTS 下若命中“之前由心跳自动注册的默认模板”，就会不一致。
+    // 不一致只告警、不回退：注册本身已确认成功，但节点属性可能非预期。
+    void WarnIfProfileMismatch(const zb::rpc::ManagedNodeSpec& intended,
+                               const zb::rpc::ManagedNodeReply& reply) {
+        if (!reply.has_node()) {
+            std::cerr << "Scheduler registration reply has no node view; cannot verify profile"
+                      << std::endl;
+            return;
+        }
+        const zb::rpc::ManagedNodeSpec& actual = reply.node().spec();
+        if (intended.SerializeAsString() == actual.SerializeAsString()) {
+            return;
+        }
+        std::cerr << "Scheduler registration profile mismatch (node=" << actual.node_id()
+                  << "): device_groups expected=" << intended.device_groups_size()
+                  << " actual=" << actual.device_groups_size()
+                  << ", logical_node_count actual=" << actual.logical_node_count()
+                  << ", participates_in_placement actual=" << actual.participates_in_placement()
+                  << ", peak_milliwatts actual="
+                  << (actual.has_power() ? actual.power().peak_milliwatts() : 0)
+                  << "; the node may be running with a different profile than configured"
+                  << std::endl;
+    }
+
+    std::string scheduler_addr_;
+    zb::rpc::RegisterManagedNodeRequest register_request_;
+    uint32_t interval_ms_{2000};
+    std::unique_ptr<brpc::Channel> channel_;
+
+    // 注册尝试上限（每次间隔 interval_ms_）；用尽后由心跳的隐式自动注册兜底。
+    static constexpr int kMaxAttempts = 5;
+};
+
 class SchedulerHeartbeatReporter {
 public:
     SchedulerHeartbeatReporter(std::string scheduler_addr,
@@ -72,22 +196,32 @@ public:
     ~SchedulerHeartbeatReporter() { Stop(); }
 
 private:
+    // 出站 channel 懒初始化；失败返回 false，由调用方按间隔重试。
+    bool EnsureChannel(std::unique_ptr<brpc::Channel>* channel) {
+        if (*channel) {
+            return true;
+        }
+        auto new_channel = std::make_unique<brpc::Channel>();
+        brpc::ChannelOptions options;
+        options.protocol = "baidu_std";
+        options.timeout_ms = 2000;
+        options.max_retry = 0;
+        if (new_channel->Init(scheduler_addr_.c_str(), &options) != 0) {
+            std::cerr << "Failed to init Scheduler channel: " << scheduler_addr_ << std::endl;
+            return false;
+        }
+        *channel = std::move(new_channel);
+        return true;
+    }
+
     void Run() {
         std::unique_ptr<brpc::Channel> channel;
         while (!stop_.load()) {
-            if (!channel) {
-                auto new_channel = std::make_unique<brpc::Channel>();
-                brpc::ChannelOptions options;
-                options.protocol = "baidu_std";
-                options.timeout_ms = 2000;
-                options.max_retry = 0;
-                if (new_channel->Init(scheduler_addr_.c_str(), &options) != 0) {
-                    std::cerr << "Failed to init Scheduler channel: " << scheduler_addr_ << std::endl;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_));
-                    continue;
-                }
-                channel = std::move(new_channel);
+            if (!EnsureChannel(&channel)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_));
+                continue;
             }
+
             zb::rpc::SchedulerService_Stub stub(channel.get());
             zb::rpc::HeartbeatRequest request;
             request.set_node_id(node_id_);
@@ -146,6 +280,70 @@ private:
     std::atomic<bool> stop_{false};
     std::thread thread_;
 };
+
+// 从节点配置逐项构建 RegisterManagedNode 请求（设备组 + 功率 + 可靠性 + 光盘延迟 + 代际）。
+// 客户端显式给出硬件几何，节点属性不再依赖服务端默认光盘库模板。
+zb::rpc::RegisterManagedNodeRequest BuildRegisterRequest(const zb::optical_node::OpticalNodeConfig& cfg,
+                                                         const std::string& node_id) {
+    zb::rpc::RegisterManagedNodeRequest request;
+    auto* spec = request.mutable_spec();
+    spec->set_node_id(node_id);
+    spec->set_kind(zb::rpc::MANAGED_KIND_OPTICAL_LIBRARY);
+    spec->set_execution_mode(zb::rpc::MANAGED_EXECUTION_PHYSICAL);
+    spec->set_logical_node_count(1);
+    // 光盘库默认不参与普通副本放置，归档准入由 CMS 目录决定。
+    spec->set_participates_in_placement(false);
+    spec->set_participates_in_placement_set(true);
+    spec->set_technology_generation(cfg.technology_generation);
+    spec->set_instance_generation(cfg.instance_generation);
+    spec->set_external_network_bandwidth_bytes_per_sec(cfg.external_network_bandwidth_bytes_per_sec);
+    spec->set_fixed_access_latency_us(cfg.fixed_access_latency_us);
+    spec->set_optical_load_latency_us(cfg.optical_load_latency_us);
+    spec->set_optical_seek_latency_us(cfg.optical_seek_latency_us);
+
+    // hdd-cache：image_dir 总大小 = 镜像数上限 × 单卷镜像大小；单设备、不并发。
+    auto* cache = spec->add_device_groups();
+    cache->set_name("hdd-cache");
+    cache->set_kind(zb::rpc::MANAGED_DEVICE_HDD);
+    cache->set_device_capacity_bytes(cfg.capacity_in_images * cfg.volume_size_bytes);
+    cache->set_device_count(1);
+    cache->set_max_concurrency(1);
+    cache->set_per_device_bandwidth_bytes_per_sec(cfg.cache_read_bytes_per_sec);
+    cache->set_per_device_read_bandwidth_bytes_per_sec(cfg.cache_read_bytes_per_sec);
+    cache->set_per_device_write_bandwidth_bytes_per_sec(cfg.cache_write_bytes_per_sec);
+
+    // disc：单盘容量 × 盘片总数。
+    auto* disc = spec->add_device_groups();
+    disc->set_name("disc");
+    disc->set_kind(zb::rpc::MANAGED_DEVICE_DISC);
+    disc->set_device_capacity_bytes(cfg.disc_capacity_bytes);
+    disc->set_device_count(cfg.total_disc_count);
+
+    // optical-drive：光驱组，本身无容量，按读写带宽计。
+    auto* drive = spec->add_device_groups();
+    drive->set_name("optical-drive");
+    drive->set_kind(zb::rpc::MANAGED_DEVICE_OPTICAL_DRIVE);
+    drive->set_device_capacity_bytes(0);
+    drive->set_device_count(cfg.drive_count);
+    drive->set_max_concurrency(cfg.drive_count);
+    drive->set_per_device_bandwidth_bytes_per_sec(cfg.drive_read_bytes_per_sec);
+    drive->set_per_device_read_bandwidth_bytes_per_sec(cfg.drive_read_bytes_per_sec);
+    drive->set_per_device_write_bandwidth_bytes_per_sec(cfg.drive_write_bytes_per_sec);
+
+    auto* power = spec->mutable_power();
+    power->set_peak_milliwatts(cfg.power_peak_milliwatts);
+    power->set_medium_milliwatts(cfg.power_medium_milliwatts);
+    power->set_standby_milliwatts(cfg.power_standby_milliwatts);
+    power->set_off_milliwatts(cfg.power_off_milliwatts);
+
+    auto* reliability = spec->mutable_reliability();
+    reliability->set_mean_lifetime_ms(cfg.reliability_mean_lifetime_ms);
+    reliability->set_lifetime_stddev_ms(cfg.reliability_lifetime_stddev_ms);
+    reliability->set_minimum_lifetime_ms(cfg.reliability_minimum_lifetime_ms);
+    reliability->set_model(zb::rpc::ManagedReliabilityProfile::NORMAL_LIFETIME);
+
+    return request;
+}
 
 zb::rpc::NodeRole ParseRole(const std::string& role) {
     std::string lowered = role;
@@ -223,7 +421,19 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (!cfg.scheduler_addr.empty()) reporter.Start();
+    if (!cfg.scheduler_addr.empty()) {
+        // 启动阶段一次性注册（同步、带有限重试）；成功后才开始周期心跳。
+        // 未确认时仍继续心跳，由心跳的隐式自动注册兜底（profile 退化为默认模板）。
+        OpticalNodeSchedulerRegistrar registrar(cfg.scheduler_addr,
+                                                BuildRegisterRequest(cfg, node_id),
+                                                cfg.heartbeat_interval_ms);
+        std::string register_error;
+        if (!registrar.Register(&register_error)) {
+            std::cerr << "Scheduler managed-node registration not confirmed: " << register_error
+                      << "; heartbeat will rely on implicit auto-registration" << std::endl;
+        }
+        reporter.Start();
+    }
 
     server.RunUntilAskedToQuit();
 

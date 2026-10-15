@@ -59,6 +59,25 @@ struct CDManagerConfig {
     uint64_t burn_image_size = 10ULL * 1024ULL * 1024ULL * 1024ULL;  // 默认10GB镜像大小
     double burn_bandwidth_mbps = 20.0;  // 刻录带宽 MB/s
     double time_burn_fixed_seconds = 1.0;  // 刻录固定延迟
+    // 读盘相关参数
+    double read_bandwidth_mbps = 100.0;    // 读盘带宽 MB/s
+    double time_read_fixed_seconds = 0.5;  // 读盘固定延迟
+    // 光驱 / 机械臂动作耗时（秒）
+    double time_drive_load_seconds = 12.0;   // 装盘
+    double time_drive_eject_seconds = 3.0;   // 退盘
+    double time_grasp_seconds = 2.0;         // 抓取
+    // 机械臂移动速度（米/秒）
+    double arm_speed_x = 2.0;
+    double arm_speed_y = 1.0;
+    double arm_speed_z = 1.0;
+    // 货架几何（行/列/深度，用于随机盘位分配）
+    double rack_rows = 50.0;
+    double rack_cols = 200.0;
+    double rack_depth = 10.0;
+    // 单个盘位尺寸（米），用于机械臂移动距离估算
+    double slot_width = 0.015;
+    double slot_height = 0.15;
+    double slot_depth = 0.3;
     std::string workspace_root = "/tmp/cd_manager/";
 };
 

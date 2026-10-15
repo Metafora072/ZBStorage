@@ -29,6 +29,34 @@ bool ExtractTrailingSeq(const std::string& value, std::string* seq) {
     return true;
 }
 
+// 从节点配置逐项构建光盘库/模拟参数（原 cd_manager 内写死的常量现全部外部化）。
+// workspace_root 不在此设置——由 OpticalNodeManager::InitializeDir 按 disc_sim_dir_ 覆盖。
+cd_manager_sim::CDManagerConfig BuildCDManagerConfig(const OpticalNodeConfig& cfg) {
+    cd_manager_sim::CDManagerConfig out;
+    out.num_drives = static_cast<int>(cfg.drive_count);
+    out.num_arms = static_cast<int>(cfg.arm_count);
+    out.total_disc_count = cfg.total_disc_count;
+    out.volume_size = cfg.volume_size_bytes;
+    out.burn_image_size = cfg.burn_image_size_bytes;
+    out.burn_bandwidth_mbps = cfg.burn_bandwidth_mbps;
+    out.time_burn_fixed_seconds = cfg.burn_fixed_seconds;
+    out.read_bandwidth_mbps = cfg.read_bandwidth_mbps;
+    out.time_read_fixed_seconds = cfg.read_fixed_seconds;
+    out.time_drive_load_seconds = cfg.drive_load_seconds;
+    out.time_drive_eject_seconds = cfg.drive_eject_seconds;
+    out.time_grasp_seconds = cfg.grasp_seconds;
+    out.arm_speed_x = cfg.arm_speed_x;
+    out.arm_speed_y = cfg.arm_speed_y;
+    out.arm_speed_z = cfg.arm_speed_z;
+    out.rack_rows = cfg.rack_rows;
+    out.rack_cols = cfg.rack_cols;
+    out.rack_depth = cfg.rack_depth;
+    out.slot_width = cfg.slot_width;
+    out.slot_height = cfg.slot_height;
+    out.slot_depth = cfg.slot_depth;
+    return out;
+}
+
 }  // namespace
 
 OpticalStorageServiceImpl::OpticalStorageServiceImpl(const OpticalNodeConfig& config)
@@ -40,9 +68,9 @@ OpticalStorageServiceImpl::OpticalStorageServiceImpl(const OpticalNodeConfig& co
                             config.disc_capacity_bytes,
                             config.standard_images_per_disc,
                             config.disc_block_size_bytes,
-                            config.total_disc_count,
                             config.max_write_images,
-                            config.scheduler_addr) {
+                            config.scheduler_addr,
+                            BuildCDManagerConfig(config)) {
     // 在 Run() 拉起后台线程之前注册完成回调：任何准备任务 READY 都能通知到客户端。
     optical_node_manager_.SetPreparedFileReadyCallback(
         [this](const optical_node_manager::PreparedFileReadyEvent& ev) { SendReadReady(ev); });

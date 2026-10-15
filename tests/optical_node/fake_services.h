@@ -45,6 +45,7 @@ public:
     std::string node_address;
 
     std::atomic<int> get_cluster_view_calls{0};
+    std::atomic<int> register_calls{0};
 
     void GetClusterView(google::protobuf::RpcController* controller,
                         const zb::rpc::GetClusterViewRequest* request,
@@ -55,6 +56,11 @@ public:
                          const zb::rpc::HeartbeatRequest* request,
                          zb::rpc::HeartbeatReply* response,
                          google::protobuf::Closure* done) override;
+
+    void RegisterManagedNode(google::protobuf::RpcController* controller,
+                             const zb::rpc::RegisterManagedNodeRequest* request,
+                             zb::rpc::ManagedNodeReply* response,
+                             google::protobuf::Closure* done) override;
 };
 
 // loopback 临时端口上的 brpc server；端口取 0 由内核分配，避免端口冲突。

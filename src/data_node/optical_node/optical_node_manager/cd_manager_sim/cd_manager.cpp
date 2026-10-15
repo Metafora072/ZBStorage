@@ -31,6 +31,12 @@ Duration SecondsToDuration(double seconds) {
     return std::chrono::duration_cast<Duration>(std::chrono::duration<double>(seconds));
 }
 
+// 货架某一维的随机下标上界（含）：维度 <= 1 时退化为 0（单一槽位）。
+int RackIndexBound(double dimension) {
+    const int cells = static_cast<int>(dimension);
+    return cells > 1 ? cells - 1 : 0;
+}
+
 }  // namespace
 
 struct CDManager::Impl {
@@ -102,9 +108,9 @@ struct CDManager::Impl {
     explicit Impl(CDManagerConfig cfg)
         : config(std::move(cfg)),
           rng(std::random_device{}()),
-          dist_row(0, static_cast<int>(kRackRows) - 1),
-          dist_col(0, static_cast<int>(kRackCols) - 1),
-          dist_depth(0, static_cast<int>(kRackDepth) - 1) {
+          dist_row(0, RackIndexBound(config.rack_rows)),
+          dist_col(0, RackIndexBound(config.rack_cols)),
+          dist_depth(0, RackIndexBound(config.rack_depth)) {
         total_disc_count_ = std::max<uint64_t>(1, config.total_disc_count);
     }
 
@@ -135,21 +141,6 @@ struct CDManager::Impl {
     std::uniform_int_distribution<int> dist_row;
     std::uniform_int_distribution<int> dist_col;
     std::uniform_int_distribution<int> dist_depth;
-
-    static constexpr double kTimeGraspSeconds = 2.0;
-    static constexpr double kTimeDriveLoadSeconds = 12.0;
-    static constexpr double kTimeDriveEjectSeconds = 3.0;
-    static constexpr double kTimeReadFixedSeconds = 0.5;
-    static constexpr double kReadBandwidthMbPerSecond = 100.0;
-    static constexpr double kArmSpeedX = 2.0;
-    static constexpr double kArmSpeedY = 1.0;
-    static constexpr double kArmSpeedZ = 1.0;
-    static constexpr double kRackRows = 50.0;
-    static constexpr double kRackCols = 200.0;
-    static constexpr double kRackDepth = 10.0;
-    static constexpr double kSlotWidth = 0.015;
-    static constexpr double kSlotHeight = 0.15;
-    static constexpr double kSlotDepth = 0.3;
 
     // Start/Stop 维护一个后台调度线程：
     // 线程只负责等待最早完成的任务并在到点后触发回调。
@@ -663,9 +654,9 @@ struct CDManager::Impl {
             const TimePoint arm_ready = arm_available_at[arm_idx];
 
             const Duration outbound_move = CalculateArmMoveDuration(task.disc_location);
-            const double time_z = task.disc_location.z / kArmSpeedZ;
-            const double time_xy = std::max(task.disc_location.x / kArmSpeedX,
-                                            task.disc_location.y / kArmSpeedY);
+            const double time_z = task.disc_location.z / config.arm_speed_z;
+            const double time_xy = std::max(task.disc_location.x / config.arm_speed_x,
+                                            task.disc_location.y / config.arm_speed_y);
             const Duration inbound_move = SecondsToDuration(time_z + time_xy);
 
             const TimePoint drive_allocated_at = std::max(task.arrival_time, drive_ready);
@@ -709,15 +700,15 @@ struct CDManager::Impl {
         const int r = dist_row(rng);
         const int c = dist_col(rng);
         const int d = dist_depth(rng);
-        return Point3D(c * kSlotWidth, r * kSlotHeight, d * kSlotDepth);
+        return Point3D(c * config.slot_width, r * config.slot_height, d * config.slot_depth);
     }
 
     // 估算一次读请求的纯读取阶段耗时。
     // 入参为实际读取的字节数，而不是固定用 config.volume_size。
     Duration CalculateReadDuration(uint64_t read_size_bytes) const {
         const double read_file_size_mb = static_cast<double>(read_size_bytes) / (1024.0 * 1024.0);
-        const double transfer_time = read_file_size_mb / kReadBandwidthMbPerSecond;
-        return SecondsToDuration(kTimeReadFixedSeconds + transfer_time);
+        const double transfer_time = read_file_size_mb / config.read_bandwidth_mbps;
+        return SecondsToDuration(config.time_read_fixed_seconds + transfer_time);
     }
 
     // 估算一次刻录请求的纯刻录阶段耗时。
@@ -732,19 +723,20 @@ struct CDManager::Impl {
 
     // 返回光驱执行装盘动作的固定耗时。
     Duration CalculateDriveLoadDuration() const {
-        return SecondsToDuration(kTimeDriveLoadSeconds);
+        return SecondsToDuration(config.time_drive_load_seconds);
     }
 
     // 返回光驱执行退盘动作的固定耗时。
     Duration CalculateDriveEjectDuration() const {
-        return SecondsToDuration(kTimeDriveEjectSeconds);
+        return SecondsToDuration(config.time_drive_eject_seconds);
     }
 
     // 根据盘片所在三维坐标估算机械臂的单程移动时间。
     Duration CalculateArmMoveDuration(const Point3D& disc_location) const {
-        const double time_z = disc_location.z / kArmSpeedZ;
-        const double time_xy = std::max(disc_location.x / kArmSpeedX, disc_location.y / kArmSpeedY);
-        return SecondsToDuration(time_z + time_xy + kTimeGraspSeconds);
+        const double time_z = disc_location.z / config.arm_speed_z;
+        const double time_xy = std::max(disc_location.x / config.arm_speed_x,
+                                        disc_location.y / config.arm_speed_y);
+        return SecondsToDuration(time_z + time_xy + config.time_grasp_seconds);
     }
 
     // 在一组资源可用时间中找到最早空闲的那一个。

@@ -35,11 +35,12 @@ public:
     // image_dir 镜像数上限与可用 ID 池容量上限（volume_id / disk_id 两个池共用该上限）。
     // disc_capacity_bytes / standard_images_per_disc / disc_block_size_bytes 为光盘有关参数
     // （单张光盘容量上限、标准镜像数基线、数据块对齐大小）。
-    // total_disc_count 为库内总光盘数（盘片槽位容量上限），启动时注入 cd_manager，
-    // 用于对外上报光盘库容量。
     // max_write_images 为下载侧背压阈值：image_dir 中允许同时存在的写镜像数上限，
     // 超过即暂停下载原始文件（须大于单盘可容纳的镜像数，否则无法封盘）。
     // scheduler_addr 为 scheduler 服务地址，供归档线程查询全量节点视图（node_id→address）。
+    // cd_manager_config 为光盘库/模拟参数（光驱数、机械臂数、总光盘数、刻录与读盘带宽、
+    // 动作耗时、机械臂速度、货架几何等），由上层从节点配置逐项透传；InitializeDir 仅
+    // 覆盖其中的 workspace_root。
     OpticalNodeManager(uint64_t volume_size,
                        double size_threshold,
                        const std::string& root_dir,
@@ -48,9 +49,9 @@ public:
                        uint64_t disc_capacity_bytes,
                        uint32_t standard_images_per_disc,
                        uint64_t disc_block_size_bytes,
-                       uint64_t total_disc_count,
                        uint32_t max_write_images,
-                       const std::string& scheduler_addr);
+                       const std::string& scheduler_addr,
+                       cd_manager_sim::CDManagerConfig cd_manager_config);
 
     ~OpticalNodeManager();
 
@@ -499,8 +500,8 @@ private:
     uint32_t standard_images_per_disc_{0};
     uint64_t disc_block_size_bytes_{0};
 
-    // 库内总光盘数（构造注入，运行期不变），InitializeDir 时下发给 cd_manager。
-    uint64_t total_disc_count_{0};
+    // 光盘库/模拟参数（构造注入，运行期不变），InitializeDir 时下发给 cd_manager。
+    cd_manager_sim::CDManagerConfig cd_manager_config_{};
 
     // 下载侧背压阈值：image_dir 中允许同时存在的写镜像数上限（含「已封印、等刻录释放」的）。
     // 由归档下载批次在开始前检查，超过即暂停下载，等 Zip 压缩 / 刻录释放降低占用。

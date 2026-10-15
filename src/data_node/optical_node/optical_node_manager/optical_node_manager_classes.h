@@ -26,6 +26,25 @@
 // 字符串值需保持稳定，上层可直接做 == 比较或拼入日志 / RPC 返回。
 namespace optical_node_manager {
 
+// 光盘库库存快照：供对外上报（心跳设备清单 / ReportOpticalLibraryStatus）读取真实库状态。
+// 纯只读聚合，不改变任何运行态。镜像数量单位为「镜像个数」——字节数由调用方结合
+// 单卷镜像大小（VOLUME_SIZE_BYTES）自行换算，避免在此层引入容量单位约定。
+struct OpticalLibraryInventory {
+    uint32_t drive_total{0};              // 光驱总数
+    uint32_t drive_busy{0};               // 忙光驱数（被活动任务占用）
+    uint64_t disc_count{0};               // 库内光盘数量（cd_manager 总光盘数，= local_disc_count）
+    uint64_t slot_count{0};               // 光盘架槽位数（cd_manager 总槽数，= total_slots）
+    uint64_t disc_used{0};                // 已用光盘数（刻录完成计数，= recorded_disc_count）
+    uint64_t disc_burning{0};             // 正在执行的刻录任务数（= recording_disc_count）
+    uint64_t staging_capacity_images{0};  // image_dir 容量（镜像数上限）
+    uint64_t staging_used_images{0};      // image_dir 已用（镜像数）
+    uint64_t staging_write_images{0};     // 写镜像数
+    uint64_t staging_read_images{0};      // 读镜像数
+    uint64_t pending_read_tasks{0};       // 非终态读任务（READ / CD_READ）
+    uint64_t pending_write_tasks{0};      // 非终态写任务（WRITE）
+    uint64_t accumulated_write_bytes{0};  // 累计写入字节（压缩归档文件时累加）
+};
+
 namespace manager_status {
 
 // Run() 尚未调用。
@@ -1517,6 +1536,7 @@ enum class RuntimeStateSectionTag : uint32_t {
     kPendingFiles = 7,     // volume_manager_ 的 pending_files_ / pending_size_
     kImages = 8,           // space_manager_ 管理表全量快照（volume_id + category，按 LRU 由旧到新）
     kDiscUsage = 9,        // cd_manager 的已使用光盘数（总光盘数由启动配置决定，不落盘）
+    kWriteStats = 10,      // 累计写入字节（ZipTaskProcessor 压缩时累加）
 };
 
 /**

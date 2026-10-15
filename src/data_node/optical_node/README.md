@@ -63,9 +63,17 @@ volume images, packs those images onto optical discs, burns the discs, and serve
   drop half-written `vdisc.tmp`) and renames the file to `runtime_state_snapshot.loaded` so it is
   replayed only once. Not persisted (must be redone after a restart): in-progress `WriteObject` shard
   state, `cd_manager_sim` active tasks (their burns restart from zero), and the download round quota.
-- Scheduler heartbeat reports readiness from `IsArchiveEngineReady()`. The archive engine does not export a device inventory or task telemetry yet, so the heartbeat keeps the node in `JOINING` with
-  `readiness_message = "archive engine running; awaiting optical inventory and task telemetry"`
-  instead of publishing fabricated empty inventory / idle measurements.
+- Scheduler heartbeat reports readiness from `IsArchiveEngineReady()` and now carries a device
+  inventory aligned with the profile's three groups: one `hdd-cache` (`CAPACITY_IN_IMAGES ×
+  VOLUME_SIZE_BYTES`, free derived from `staging_used_images`, carries `accumulated_write_bytes`),
+  one aggregated `disc` (`DISC_CAPACITY_BYTES × disc_count`, free from `disc_count − disc_used`),
+  and one `optical-drive` per drive (`optical-drive-<i>`, per-drive read/write bandwidth).
+  `accumulated_write_bytes` accumulates archive-file sizes at compression time and is persisted in
+  the runtime snapshot (restored on restart). With a non-empty inventory the scheduler derives
+  `inventory_ready = true`, so the node leaves `JOINING`. Disc classification counts, staging
+  pressure, background tasks and busy drives are reported on the same cadence via
+   `ReportOpticalLibraryStatus` (`total_slots = SLOT_COUNT`, `local_disc_count = TOTAL_DISC_COUNT`,
+   `recorded = used discs`, `recording = active burn tasks`, `blank = local − recorded − recording`).
 - At startup, before the heartbeat loop begins, the node runs a **one-shot** `RegisterManagedNode`
   (`kind = MANAGED_KIND_OPTICAL_LIBRARY`, `MANAGED_EXECUTION_PHYSICAL`, `participates_in_placement =
   false`, `activate_immediately = false`) so the scheduler keeps it in `JOINING` until real inventory
@@ -116,7 +124,8 @@ Values are also clamped to safe defaults when zero/invalid (see `OpticalNodeConf
 | `AVAILABLE_ID_COUNT` | `5` | capacity of the `volume_id` / `disk_id` pools (shared) |
 | `DISC_CAPACITY_BYTES` | `1099511627776` | max size of one optical disc (bytes, 1 TiB) |
 | `STANDARD_IMAGES_PER_DISC` | `100` | baseline number of images per disc (actual disc may hold more, bounded by capacity) |
-| `TOTAL_DISC_COUNT` | `1000` | total disc slots in the library; startup-only, reported as optical capacity |
+| `TOTAL_DISC_COUNT` | `1000` | number of discs in the library; reported as `local_disc_count` |
+| `SLOT_COUNT` | `100000` | rack slot count; reported as `total_slots` (raised to ≥ `TOTAL_DISC_COUNT`) |
 | `DISC_BLOCK_SIZE_BYTES` | `2048` | disc block size; superblock, metadata area and every image are aligned to it |
 | `MAX_WRITE_IMAGES` | `128` | max concurrent WRITE images; download back-pressure threshold |
 

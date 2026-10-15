@@ -36,6 +36,7 @@ cd_manager_sim::CDManagerConfig BuildCDManagerConfig(const OpticalNodeConfig& cf
     out.num_drives = static_cast<int>(cfg.drive_count);
     out.num_arms = static_cast<int>(cfg.arm_count);
     out.total_disc_count = cfg.total_disc_count;
+    out.slot_count = cfg.slot_count;
     out.volume_size = cfg.volume_size_bytes;
     out.burn_image_size = cfg.burn_image_size_bytes;
     out.burn_bandwidth_mbps = cfg.burn_bandwidth_mbps;
@@ -218,6 +219,10 @@ bool OpticalStorageServiceImpl::Shutdown() {
 
 std::string OpticalStorageServiceImpl::GetArchiveStatusDetail() const {
     return optical_node_manager_.GetStatusDetail();
+}
+
+optical_node_manager::OpticalLibraryInventory OpticalStorageServiceImpl::GetLibraryInventory() const {
+    return optical_node_manager_.GetInventory();
 }
 
 } // namespace zb::optical_node

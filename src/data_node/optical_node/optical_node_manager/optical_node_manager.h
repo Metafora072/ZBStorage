@@ -70,6 +70,10 @@ public:
 
     // 在状态字符串后追加最近一次失败原因，仅用于排障 / 日志。
     std::string GetStatusDetail() const;
+
+    // 采集一次光盘库库存快照（光驱忙闲 / 盘片 / 暂存区 / 后台任务）。
+    // 线程安全、纯只读；未初始化或组件缺失的项保持为 0。
+    OpticalLibraryInventory GetInventory() const;
     // #endregion
 
     // #region 2. 生命周期（启动 / 关机）
@@ -462,6 +466,10 @@ private:
     std::atomic<uint64_t> next_volume_id_{1};
     // 本地 disk_id（对应 MDS disc_id）单调递增计数器。
     std::atomic<uint64_t> next_disk_id_{1};
+
+    // 累计写入字节：ZipTaskProcessor 每压缩一个归档文件（压缩前原始大小）累加一次。
+    // 供心跳 accumulated_write_bytes 上报；持久化到快照并在重启时恢复。
+    std::atomic<uint64_t> accumulated_write_bytes_{0};
 
     // 待打包 inode_id 集合：ZipTaskProcessor 在每次 AddFileToCollect 前登记本次 inode，
     // 封装触发后扫描 temp_dir_ 剩余 temp_*.compressed，diff 出本次被打包的 inode_id 并移除。

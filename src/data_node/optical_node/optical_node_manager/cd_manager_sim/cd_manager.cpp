@@ -12,6 +12,7 @@
 #include <random>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -274,6 +275,31 @@ struct CDManager::Impl {
     void SetUsedDiscCount(uint64_t count) {
         std::lock_guard<std::mutex> lock(mutex);
         used_disc_count_ = count;
+    }
+
+    // 返回当前被活动任务占用的光驱数：按 assigned_drive_index 去重，
+    // 同一光驱被多个任务短时共用（卸载与新任务重叠）时只计一次。
+    std::size_t BusyDriveCount() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::unordered_set<int> busy_drives;
+        for (const auto& pair : active_tasks) {
+            if (pair.second.assigned_drive_index >= 0) {
+                busy_drives.insert(pair.second.assigned_drive_index);
+            }
+        }
+        return busy_drives.size();
+    }
+
+    // 返回当前正在执行的写(刻录)任务数（active_tasks 中 type == BURN 的数量）。
+    std::size_t ActiveBurnTaskCount() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::size_t count = 0;
+        for (const auto& pair : active_tasks) {
+            if (pair.second.type == TaskType::BURN) {
+                ++count;
+            }
+        }
+        return count;
     }
 
     // 后台线程维护一个预测调度：
@@ -809,6 +835,16 @@ uint64_t CDManager::UsedDiscCount() const {
 // 注入已使用光盘数（重启恢复用）。
 void CDManager::SetUsedDiscCount(uint64_t count) {
     impl_->SetUsedDiscCount(count);
+}
+
+// 返回当前忙光驱数。
+std::size_t CDManager::BusyDriveCount() const {
+    return impl_->BusyDriveCount();
+}
+
+// 返回当前正在执行的写(刻录)任务数。
+std::size_t CDManager::ActiveBurnTaskCount() const {
+    return impl_->ActiveBurnTaskCount();
 }
 
 }  // namespace cd_manager_sim

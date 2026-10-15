@@ -51,9 +51,11 @@ struct BurnCompleteEvent {
 struct CDManagerConfig {
     int num_drives = 20;
     int num_arms = 4;
-    // 库内总光盘数（盘片槽位容量上限）。启动时初始化，运行期不变；
-    // 用于对外上报光盘库容量（如 Scheduler 的 total_slots）。0 或非法值按 1 生效。
+    // 库内光盘数量（对应 Scheduler 的 local_disc_count）。启动时初始化，运行期不变；
+    // 0 或非法值按 1 生效。
     uint64_t total_disc_count = 1000;
+    // 光盘库槽位数（光盘架总槽数，对应 Scheduler 的 total_slots）。应 >= total_disc_count。
+    uint64_t slot_count = 100000;
     uint64_t volume_size = 1024ULL * 1024ULL * 1024ULL;
     // 刻录相关参数
     uint64_t burn_image_size = 10ULL * 1024ULL * 1024ULL * 1024ULL;  // 默认10GB镜像大小
@@ -136,6 +138,12 @@ public:
 
     // SetUsedDiscCount() 注入已使用光盘数，供上层在重启时用快照值回填。
     void SetUsedDiscCount(uint64_t count);
+
+    // BusyDriveCount() 返回当前被活动任务占用的光驱数（按 assigned_drive_index 去重）。
+    std::size_t BusyDriveCount() const;
+
+    // ActiveBurnTaskCount() 返回当前正在执行的写（刻录）任务数。
+    std::size_t ActiveBurnTaskCount() const;
 
 private:
     struct Impl;

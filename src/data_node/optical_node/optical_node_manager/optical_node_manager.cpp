@@ -568,6 +568,52 @@ namespace optical_node_manager {
         detail += ")";
         return detail;
     }
+
+    OpticalLibraryInventory OpticalNodeManager::GetInventory() const {
+        OpticalLibraryInventory inv;
+        // 静态硬件属性（光驱总数、盘片槽位）以配置为准——与注册使用同一来源，
+        // 避免组件侧归一导致“注册值 ≠ 库存值”的双真源。
+        inv.drive_total = static_cast<uint32_t>(std::max(1, cd_manager_config_.num_drives));
+        inv.disc_count = cd_manager_config_.total_disc_count;
+        inv.slot_count = cd_manager_config_.slot_count;
+        // 运行时属性以 cd_manager 为准：忙光驱、已用盘数、正在执行的刻录任务数。
+        if (cd_manager_ != nullptr) {
+            inv.drive_busy = static_cast<uint32_t>(cd_manager_->BusyDriveCount());
+            inv.disc_used = cd_manager_->UsedDiscCount();
+            inv.disc_burning = static_cast<uint64_t>(cd_manager_->ActiveBurnTaskCount());
+        }
+        // 暂存区：image_dir 的容量/占用（单位为镜像数）。
+        if (space_manager_ != nullptr) {
+            space_manager::ImageDirStats stats{};
+            if (space_manager_->GetStats(stats) == volumemanager::ErrorCode::SUCCESS) {
+                inv.staging_capacity_images = stats.capacity_images;
+                inv.staging_used_images = stats.used_images;
+                inv.staging_write_images = stats.write_images;
+                inv.staging_read_images = stats.read_images;
+            }
+        }
+        // 后台任务：按类型统计非终态读/写任务（刻录任务数已由 cd_manager 提供）。
+        if (task_map_ != nullptr) {
+            for (const WR_task::WRTask& task : task_map_->SnapshotAll()) {
+                if (task.isTaskTerminal()) {
+                    continue;
+                }
+                switch (task.type) {
+                    case WR_task::WRTaskType::READ:
+                    case WR_task::WRTaskType::CD_READ:
+                        ++inv.pending_read_tasks;
+                        break;
+                    case WR_task::WRTaskType::WRITE:
+                        ++inv.pending_write_tasks;
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+        inv.accumulated_write_bytes = accumulated_write_bytes_.load(std::memory_order_relaxed);
+        return inv;
+    }
 // #endregion
 
 // #region 2. 生命周期（启动 / 关机）
@@ -1118,7 +1164,7 @@ namespace optical_node_manager {
 
     // 把运行期内存态写入 log/runtime_state_snapshot：
     //   [RuntimeStateMetaHeader][kCounters][kAvailableIds][kTasks][kQueues]
-    //   [kArchiveQueue][kVolumeReadIndex][kPendingFiles][kImages][kDiscUsage]
+    //   [kArchiveQueue][kVolumeReadIndex][kPendingFiles][kImages][kDiscUsage][kWriteStats]
     // 不落盘的状态（重启后由任务 + 磁盘产物重放恢复）：
     //   pending_pack_inode_ids_（单步临时集合）、cd_manager 活跃任务与总光盘数。
     bool OpticalNodeManager::PersistRuntimeState() {
@@ -1305,6 +1351,13 @@ namespace optical_node_manager {
                 (cd_manager_ != nullptr) ? cd_manager_->UsedDiscCount() : 0;
             AppendU64(payload, used_disc_count);
             append_section(RuntimeStateSectionTag::kDiscUsage, payload);
+        }
+
+        // ⑩ 写入统计：累计写入字节（ZipTaskProcessor 压缩时累加）。
+        {
+            std::vector<uint8_t> payload;
+            AppendU64(payload, accumulated_write_bytes_.load(std::memory_order_relaxed));
+            append_section(RuntimeStateSectionTag::kWriteStats, payload);
         }
 
         RuntimeStateMetaHeader header;
@@ -1855,7 +1908,18 @@ namespace optical_node_manager {
             }
         }
 
-        // ⑪ ID 计数对齐与可用 ID 池去重。
+        // ⑪ 写入统计：恢复累计写入字节（段缺失 / 旧快照时保持当前值）。
+        if (auto it = find_section(RuntimeStateSectionTag::kWriteStats); it != sections.end()) {
+            uint64_t accumulated_write_bytes = 0;
+            if (!it->second.ReadU64(&accumulated_write_bytes)) {
+                last_sidecar_failure_reason_buf_ = FormatFailureDetail(
+                    start_failure_phase::kLoadRuntimeState, "write_stats_truncated");
+            } else {
+                accumulated_write_bytes_.store(accumulated_write_bytes, std::memory_order_relaxed);
+            }
+        }
+
+        // ⑫ ID 计数对齐与可用 ID 池去重。
         //    即使快照缺失也要做：计数器若从 1 重来，MoveFrom 的 rename 会覆盖 image/
         //    中的 volume_<id>.vimg（文件被替换），disc_<id>_meta / vdisc 同理。
         {
@@ -3045,8 +3109,13 @@ namespace optical_node_manager {
                     continue;
                 }
 
-                // 2. 压缩成功 → 删原始文件。
+                // 2. 压缩成功 → 累计写入字节（归档文件原始大小）→ 删原始文件。
                 const std::string original_file_path = input_file_dir_ + full_task->file_path;
+                struct stat original_stat {};
+                if (::stat(original_file_path.c_str(), &original_stat) == 0 && original_stat.st_size > 0) {
+                    accumulated_write_bytes_.fetch_add(static_cast<uint64_t>(original_stat.st_size),
+                                                       std::memory_order_relaxed);
+                }
                 ::unlink(original_file_path.c_str());
 
                 // 背压反馈：一次压缩完成意味着流水线前进一步（原始文件已消化、写镜像占用可能下降），

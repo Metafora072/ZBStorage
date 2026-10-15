@@ -105,6 +105,10 @@ public:
     // 归档引擎当前状态 + 最近一次失败原因，仅用于排障 / 日志。
     std::string GetArchiveStatusDetail() const;
 
+    // 采集一次光盘库库存快照（光驱忙闲 / 盘片 / 暂存区 / 后台任务），
+    // 转发给 OpticalNodeManager；供对外上报（心跳设备清单 / 光盘库状态）读取。
+    optical_node_manager::OpticalLibraryInventory GetLibraryInventory() const;
+
 private:
     // 准备任务 READY 后（后台线程回调）把 ReadReady 序列化并写入对应通知 Stream；
     // 会话已关闭或写入失败时仅记录，本阶段不重试。

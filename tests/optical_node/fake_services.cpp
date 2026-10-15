@@ -127,6 +127,22 @@ void FakeSchedulerService::RegisterManagedNode(google::protobuf::RpcController* 
     response->set_generation(1);
 }
 
+void FakeSchedulerService::ReportOpticalLibraryStatus(
+    google::protobuf::RpcController* controller,
+    const zb::rpc::ReportOpticalLibraryStatusRequest* request,
+    zb::rpc::ManagedNodeReply* response,
+    google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+    (void)controller;
+    (void)request;
+    ++optical_status_calls;
+    if (response == nullptr) {
+        return;
+    }
+    response->mutable_status()->set_code(zb::rpc::SCHED_OK);
+    response->set_generation(1);
+}
+
 LocalServer::LocalServer(google::protobuf::Service* service) {
     Require(server_.AddService(service, brpc::SERVER_DOESNT_OWN_SERVICE) == 0,
             "AddService 失败");

@@ -207,6 +207,13 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
                 }
                 return {};
             }
+        } else if (key == "SLOT_COUNT") {
+            if (!ParseUint64(value, &cfg.slot_count)) {
+                if (error) {
+                    *error = "Invalid SLOT_COUNT at line " + std::to_string(line_no);
+                }
+                return {};
+            }
         } else if (key == "DISC_BLOCK_SIZE_BYTES") {
             if (!ParseUint64(value, &cfg.disc_block_size_bytes)) {
                 if (error) {
@@ -439,6 +446,13 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
     }
     if (cfg.total_disc_count == 0) {
         cfg.total_disc_count = 1000;
+    }
+    // 槽位数须 >= 光盘数量，否则 local_disc_count > total_slots 会被服务端校验拒绝。
+    if (cfg.slot_count == 0) {
+        cfg.slot_count = 100000;
+    }
+    if (cfg.slot_count < cfg.total_disc_count) {
+        cfg.slot_count = cfg.total_disc_count;
     }
     if (cfg.disc_block_size_bytes == 0) {
         cfg.disc_block_size_bytes = 2048;

@@ -28,6 +28,18 @@ uint64_t NowMs() {
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
+// 心跳设备清单所需的静态量（从节点配置取），避免把整个 cfg 传入 reporter。
+// 库存快照只给「镜像个数 / 盘片数」等计数，这里提供换算成字节所需的单卷镜像大小与单盘容量。
+struct HeartbeatInventoryConfig {
+    uint64_t volume_size_bytes{0};           // 单卷镜像大小（换算 cache 容量）
+    uint64_t disc_capacity_bytes{0};         // 单盘容量
+    uint64_t capacity_in_images{0};          // image_dir 镜像数上限
+    uint64_t cache_read_bytes_per_sec{0};    // hdd-cache 读带宽
+    uint64_t cache_write_bytes_per_sec{0};   // hdd-cache 写带宽
+    uint64_t drive_read_bytes_per_sec{0};    // 单光驱读带宽
+    uint64_t drive_write_bytes_per_sec{0};   // 单光驱写带宽
+};
+
 // 一次性注册光盘库受管节点身份。启动阶段同步执行，带有限次重试；成功后进程内不再发送
 // 注册请求（重复发送也会被服务端 ALREADY_EXISTS 幂等吸收）。
 // 与心跳上报分离：注册只在生命周期入口执行一次，心跳是周期性运行态上报。
@@ -164,6 +176,7 @@ public:
                                uint32_t node_weight,
                                uint32_t virtual_node_count,
                                uint32_t interval_ms,
+                               HeartbeatInventoryConfig inventory_config,
                                zb::optical_node::OpticalStorageServiceImpl* service)
         : scheduler_addr_(std::move(scheduler_addr)),
           node_id_(std::move(node_id)),
@@ -175,6 +188,7 @@ public:
           node_weight_(node_weight == 0 ? 1 : node_weight),
           virtual_node_count_(virtual_node_count == 0 ? 1 : virtual_node_count),
           interval_ms_(interval_ms == 0 ? 2000 : interval_ms),
+          inventory_config_(inventory_config),
           service_(service) {}
 
     bool Start() {
@@ -214,6 +228,55 @@ private:
         return true;
     }
 
+    // 上报光盘库专属状态：盘片分类（blank/recording/recorded/defective）、暂存区、后台任务、忙光驱。
+    // 口径：local = 光盘数量；recording = cd_manager 正在执行的刻录任务数；recorded = 已用光盘数；
+    // defective 恒 0；blank = local − recording − recorded − defective；total_slots = 光盘架槽位数。
+    void ReportLibraryStatus(zb::rpc::SchedulerService_Stub& stub) {
+        const auto inv = service_->GetLibraryInventory();
+        const uint32_t disc_count =
+            static_cast<uint32_t>(std::min<uint64_t>(inv.disc_count, 0xFFFFFFFFull));
+        const uint32_t total_slots = static_cast<uint32_t>(
+            std::min<uint64_t>(std::max(inv.slot_count, inv.disc_count), 0xFFFFFFFFull));
+        const uint32_t recorded =
+            static_cast<uint32_t>(std::min<uint64_t>(inv.disc_used, disc_count));
+        const uint32_t recording =
+            static_cast<uint32_t>(std::min<uint64_t>(inv.disc_burning, disc_count - recorded));
+        const uint64_t staging_capacity =
+            inventory_config_.capacity_in_images * inventory_config_.volume_size_bytes;
+        const uint64_t staging_used =
+            std::min(inv.staging_used_images, inventory_config_.capacity_in_images) *
+            inventory_config_.volume_size_bytes;
+
+        zb::rpc::ReportOpticalLibraryStatusRequest request;
+        request.set_node_id(node_id_);
+        auto* status = request.mutable_status();
+        status->set_observed(true);
+        status->set_total_slots(total_slots);
+        status->set_local_disc_count(disc_count);
+        status->set_blank_disc_count(disc_count - recorded - recording);
+        status->set_recording_disc_count(recording);
+        status->set_recorded_disc_count(recorded);
+        status->set_defective_disc_count(0);
+        status->set_staging_capacity_bytes(staging_capacity);
+        status->set_staging_used_bytes(staging_used);
+        status->set_pending_write_tasks(
+            static_cast<uint32_t>(std::min<uint64_t>(inv.pending_write_tasks, 0xFFFFFFFFull)));
+        status->set_pending_read_tasks(
+            static_cast<uint32_t>(std::min<uint64_t>(inv.pending_read_tasks, 0xFFFFFFFFull)));
+        status->set_busy_drives(inv.drive_busy);
+        status->set_observed_at_ms(NowMs());
+
+        zb::rpc::ManagedNodeReply response;
+        brpc::Controller cntl;
+        stub.ReportOpticalLibraryStatus(&cntl, &request, &response, nullptr);
+        if (cntl.Failed()) {
+            std::cerr << "Scheduler optical library status failed: " << cntl.ErrorText() << std::endl;
+        } else if (response.status().code() != zb::rpc::SCHED_OK) {
+            std::cerr << "Scheduler optical library status rejected: "
+                      << response.status().message() << std::endl;
+        }
+    }
+
     void Run() {
         std::unique_ptr<brpc::Channel> channel;
         while (!stop_.load()) {
@@ -238,11 +301,48 @@ private:
             request.set_readiness_reported(true);
             request.set_initialization_complete(service_->IsArchiveEngineReady());
             request.set_metadata_ready(service_->IsArchiveEngineReady());
-            // The new archive engine does not yet export a device inventory or
-            // asynchronous task telemetry. Keep the node JOINING (empty disks),
-            // rather than publish fabricated empty inventory / idle measurements.
             request.set_readiness_message(
-                "archive engine running; awaiting optical inventory and task telemetry");
+                "archive engine running; library inventory attached");
+
+            // 设备清单：与 profile 三组对齐——hdd-cache ×1、disc ×1（盘片容量聚合）、
+            // optical-drive 逐光驱 drive_total 条。inventory 只参与容量/空闲/健康/带宽求和。
+            const auto inv = service_->GetLibraryInventory();
+            {
+                zb::rpc::DiskHeartbeat* cache = request.add_disks();
+                cache->set_disk_id("hdd-cache");
+                cache->set_device_kind(zb::rpc::MANAGED_DEVICE_HDD);
+                const uint64_t capacity_images = inventory_config_.capacity_in_images;
+                const uint64_t used_images = std::min(inv.staging_used_images, capacity_images);
+                cache->set_capacity_bytes(capacity_images * inventory_config_.volume_size_bytes);
+                cache->set_free_bytes(
+                    (capacity_images - used_images) * inventory_config_.volume_size_bytes);
+                cache->set_is_healthy(true);
+                cache->set_read_bandwidth_bytes_per_sec(inventory_config_.cache_read_bytes_per_sec);
+                cache->set_write_bandwidth_bytes_per_sec(inventory_config_.cache_write_bytes_per_sec);
+                // 累计写入字节挂在写入目标（image_dir 缓存）上；调度器按设备求和，位置不影响汇总。
+                cache->set_accumulated_write_bytes(inv.accumulated_write_bytes);
+            }
+            {
+                zb::rpc::DiskHeartbeat* disc = request.add_disks();
+                disc->set_disk_id("disc");
+                disc->set_device_kind(zb::rpc::MANAGED_DEVICE_DISC);
+                const uint64_t used_discs = std::min(inv.disc_used, inv.disc_count);
+                disc->set_capacity_bytes(inventory_config_.disc_capacity_bytes * inv.disc_count);
+                disc->set_free_bytes(
+                    inventory_config_.disc_capacity_bytes * (inv.disc_count - used_discs));
+                disc->set_is_healthy(true);
+                // 盘片介质本身无读写带宽（与 profile 的 disc 组一致）；带宽由光驱条目承载。
+            }
+            for (uint32_t i = 0; i < inv.drive_total; ++i) {
+                zb::rpc::DiskHeartbeat* drive = request.add_disks();
+                drive->set_disk_id("optical-drive-" + std::to_string(i));
+                drive->set_device_kind(zb::rpc::MANAGED_DEVICE_OPTICAL_DRIVE);
+                drive->set_capacity_bytes(0);
+                drive->set_free_bytes(0);
+                drive->set_is_healthy(true);
+                drive->set_read_bandwidth_bytes_per_sec(inventory_config_.drive_read_bytes_per_sec);
+                drive->set_write_bandwidth_bytes_per_sec(inventory_config_.drive_write_bytes_per_sec);
+            }
 
             zb::rpc::HeartbeatReply response;
             brpc::Controller cntl;
@@ -250,16 +350,20 @@ private:
             if (cntl.Failed()) {
                 std::cerr << "Scheduler heartbeat failed: " << cntl.ErrorText() << std::endl;
                 channel.reset();
-            } else if (response.status().code() == zb::rpc::SCHED_OK) {
-                bool is_primary = response.assigned_role() == zb::rpc::NODE_ROLE_PRIMARY;
-                configured_role_ = response.assigned_role();
-                service_->ApplySchedulerAssignment(is_primary,
-                                                   response.epoch(),
-                                                   response.group_id(),
-                                                   response.primary_node_id(),
-                                                   response.primary_address(),
-                                                   response.secondary_node_id(),
-                                                   response.secondary_address());
+            } else {
+                if (response.status().code() == zb::rpc::SCHED_OK) {
+                    bool is_primary = response.assigned_role() == zb::rpc::NODE_ROLE_PRIMARY;
+                    configured_role_ = response.assigned_role();
+                    service_->ApplySchedulerAssignment(is_primary,
+                                                       response.epoch(),
+                                                       response.group_id(),
+                                                       response.primary_node_id(),
+                                                       response.primary_address(),
+                                                       response.secondary_node_id(),
+                                                       response.secondary_address());
+                }
+                // 同一通道、同一节拍上报光盘库专属状态；失败只记日志，不影响心跳循环。
+                ReportLibraryStatus(stub);
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_));
@@ -276,6 +380,7 @@ private:
     uint32_t node_weight_{1};
     uint32_t virtual_node_count_{1};
     uint32_t interval_ms_{2000};
+    HeartbeatInventoryConfig inventory_config_;
     zb::optical_node::OpticalStorageServiceImpl* service_{};
     std::atomic<bool> stop_{false};
     std::thread thread_;
@@ -343,6 +448,19 @@ zb::rpc::RegisterManagedNodeRequest BuildRegisterRequest(const zb::optical_node:
     reliability->set_model(zb::rpc::ManagedReliabilityProfile::NORMAL_LIFETIME);
 
     return request;
+}
+
+// 从节点配置提取心跳设备清单所需的静态量。
+HeartbeatInventoryConfig BuildHeartbeatInventoryConfig(const zb::optical_node::OpticalNodeConfig& cfg) {
+    HeartbeatInventoryConfig out;
+    out.volume_size_bytes = cfg.volume_size_bytes;
+    out.disc_capacity_bytes = cfg.disc_capacity_bytes;
+    out.capacity_in_images = cfg.capacity_in_images;
+    out.cache_read_bytes_per_sec = cfg.cache_read_bytes_per_sec;
+    out.cache_write_bytes_per_sec = cfg.cache_write_bytes_per_sec;
+    out.drive_read_bytes_per_sec = cfg.drive_read_bytes_per_sec;
+    out.drive_write_bytes_per_sec = cfg.drive_write_bytes_per_sec;
+    return out;
 }
 
 zb::rpc::NodeRole ParseRole(const std::string& role) {
@@ -415,6 +533,7 @@ int main(int argc, char* argv[]) {
                                         cfg.node_weight,
                                         cfg.virtual_node_count,
                                         cfg.heartbeat_interval_ms,
+                                        BuildHeartbeatInventoryConfig(cfg),
                                         &storage_service);
     if (server.Start(FLAGS_port, &options) != 0) {
         std::cerr << "Failed to start brpc server on port " << FLAGS_port << std::endl;

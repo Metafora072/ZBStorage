@@ -104,7 +104,9 @@ struct CDManager::Impl {
           rng(std::random_device{}()),
           dist_row(0, static_cast<int>(kRackRows) - 1),
           dist_col(0, static_cast<int>(kRackCols) - 1),
-          dist_depth(0, static_cast<int>(kRackDepth) - 1) {}
+          dist_depth(0, static_cast<int>(kRackDepth) - 1) {
+        total_disc_count_ = std::max<uint64_t>(1, config.total_disc_count);
+    }
 
     CDManagerConfig config;
     mutable std::mutex mutex;
@@ -123,6 +125,11 @@ struct CDManager::Impl {
                         std::vector<BurnCompleteDeadline>,
                         std::greater<BurnCompleteDeadline>> burn_complete_heap;
     bool schedule_dirty = false;
+
+    // 库内总光盘数（构造时由 config 初始化，运行期不变）与已使用光盘数
+    // （每完成一张盘的刻录 +1；由上层写入快照并在重启时通过 SetUsedDiscCount 注入）。
+    uint64_t total_disc_count_ = 0;
+    uint64_t used_disc_count_ = 0;
 
     std::mt19937 rng;
     std::uniform_int_distribution<int> dist_row;
@@ -260,6 +267,24 @@ struct CDManager::Impl {
         return active_tasks.size();
     }
 
+    // 返回库内总光盘数（启动时初始化，运行期不变）。
+    uint64_t TotalDiscCount() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return total_disc_count_;
+    }
+
+    // 返回已使用光盘数（每完成一张盘的刻录 +1）。
+    uint64_t UsedDiscCount() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return used_disc_count_;
+    }
+
+    // 注入已使用光盘数，供上层在重启时用快照值回填。
+    void SetUsedDiscCount(uint64_t count) {
+        std::lock_guard<std::mutex> lock(mutex);
+        used_disc_count_ = count;
+    }
+
     // 后台线程维护一个预测调度：
     // 它会等待下一次"读/刻录完成回调"或"卸盘完成释放"时刻到达，再推进状态。
     void WorkerLoop() {
@@ -378,6 +403,11 @@ struct CDManager::Impl {
         }
 
         it->second.complete_notified = true;
+
+        // 一张盘刻录完成即视为占用一张盘片，累计已使用光盘数。
+        // complete_notified 保证同一任务只递增一次；未完成的刻录在重启后重刻时再计数，
+        // 因此与快照注入的历史计数不会重复。
+        ++used_disc_count_;
 
         BurnCompleteEvent event;
         event.task_id = it->second.burn_request.task_id;
@@ -772,6 +802,21 @@ bool CDManager::HasActiveTask(uint64_t task_id) const {
 // 返回当前处于内部模拟生命周期中的任务总数。
 std::size_t CDManager::ActiveTaskCount() const {
     return impl_->ActiveTaskCount();
+}
+
+// 返回库内总光盘数。
+uint64_t CDManager::TotalDiscCount() const {
+    return impl_->TotalDiscCount();
+}
+
+// 返回已使用光盘数。
+uint64_t CDManager::UsedDiscCount() const {
+    return impl_->UsedDiscCount();
+}
+
+// 注入已使用光盘数（重启恢复用）。
+void CDManager::SetUsedDiscCount(uint64_t count) {
+    impl_->SetUsedDiscCount(count);
 }
 
 }  // namespace cd_manager_sim

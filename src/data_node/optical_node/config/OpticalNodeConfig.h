@@ -42,6 +42,9 @@ struct OpticalNodeConfig {
     // 标准镜像数为基线口径，实际单张光盘按容量可能容纳更多镜像。
     uint64_t disc_capacity_bytes{1099511627776ULL};
     uint32_t standard_images_per_disc{100};
+    // 库内总光盘数（盘片槽位容量上限，对应 Scheduler 的 total_slots）。
+    // 启动时初始化，运行期不变；0 或非法值按 1000 生效。
+    uint64_t total_disc_count{1000};
     // 光盘数据块大小（字节）：超级块、元数据区与每个 vimg 均按此对齐。
     uint64_t disc_block_size_bytes{2048};
 

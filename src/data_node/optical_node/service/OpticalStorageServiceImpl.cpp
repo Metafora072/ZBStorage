@@ -40,6 +40,7 @@ OpticalStorageServiceImpl::OpticalStorageServiceImpl(const OpticalNodeConfig& co
                             config.disc_capacity_bytes,
                             config.standard_images_per_disc,
                             config.disc_block_size_bytes,
+                            config.total_disc_count,
                             config.max_write_images,
                             config.scheduler_addr) {
     // 在 Run() 拉起后台线程之前注册完成回调：任何准备任务 READY 都能通知到客户端。

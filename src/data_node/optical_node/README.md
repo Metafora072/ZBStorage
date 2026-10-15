@@ -107,6 +107,7 @@ Values are also clamped to safe defaults when zero/invalid (see `OpticalNodeConf
 | `AVAILABLE_ID_COUNT` | `5` | capacity of the `volume_id` / `disk_id` pools (shared) |
 | `DISC_CAPACITY_BYTES` | `1099511627776` | max size of one optical disc (bytes, 1 TiB) |
 | `STANDARD_IMAGES_PER_DISC` | `100` | baseline number of images per disc (actual disc may hold more, bounded by capacity) |
+| `TOTAL_DISC_COUNT` | `1000` | total disc slots in the library; startup-only, reported as optical capacity |
 | `DISC_BLOCK_SIZE_BYTES` | `2048` | disc block size; superblock, metadata area and every image are aligned to it |
 | `MAX_WRITE_IMAGES` | `128` | max concurrent WRITE images; download back-pressure threshold |
 

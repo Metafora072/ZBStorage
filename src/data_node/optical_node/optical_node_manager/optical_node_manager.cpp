@@ -478,6 +478,7 @@ namespace optical_node_manager {
                                            uint64_t disc_capacity_bytes,
                                            uint32_t standard_images_per_disc,
                                            uint64_t disc_block_size_bytes,
+                                           uint64_t total_disc_count,
                                            uint32_t max_write_images,
                                            const std::string& scheduler_addr)
         : volume_manager_(volume_size, size_threshold),
@@ -495,6 +496,7 @@ namespace optical_node_manager {
         disc_capacity_bytes_ = disc_capacity_bytes;
         standard_images_per_disc_ = standard_images_per_disc;
         disc_block_size_bytes_ = disc_block_size_bytes;
+        total_disc_count_ = total_disc_count;
         max_write_images_ = max_write_images < 1 ? 1 : max_write_images;
     }
 
@@ -929,6 +931,8 @@ namespace optical_node_manager {
 
         cd_manager_sim::CDManagerConfig config{};
         config.workspace_root = disc_sim_dir_;
+        // 库内总光盘数由启动配置注入 cd_manager（运行期不变；已使用数走快照恢复）。
+        config.total_disc_count = total_disc_count_;
         try {
             cd_manager_ = std::make_unique<cd_manager_sim::CDManager>(config);
         } catch (const std::exception& e) {
@@ -1116,9 +1120,9 @@ namespace optical_node_manager {
 
     // 把运行期内存态写入 log/runtime_state_snapshot：
     //   [RuntimeStateMetaHeader][kCounters][kAvailableIds][kTasks][kQueues]
-    //   [kArchiveQueue][kVolumeReadIndex][kPendingFiles][kImages]
+    //   [kArchiveQueue][kVolumeReadIndex][kPendingFiles][kImages][kDiscUsage]
     // 不落盘的状态（重启后由任务 + 磁盘产物重放恢复）：
-    //   pending_pack_inode_ids_（单步临时集合）、cd_manager 活跃任务。
+    //   pending_pack_inode_ids_（单步临时集合）、cd_manager 活跃任务与总光盘数。
     bool OpticalNodeManager::PersistRuntimeState() {
         if (log_dir_.empty()) {
             last_sidecar_failure_reason_buf_ = FormatFailureDetail(
@@ -1293,6 +1297,16 @@ namespace optical_node_manager {
                 AppendU32(payload, static_cast<uint32_t>(image.category));
             }
             append_section(RuntimeStateSectionTag::kImages, payload);
+        }
+
+        // ⑨ 光盘使用计数：只落已使用光盘数（每完成一张盘刻录 +1）。
+        //    总光盘数由启动配置决定、运行期不变，不落盘。
+        {
+            std::vector<uint8_t> payload;
+            const uint64_t used_disc_count =
+                (cd_manager_ != nullptr) ? cd_manager_->UsedDiscCount() : 0;
+            AppendU64(payload, used_disc_count);
+            append_section(RuntimeStateSectionTag::kDiscUsage, payload);
         }
 
         RuntimeStateMetaHeader header;
@@ -1831,7 +1845,19 @@ namespace optical_node_manager {
             }
         }
 
-        // ⑩ ID 计数对齐与可用 ID 池去重。
+        // ⑩ 光盘使用计数：把快照里的已使用光盘数注入 cd_manager。
+        //    总光盘数由启动配置决定、不落盘；段缺失（旧快照 / 首次启动）时保持 0。
+        if (auto it = find_section(RuntimeStateSectionTag::kDiscUsage); it != sections.end()) {
+            uint64_t used_disc_count = 0;
+            if (!it->second.ReadU64(&used_disc_count)) {
+                last_sidecar_failure_reason_buf_ = FormatFailureDetail(
+                    start_failure_phase::kLoadRuntimeState, "disc_usage_truncated");
+            } else if (cd_manager_ != nullptr) {
+                cd_manager_->SetUsedDiscCount(used_disc_count);
+            }
+        }
+
+        // ⑪ ID 计数对齐与可用 ID 池去重。
         //    即使快照缺失也要做：计数器若从 1 重来，MoveFrom 的 rename 会覆盖 image/
         //    中的 volume_<id>.vimg（文件被替换），disc_<id>_meta / vdisc 同理。
         {

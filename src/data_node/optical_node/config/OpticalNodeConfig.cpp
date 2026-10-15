@@ -200,6 +200,13 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
                 }
                 return {};
             }
+        } else if (key == "TOTAL_DISC_COUNT") {
+            if (!ParseUint64(value, &cfg.total_disc_count)) {
+                if (error) {
+                    *error = "Invalid TOTAL_DISC_COUNT at line " + std::to_string(line_no);
+                }
+                return {};
+            }
         } else if (key == "DISC_BLOCK_SIZE_BYTES") {
             if (!ParseUint64(value, &cfg.disc_block_size_bytes)) {
                 if (error) {
@@ -249,6 +256,9 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
     }
     if (cfg.standard_images_per_disc == 0) {
         cfg.standard_images_per_disc = 100;
+    }
+    if (cfg.total_disc_count == 0) {
+        cfg.total_disc_count = 1000;
     }
     if (cfg.disc_block_size_bytes == 0) {
         cfg.disc_block_size_bytes = 2048;

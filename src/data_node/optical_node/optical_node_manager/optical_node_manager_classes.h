@@ -1516,6 +1516,7 @@ enum class RuntimeStateSectionTag : uint32_t {
     kVolumeReadIndex = 6,  // volume_read_index_（volume_id → task_id 集合）
     kPendingFiles = 7,     // volume_manager_ 的 pending_files_ / pending_size_
     kImages = 8,           // space_manager_ 管理表全量快照（volume_id + category，按 LRU 由旧到新）
+    kDiscUsage = 9,        // cd_manager 的已使用光盘数（总光盘数由启动配置决定，不落盘）
 };
 
 /**

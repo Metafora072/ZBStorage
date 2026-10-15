@@ -104,7 +104,11 @@ void FakeSchedulerService::ReportHeartbeat(google::protobuf::RpcController* cont
                                            google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)controller;
-    (void)request;
+    ++heartbeat_calls;
+    if (request != nullptr) {
+        std::lock_guard<std::mutex> lock(capture_mu_);
+        last_heartbeat_ = *request;
+    }
     if (response == nullptr) {
         return;
     }
@@ -118,13 +122,21 @@ void FakeSchedulerService::RegisterManagedNode(google::protobuf::RpcController* 
                                                google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)controller;
-    (void)request;
     ++register_calls;
+    if (request != nullptr) {
+        std::lock_guard<std::mutex> lock(capture_mu_);
+        last_register_ = *request;
+    }
     if (response == nullptr) {
         return;
     }
     response->mutable_status()->set_code(zb::rpc::SCHED_OK);
     response->set_generation(1);
+    // 回显客户端提交的 spec：让节点侧的 profile 一致性校验走“一致”分支（避免告警噪声），
+    // 也便于测试从 reply 侧交叉核对注册内容。
+    if (request != nullptr) {
+        response->mutable_node()->mutable_spec()->CopyFrom(request->spec());
+    }
 }
 
 void FakeSchedulerService::ReportOpticalLibraryStatus(
@@ -134,8 +146,11 @@ void FakeSchedulerService::ReportOpticalLibraryStatus(
     google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)controller;
-    (void)request;
     ++optical_status_calls;
+    if (request != nullptr) {
+        std::lock_guard<std::mutex> lock(capture_mu_);
+        last_library_status_ = *request;
+    }
     if (response == nullptr) {
         return;
     }
@@ -156,6 +171,21 @@ void FakeSchedulerService::ReportNodeMetrics(google::protobuf::RpcController* co
     }
     response->mutable_status()->set_code(zb::rpc::SCHED_OK);
     response->set_generation(1);
+}
+
+zb::rpc::RegisterManagedNodeRequest FakeSchedulerService::RegisterSnapshot() const {
+    std::lock_guard<std::mutex> lock(capture_mu_);
+    return last_register_;
+}
+
+zb::rpc::HeartbeatRequest FakeSchedulerService::HeartbeatSnapshot() const {
+    std::lock_guard<std::mutex> lock(capture_mu_);
+    return last_heartbeat_;
+}
+
+zb::rpc::ReportOpticalLibraryStatusRequest FakeSchedulerService::LibraryStatusSnapshot() const {
+    std::lock_guard<std::mutex> lock(capture_mu_);
+    return last_library_status_;
 }
 
 LocalServer::LocalServer(google::protobuf::Service* service) {

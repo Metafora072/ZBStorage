@@ -1299,6 +1299,8 @@ if(BUILD_TESTING)
     if(BRPC_DYNAMIC_LIB)
         target_link_libraries(optical_node_archive_integration_test PRIVATE ${BRPC_DYNAMIC_LIB})
     endif()
+    # 综合用例内含「节点上报」测试点：会 fork/exec 真 optical_node_server 子进程，故建立构建依赖。
+    add_dependencies(optical_node_archive_integration_test optical_node_server)
 
     add_executable(optical_node_runtime_state_codec_test
         tests/optical_node/optical_node_runtime_state_codec_test.cpp
@@ -1316,7 +1318,8 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         add_test(NAME optical_node
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/optical_node/run_optical_node_archive_test.py
-                --driver $<TARGET_FILE:optical_node_archive_integration_test>)
+                --driver $<TARGET_FILE:optical_node_archive_integration_test>
+                --server-bin $<TARGET_FILE:optical_node_server>)
         set_tests_properties(optical_node PROPERTIES TIMEOUT 3600 LABELS "optical_node;slow" SKIP_RETURN_CODE 77)
     endif()
 endif()

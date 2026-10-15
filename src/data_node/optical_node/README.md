@@ -55,7 +55,8 @@ volume images, packs those images onto optical discs, burns the discs, and serve
 - `volume_id` (MDS `image_id`) and `disk_id` (MDS `disc_id`) are generated locally as increasing
   counters, because MDS `AllocateAvailableImageId` / `AllocateAvailableDiscId` are not implemented.
 - Runtime state **is** persistent: `OpticalNodeManager::Shutdown()` (called by `optical_node_server`
-  after `RunUntilAskedToQuit()`, i.e. on SIGINT/SIGTERM) stops the workers and atomically writes
+  after `RunUntilAskedToQuit()`, i.e. on SIGINT — brpc's default graceful-quit signal; SIGTERM only
+  quits gracefully when `--graceful_quit_on_sigterm=true` is set) stops the workers and atomically writes
   `log/runtime_state_snapshot` (task table, the three task queues, ID counters and available-ID pools,
   archive queue + download breakpoint, volume-read index, pending-file set, image management table).
   The next `Run()` reads it back — combining the image table with the real `image/` contents — then
@@ -188,5 +189,8 @@ START_OPTICAL=true scripts/start_demo_stack.sh
 clients as one ctest case (`optical_node`): archive batch shapes → download back pressure → pack →
 seal → burn → data-plane read over the 6 read RPCs (subscribe / prepare / ReadReady push / acquire /
 range read / two-level release) with CD read-back and cache hits → read-session & reference lifecycle
-→ LRU eviction → graceful shutdown and restart recovery. The corpus is synthesized in-process (no
-external jpg). See `tests/optical_node/README.md`.
+→ LRU eviction → graceful shutdown and restart recovery → scheduler reporting (test point `C1`:
+`fork/exec` a real `optical_node_server` subprocess against the same fake scheduler to cover the
+one-shot `RegisterManagedNode`, the periodic `ReportHeartbeat` with device inventory, and
+`ReportOpticalLibraryStatus`). The corpus is synthesized in-process (no external jpg).
+See `tests/optical_node/README.md`.

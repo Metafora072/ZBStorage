@@ -10,7 +10,9 @@
 #include <scheduler.pb.h>
 
 #include <atomic>
+#include <mutex>
 #include <string>
+#include <vector>
 
 namespace zb::optical_node::test {
 
@@ -38,13 +40,16 @@ private:
     const Corpus* corpus_{nullptr};
 };
 
-// 假 scheduler：GetClusterView 返回单个 NODE_REAL 节点，地址指向假 real_node。
+// 假 scheduler：GetClusterView 返回单个 NODE_REAL 节点，地址指向假 real_node；
+// 同时接收光盘节点的注册/心跳/光盘库状态/数据面指标上报，记录调用次数与最近一次请求，
+// 供测试对上报内容做断言。
 class FakeSchedulerService : public zb::rpc::SchedulerService {
 public:
     std::string node_id{"real-1"};
     std::string node_address;
 
     std::atomic<int> get_cluster_view_calls{0};
+    std::atomic<int> heartbeat_calls{0};
     std::atomic<int> register_calls{0};
     std::atomic<int> optical_status_calls{0};
     std::atomic<int> node_metrics_calls{0};
@@ -73,6 +78,17 @@ public:
                            const zb::rpc::ReportNodeMetricsRequest* request,
                            zb::rpc::ManagedNodeReply* response,
                            google::protobuf::Closure* done) override;
+
+    // 最近一次上报内容的快照（按值返回，与 RPC 线程隔离）；未收到过时返回默认构造对象。
+    zb::rpc::RegisterManagedNodeRequest RegisterSnapshot() const;
+    zb::rpc::HeartbeatRequest HeartbeatSnapshot() const;
+    zb::rpc::ReportOpticalLibraryStatusRequest LibraryStatusSnapshot() const;
+
+private:
+    mutable std::mutex capture_mu_;
+    zb::rpc::RegisterManagedNodeRequest last_register_;
+    zb::rpc::HeartbeatRequest last_heartbeat_;
+    zb::rpc::ReportOpticalLibraryStatusRequest last_library_status_;
 };
 
 // loopback 临时端口上的 brpc server；端口取 0 由内核分配，避免端口冲突。

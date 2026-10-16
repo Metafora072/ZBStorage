@@ -1,6 +1,10 @@
 # Scheduler 进程内仿真：当前实现边界
 
-本目录落实仓库根目录的 [Scheduler 开发设计与实施方案](../../../Scheduler开发设计与实施方案.md)。多个逻辑磁盘实例共用一个 Scheduler 进程的数据入口，继续使用 `RealNodeService` 的 13 个方法；光盘读取模型通过同一数据端口的正式 `OpticalNodeService` 四个 RPC 暴露。每个请求通过 BRPC attachment 指定逻辑节点和代际，包括请求体为空的 `GetDiskReport`；缺失、错误、过期目标会被拒绝。FUSE 客户端当前的磁盘前台调用已设置该 attachment。旧真实磁盘服务忽略它。
+本目录落实仓库根目录的 [Scheduler 开发设计与实施方案](../../../Scheduler开发设计与实施方案.md)。多个逻辑磁盘实例共用一个 Scheduler 进程的数据入口，复用 `RealNodeService` 的数据方法；光盘模型在同一数据端口提供 `OpticalNodeService` 的归档下发、六个准备/读会话接口和三个旧读接口。每个请求通过 BRPC attachment 指定逻辑节点和代际，包括请求体为空的 `GetDiskReport`；缺失、错误、过期目标会被拒绝。FUSE 的磁盘和新光盘前台调用均传递该 attachment；真实节点兼容忽略。
+
+正式光盘读链路也支持 `SubscribeReadEvents → PrepareRead → ReadReadyEvent → AcquireReadSession → ReadPreparedFile → ReleaseReadSession`，并保留上述旧读接口。共享入口用节点身份限定通知会话、本地任务和读句柄；客户端将 MDS 返回的节点 ID/实例代际交给同一套正式光盘调用代码。每次打开产生独立读句柄，EOF 不释放会话；`ReleasePreparedRead` 禁止新打开，已有句柄继续有效，最后一个引用释放后回收任务。
+
+新协议使用单个共享推进线程发送就绪事件，不为每节点/任务创建线程；会话、准备任务和读句柄都有预算上限。就绪且无读取引用的准备结果按 `TASK_RETENTION_MS` 自动回收；活跃引用保护任务不被旧协议末片/超时规则提前释放。通知流和读句柄不持久化，流断开时清理所属引用，重启后客户端须重新订阅与准备；文件、盘片和归档控制状态仍按原规则恢复。活跃读会话进入节点管理快照，参与忙碌与休眠判断。
 
 ## 配置
 
@@ -92,17 +96,17 @@ Scheduler 在本进程内初始化各实例，向既有节点管理器直接上�
 
 排空控制器支持有数据的模型磁盘源：退役 RPC 先关闭新写入准入、等待服务层在途写 RPC，并在同一排他区间进入 `Draining`；后台枚举持久模型对象，选择另一个有空间的模型节点，导入相同对象 ID/长度与文件版本，在 MDS 对 inode 版本和源位置做条件切换后删除源副本。最后必须再次确认本地为空、CMS 文件引用为零，才标记 `Retired`。生成式读数据不被当成真实字节复制；源对象若没有完整、可追溯的模型元数据则排空失败关闭，不能误删。跨 Scheduler 进程的模型迁移、预加载种子对象的保真迁移，以及物理光盘实际刻录均不在这一闭环内。
 
-## 已覆盖的回归
+## 系统集成验证
 
-`scheduler_inprocess_disk_test` 使用真正的本机 BRPC 端口验证双实例共享入口、相同局部对象/设备 ID 隔离、空请求路由、旧代际拒绝、管理禁用、覆盖写容量、空间不足、EOF 及有界共享 IO；还验证销毁并重建实例后的对象/容量/文件版本/txid 恢复、文件与对象删除、配置漂移和旧控制目录拒绝。`scheduler_inprocess_disk_server_restart_test` 启动真实 Scheduler 和 MDS，验证 CMS 不可达时的服务门禁、CMS 确认后的数据 RPC、写对象及提交文件后 `SIGKILL`、管理快照与模型控制目录重开、重启后重新确认 CMS 才可读、剩余容量正确，以及同一 txid 重试不会增加文件版本。`scheduler_inprocess_optical_test` 验证正式光盘 RPC 路由、双实例局部任务 ID 隔离、受理与就绪区分、读回/EOF、缓存命中和任务预算。`scheduler_model_closure_integration_test` 启动真实 Scheduler、MDS 和数据入口，验证非默认实例代际、模型磁盘间迁移与退役、源租约、模型光盘写入/MDS 提交及光盘读回。运行：
+`scheduler_inprocess_disk_server_restart_test` 启动真实 Scheduler 和 MDS，验证 CMS 不可达时的服务门禁、CMS 确认后的数据 RPC、写对象及提交文件后 `SIGKILL`、管理快照与模型控制目录重开、重启后重新确认 CMS 才可读、剩余容量正确，以及同一 txid 重试不会增加文件版本。
 
-本轮新增同一 txid 但提交大小/期望版本不一致的本地及异常重启后拒绝断言。
+`scheduler_model_closure_integration_test` 启动真实 Scheduler、MDS 和数据入口，验证非默认实例代际、模型磁盘间迁移与退役、源租约、模型光盘写入/MDS 提交及光盘读回。完成归档后重启 Scheduler 与 MDS，验证 CMS 重新确认、MDS 完整位置恢复；有 FUSE 设备时实际挂载正式客户端，通过 `zbctl stage submit/wait` 准备恢复后的光盘模型文件并进行 POSIX 读取。
 
-后续边界回归又增加了 4096/4097 分片、对象序号上界、`uint64` 末端偏移和超大文件对象数拒绝断言。
+上述模型数据为生成式数据，不等同于实体光盘 IO 或真实外存字节保真测试；尚未注入刻录中途的双进程崩溃或真实物理光盘故障。真实数据链路见 [Scheduler 系统测试](../../../tests/scheduler/README.md)。
 
-光盘组件回归现也覆盖 RocksDB 控制目录重开：文件/盘片占用、未完成读任务、已释放任务重试与任务号单调性；还检查配置几何漂移拒绝、旧版本禁止删除、删除后盘片槽位复用、管理库存与读指标。内部归档测试覆盖幂等清单、暂存背压、盘片预留、读缓存淘汰、读/刻录共享光驱、阶段重建、刻录后原子库存/outbox、错误租约拒绝、MDS 确认前禁止清理、确认/失败墓碑重启。全链路测试在完成模型归档后重启 Scheduler 与 MDS，验证 CMS 重新确认、MDS 完整位置恢复及光盘模型读回；有 FUSE 设备时还实际挂载客户端，从恢复后的 MDS/光盘模型读取文件。尚未注入刻录中途的双进程崩溃或真实物理光盘故障。
+单元/组件测试不作为交付内容。保留的 C++ probe 是独立服务进程集成测试的 RPC 驱动。
 
 ```text
-cmake --build build --target scheduler_node_model_test scheduler_snapshot_test scheduler_inprocess_disk_test scheduler_inprocess_disk_route_probe scheduler_inprocess_optical_test scheduler_model_closure_probe scheduler_server mds_server zb_fuse_client
-ctest --test-dir build -R '^scheduler_(node_model_test|snapshot_test|inprocess_(disk|optical).*test|model_closure_integration_test)$' --output-on-failure
+cmake --build build --target scheduler_inprocess_disk_route_probe scheduler_model_closure_probe scheduler_server mds_server zb_fuse_client zbctl
+ctest --test-dir build -R '^scheduler_(inprocess_disk_server_restart_test|model_closure_integration_test)$' --output-on-failure
 ```

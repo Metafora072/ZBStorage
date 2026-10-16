@@ -1958,7 +1958,8 @@ optical::FileInfo ResolveOpticalPrepare(FuseState* state, const std::string& pat
     UpdateInodeAttrCache(state, attr.inode_id(), location.attr());
     UpdateInodeAnchorCache(state, attr.inode_id(), anchor);
     return {anchor.node_address(), attr.inode_id(), anchor.disk_id(), anchor.image_id(),
-            location.attr().size(), OpticalVersion(location.attr())};
+            location.attr().size(), OpticalVersion(location.attr()), anchor.node_id(),
+            anchor.instance_generation() == 0 ? 1 : anchor.instance_generation()};
 }
 
 int OpenRequest(FuseState* state, const char* path, struct fuse_file_info* fi) {

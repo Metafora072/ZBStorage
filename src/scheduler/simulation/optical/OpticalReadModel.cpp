@@ -380,6 +380,7 @@ OpticalModelResult OpticalReadModel::RemoveFile(uint64_t inode_id, uint64_t vers
 void OpticalReadModel::PruneLocked(Clock::time_point now) {
     const auto retention = std::chrono::milliseconds(config_.retry_retention_ms);
     for (auto it = tasks_.begin(); it != tasks_.end();) {
+        if (it->second.retained) { ++it; continue; }
         const bool expired = it->second.released
             ? now - it->second.released_at > retention
             : now - it->second.ready_at > retention;
@@ -401,7 +402,8 @@ void OpticalReadModel::PruneLocked(Clock::time_point now) {
 
 OpticalModelResult OpticalReadModel::RequestRead(uint64_t inode_id,
                                                  const std::string& disc_id,
-                                                 const std::string& image_id) {
+                                                 const std::string& image_id, bool retained,
+                                                 const OpticalPreparedInfo* expected) {
     if (inode_id == 0 || disc_id.empty() || image_id.empty())
         return {OpticalModelCode::kInvalid, "missing optical read location"};
     std::lock_guard<std::mutex> lock(mu_);
@@ -411,6 +413,9 @@ OpticalModelResult OpticalReadModel::RequestRead(uint64_t inode_id,
     if (file == files_.end() || file->second.disc_id != disc_id ||
         file->second.image_id != image_id)
         return {OpticalModelCode::kNotFound, "file or optical location not found"};
+    if (expected && (expected->size != file->second.size ||
+        (expected->version != 0 && expected->version != file->second.version)))
+        return {OpticalModelCode::kInvalid, "optical file size or version mismatch"};
     if (tasks_.size() >= config_.max_read_tasks ||
         next_task_id_ == 0 || next_task_id_ == std::numeric_limits<uint64_t>::max())
         return {OpticalModelCode::kBusy, "optical read task queue full"};
@@ -466,7 +471,7 @@ OpticalModelResult OpticalReadModel::RequestRead(uint64_t inode_id,
     }
     ++next_task_id_;
     tasks_.emplace(id, Task{inode_id, file->second.version, file->second.size,
-                            remaining_us, 0, ready, {}, false, cache_hit});
+                            remaining_us, 0, ready, {}, false, cache_hit, retained});
     latest_task_[inode_id] = id;
     return {OpticalModelCode::kOk, {}, id, {}, cache_hit,
             remaining_us};
@@ -500,13 +505,13 @@ OpticalModelResult OpticalReadModel::ReadTaskLocked(uint64_t task_id, uint64_t o
     Task& task = it->second;
     const auto retention = std::chrono::milliseconds(config_.retry_retention_ms);
     if ((task.released && now - task.released_at > retention) ||
-        (!task.released && now - task.ready_at > retention))
+        (!task.released && !task.retained && now - task.ready_at > retention))
         return {OpticalModelCode::kNotFound, "optical task expired"};
     if (now < task.ready_at) return {OpticalModelCode::kNotReady, "MODEL_NOT_READY", task_id};
     if (size > 4ULL * 1024 * 1024)
         return {OpticalModelCode::kInvalid, "optical read chunk exceeds 4 MiB"};
     const uint64_t count = offset >= task.size ? 0 : std::min(size, task.size - offset);
-    const bool release = offset >= task.size || count == task.size - offset;
+    const bool release = !task.retained && (offset >= task.size || count == task.size - offset);
     if (release && !task.released && state_store_) {
         std::string error;
         const uint64_t release_epoch_ms = EpochMilliseconds();
@@ -536,6 +541,32 @@ OpticalModelResult OpticalReadModel::ReadTask(uint64_t task_id, uint64_t offset,
     const auto now = Clock::now();
     PruneLocked(now);
     return ReadTaskLocked(task_id, offset, size, now);
+}
+
+OpticalModelResult OpticalReadModel::InspectPrepared(uint64_t task_id, OpticalPreparedInfo* output) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = tasks_.find(task_id);
+    if (!output || it == tasks_.end() || !it->second.retained)
+        return {OpticalModelCode::kNotFound, "prepared task not found"};
+    const auto& task = it->second;
+    *output = {task.inode_id, task.version, task.size, Clock::now() >= task.ready_at};
+    if (output->ready) CacheReadyLocked(task.inode_id, task);
+    return {};
+}
+
+OpticalModelResult OpticalReadModel::ReleasePrepared(uint64_t task_id) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = tasks_.find(task_id);
+    if (it == tasks_.end()) return {OpticalModelCode::kNotFound, "prepared task not found"};
+    if (state_store_) {
+        std::string error;
+        if (!state_store_->DeleteTask(task_id, &error))
+            return {OpticalModelCode::kIoError, "cannot release prepared task: " + error};
+    }
+    if (latest_task_.count(it->second.inode_id) && latest_task_[it->second.inode_id] == task_id)
+        latest_task_.erase(it->second.inode_id);
+    tasks_.erase(it);
+    return {};
 }
 
 OpticalModelResult OpticalReadModel::ReadLatest(uint64_t inode_id, uint64_t offset,

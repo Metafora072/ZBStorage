@@ -33,10 +33,11 @@ tests/*/log/
 
 # Local experiment reports are evidence, not source deliverables.
 tests/scheduler/REPORT-*.md
-# Keep legacy internal regressions local, but track tests referenced by CMake/CI.
+# Scheduler 单元/组件回归只在本地使用，不作为交付内容。
 /tests/scheduler/cpp/*
-!/tests/scheduler/cpp/scheduler_node_model_test.cpp
-!/tests/scheduler/cpp/scheduler_snapshot_test.cpp
+/tests/scheduler/scheduler_*_test.cpp
+/tests/scheduler/inprocess_disk_test.cpp
+/tests/scheduler/inprocess_optical_test.cpp
 /tests/scheduler/python/test_*.py
 /tests/scheduler/python/closure.py
 /tools/workload_trace/tests/

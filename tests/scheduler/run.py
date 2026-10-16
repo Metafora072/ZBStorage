@@ -13,6 +13,68 @@ from python.workloads import run_batch
 WORKLOADS = ("sequential_write", "sequential_read", "random_rw", "typical_trace")
 
 
+def check_optical_admission(cluster, output):
+    """手动验证 Scheduler 准入；实体光盘库存实现只观察，不作为测试前提。"""
+    rpc, cms = Rpc(cluster.scheduler, "SchedulerService"), Rpc(cluster.mds, "MdsService")
+    probe_id, node_id = "t03-optical-unready", "t03-optical"
+    try:
+        # 独立身份验证负向门禁，不能把已经具备上报能力的真实进程当作未就绪夹具。
+        rpc.call("RegisterManagedNode", spec={
+            "node_id": probe_id, "kind": "MANAGED_KIND_OPTICAL_LIBRARY",
+            "execution_mode": "MANAGED_EXECUTION_PHYSICAL",
+            "participates_in_placement": False, "participates_in_placement_set": True})
+        device = {"disk_id": "disc", "device_kind": "MANAGED_DEVICE_DISC",
+                  "capacity_bytes": 4096, "free_bytes": 4096, "is_healthy": True}
+        blocked = {}
+        for label, initialized, metadata, disks in (
+                ("no_inventory", True, True, []),
+                ("not_initialized", False, True, [device]),
+                ("metadata_not_ready", True, False, [device])):
+            rpc.call("ReportHeartbeat", node_id=probe_id, node_type="NODE_OPTICAL",
+                     address=cluster.optical_address, report_ts_ms=time.time_ns() // 1_000_000,
+                     readiness_reported=True, initialization_complete=initialized,
+                     metadata_ready=metadata, disks=disks)
+            node = rpc.call("GetManagedNode", node_id=probe_id)["node"]
+            if node["lifecycle"] != "MANAGED_LIFECYCLE_JOINING":
+                raise ValueError(f"unready optical node admitted ({label}): {node}")
+            blocked[label] = node
+
+        def committed_probe():
+            views = {entry["managed_view"]["spec"]["node_id"]: entry["managed_view"]
+                     for entry in cms.call("GetCmsNodeCatalog").get("nodes", [])}
+            probe = views.get(probe_id)
+            if not probe:
+                return None
+            if probe["lifecycle"] != "MANAGED_LIFECYCLE_JOINING":
+                raise ValueError("CMS admitted the unready optical probe")
+            current = probe.get("readiness", {})
+            expected = blocked["metadata_not_ready"]["readiness"]
+            if not current.get("observed") or any(
+                    current.get(key, False) != expected.get(key, False) for key in
+                    ("initialization_complete", "inventory_ready", "metadata_ready")) or (
+                    int(current.get("observed_at_ms", 0)) < int(expected.get("observed_at_ms", 0))):
+                return None  # 等待本轮 Scheduler 结果提交到 CMS，不能读旧目录作成功依据。
+            return probe
+
+        catalog = wait_for(committed_probe)
+        actual = next((node for node in list_nodes(rpc) if node["spec"]["node_id"] == node_id), None)
+        if actual:
+            readiness = actual.get("readiness", {})
+            if actual["lifecycle"] == "MANAGED_LIFECYCLE_WORKING" and not all(
+                    readiness.get(key, False) for key in
+                    ("observed", "initialization_complete", "inventory_ready", "metadata_ready")):
+                raise ValueError("Scheduler admitted an optical node before readiness")
+        # 不要求真实光盘节点永远 Joining，也不检查其具体设备格式/任务实现。
+        save_json(output / "optical_boundary.json", {
+            "status": "PASS", "blocked": blocked, "cms_probe": catalog,
+            "external_node_observation": actual,
+            "scope": "Scheduler readiness and CMS catalog only; external optical inventory is informational"})
+        print("Scheduler optical admission gate: PASS", flush=True)
+    finally:
+        rpc.close()
+        cms.close()
+
+
 def simulation(cluster, output):
     """Use real CMS placement, simulated hardware, and actual Scheduler power policy."""
     rpc, cms = Rpc(cluster.scheduler, "SchedulerService"), Rpc(cluster.mds, "MdsService")
@@ -164,14 +226,7 @@ def main():
                 with LocalCluster(output, args.build, args.nodes, optical=args.optical_check) as cluster:
                     report = batches(cluster.scheduler, cluster.mds)
                     if args.optical_check:
-                        rpc = Rpc(cluster.scheduler, "SchedulerService")
-                        node = wait_for(lambda: next((n for n in list_nodes(rpc)
-                            if n["spec"]["node_id"] == "t03-optical"), None))
-                        if node["lifecycle"] != "MANAGED_LIFECYCLE_JOINING" or node.get("readiness", {}).get("inventory_ready"):
-                            raise RuntimeError("optical node without inventory must not be admitted")
-                        save_json(output / "optical_boundary.json", {"status": "PASS", "node": node,
-                            "external_dependency": "T05 inventory/task telemetry and T02/MDS optical data-plane integration"})
-                        rpc.close()
+                        check_optical_admission(cluster, output)
             else:
                 report = batches(args.scheduler, args.mds)
             save_json(output / "index.json", {"task": "T03-1", "status": "PASS", "workloads": list(report),

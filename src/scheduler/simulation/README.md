@@ -104,9 +104,10 @@ Scheduler 在本进程内初始化各实例，向既有节点管理器直接上�
 
 上述模型数据为生成式数据，不等同于实体光盘 IO 或真实外存字节保真测试；尚未注入刻录中途的双进程崩溃或真实物理光盘故障。真实数据链路见 [Scheduler 系统测试](../../../tests/scheduler/README.md)。
 
-单元/组件测试不作为交付内容。保留的 C++ probe 是独立服务进程集成测试的 RPC 驱动。
+单元/组件测试不作为交付内容。本模块系统测试仅手动运行，不注册到全仓 CTest；保留的 C++ probe 是独立服务进程集成测试的 RPC 驱动，以 `EXCLUDE_FROM_ALL` 排除在默认构建之外。
 
 ```text
 cmake --build build --target scheduler_inprocess_disk_route_probe scheduler_model_closure_probe scheduler_server mds_server zb_fuse_client zbctl
-ctest --test-dir build -R '^scheduler_(inprocess_disk_server_restart_test|model_closure_integration_test)$' --output-on-failure
+python3 tests/scheduler/inprocess_disk_server_restart_test.py --scheduler build/scheduler_server --mds build/mds_server --probe build/scheduler_inprocess_disk_route_probe
+python3 tests/scheduler/model_closure_integration_test.py --scheduler build/scheduler_server --mds build/mds_server --probe build/scheduler_model_closure_probe --ctl build/zbctl --client build/zb_fuse_client
 ```

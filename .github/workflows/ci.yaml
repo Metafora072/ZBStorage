@@ -67,6 +67,7 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DPORTABLE=ON \
             -DBUILD_TESTING=ON \
             -DBUILD_BRPC_TOOLS=OFF \
             -DBUILD_UNIT_TESTS=OFF \

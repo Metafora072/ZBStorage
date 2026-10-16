@@ -4,9 +4,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <fcntl.h>
+#include <unistd.h>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -86,6 +89,110 @@ StorageServiceImpl::~StorageServiceImpl() {
     }
 }
 
+bool StorageServiceImpl::InitWriteAdmission(const std::string& node_id,
+                                            const std::string& state_dir,
+                                            std::string* error) {
+    std::unique_lock<std::shared_mutex> lock(write_admission_mu_);
+    if (node_id.empty() || node_id.find_first_of("\r\n") != std::string::npos || state_dir.empty()) {
+        if (error) *error = "invalid write admission identity or state directory";
+        return false;
+    }
+    std::error_code ec;
+    fs::create_directories(state_dir, ec);
+    if (ec) { if (error) *error = ec.message(); return false; }
+    admission_node_id_ = node_id;
+    admission_state_path_ = (fs::path(state_dir) / "write_admission.closed").string();
+    const bool exists = fs::exists(admission_state_path_, ec);
+    if (ec) { if (error) *error = ec.message(); return false; }
+    if (exists) {
+        std::ifstream input(admission_state_path_, std::ios::binary);
+        const std::string marker((std::istreambuf_iterator<char>(input)), {});
+        if (!input || marker != "ZBDRAIN1\n" + node_id + "\n") {
+            if (error) *error = "invalid or mismatched durable write admission marker";
+            return false;
+        }
+        write_admission_closed_ = write_admission_durable_ = true;
+    }
+    return true;
+}
+
+zb::msg::Status StorageServiceImpl::BeginDataDrain(const std::string& node_id) {
+    if (node_id.empty() || node_id != admission_node_id_ || admission_state_path_.empty())
+        return zb::msg::Status::InvalidArgument("write admission identity is not initialized or mismatched");
+    // 先拒绝新请求，再等待旧写离开共享区，避免持续写入使排空饥饿。
+    write_admission_closed_.store(true);
+    std::unique_lock<std::shared_mutex> lock(write_admission_mu_);
+    if (write_admission_durable_) return zb::msg::Status::Ok();
+    // 落盘失败也保持内存门禁关闭；调用方只能重试，不能继续迁移。
+    write_admission_closed_ = true;
+    const std::string marker = "ZBDRAIN1\n" + node_id + "\n";
+    const std::string temporary = admission_state_path_ + ".tmp";
+    int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return zb::msg::Status::IoError("cannot create write admission marker");
+    size_t offset = 0;
+    while (offset < marker.size()) {
+        const ssize_t count = ::write(fd, marker.data() + offset, marker.size() - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) { ::close(fd); return zb::msg::Status::IoError("cannot write admission marker"); }
+        offset += static_cast<size_t>(count);
+    }
+    const bool synced = ::fsync(fd) == 0;
+    const bool closed = ::close(fd) == 0;
+    if (!synced || !closed || ::rename(temporary.c_str(), admission_state_path_.c_str()) != 0)
+        return zb::msg::Status::IoError("cannot commit write admission marker");
+    fd = ::open(fs::path(admission_state_path_).parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return zb::msg::Status::IoError("cannot open admission state directory");
+    const bool directory_synced = ::fsync(fd) == 0;
+    ::close(fd);
+    if (!directory_synced) return zb::msg::Status::IoError("cannot sync admission state directory");
+    write_admission_durable_ = true;
+    return zb::msg::Status::Ok();
+}
+
+zb::msg::Status StorageServiceImpl::InstallMigratedFile(const std::string& node_id,
+    const std::string& migration_id, const std::string& disk_id, const zb::msg::FileMeta& meta) {
+    std::shared_lock<std::shared_mutex> admission(write_admission_mu_);
+    if (write_admission_closed_) return zb::msg::Status::IoError("NODE_DRAINING");
+    if (!disk_manager_ || !path_resolver_ || node_id.empty() || node_id != admission_node_id_ ||
+        migration_id.empty() || migration_id.size() > 256 ||
+        migration_id.find_first_of("\t\r\n") != std::string::npos || disk_id.empty() ||
+        meta.inode_id == 0 || meta.version == 0 || meta.object_unit_size == 0)
+        return zb::msg::Status::InvalidArgument("invalid migrated file identity or metadata");
+    const auto mount = disk_manager_->GetMountPoint(disk_id);
+    if (mount.empty()) return zb::msg::Status::NotFound("migration disk not found");
+    const uint64_t count = meta.file_size / meta.object_unit_size + (meta.file_size % meta.object_unit_size != 0);
+    if (count > UINT32_MAX) return zb::msg::Status::InvalidArgument("too many migrated objects");
+    for (uint64_t index = 0; index < count; ++index) {
+        const auto path = path_resolver_->Resolve(mount, BuildStableObjectId(meta.inode_id, index), false);
+        std::error_code ec;
+        const auto bytes = fs::file_size(path, ec);
+        if (ec || bytes != std::min(meta.object_unit_size, meta.file_size - index * meta.object_unit_size))
+            return zb::msg::Status::IoError("migrated object geometry mismatch");
+    }
+    std::lock_guard<std::mutex> lock(file_meta_mu_);
+    std::string error;
+    if (!file_meta_loaded_ && (!InitFileMetaStorePath() || !LoadFileMetaStoreLocked(&error)))
+        return zb::msg::Status::IoError(error);
+    const auto old = file_meta_by_inode_.find(meta.inode_id);
+    if (old != file_meta_by_inode_.end()) {
+        if (old->second.version != meta.version || old->second.file_size != meta.file_size ||
+            old->second.object_unit_size != meta.object_unit_size || old->second.mtime_sec != meta.mtime_sec)
+            return zb::msg::Status::IoError("migration target already has conflicting file metadata");
+    } else {
+        file_meta_by_inode_[meta.inode_id] = meta;
+        last_commit_txid_by_inode_[meta.inode_id] = "migration:" + migration_id;
+        if (!PersistFileMetaStoreLocked(&error)) {
+            file_meta_by_inode_.erase(meta.inode_id);
+            last_commit_txid_by_inode_.erase(meta.inode_id);
+            return zb::msg::Status::IoError(error);
+        }
+    }
+    if (!archive_file_meta_store_.UpsertFile(meta.inode_id, disk_id, meta.file_size,
+                                             count, meta.version, true))
+        return zb::msg::Status::IoError("cannot persist migrated archive metadata");
+    return zb::msg::Status::Ok();
+}
+
 void StorageServiceImpl::SetFileMetaStoreDir(const std::string& dir_path) {
     if (dir_path.empty()) {
         return;
@@ -157,6 +264,11 @@ ReplicationStatusSnapshot StorageServiceImpl::GetReplicationStatus() const {
 
 zb::msg::WriteObjectReply StorageServiceImpl::WriteObject(const zb::msg::WriteObjectRequest& request) {
     zb::msg::WriteObjectReply reply;
+    std::shared_lock<std::shared_mutex> admission(write_admission_mu_);
+    if (write_admission_closed_) {
+        reply.status = zb::msg::Status::IoError("NODE_DRAINING: write admission is closed");
+        return reply;
+    }
     if (!disk_manager_ || !path_resolver_ || !io_executor_) {
         reply.status = zb::msg::Status::InternalError("Service not initialized");
         return reply;
@@ -649,6 +761,11 @@ zb::msg::ResolveFileReadReply StorageServiceImpl::ResolveFileRead(const zb::msg:
 zb::msg::AllocateFileWriteReply StorageServiceImpl::AllocateFileWrite(
     const zb::msg::AllocateFileWriteRequest& request) const {
     zb::msg::AllocateFileWriteReply reply;
+    std::shared_lock<std::shared_mutex> admission(write_admission_mu_);
+    if (write_admission_closed_) {
+        reply.status = zb::msg::Status::IoError("NODE_DRAINING: write admission is closed");
+        return reply;
+    }
     if (request.inode_id == 0) {
         reply.status = zb::msg::Status::InvalidArgument("inode_id is empty");
         return reply;
@@ -691,6 +808,11 @@ zb::msg::AllocateFileWriteReply StorageServiceImpl::AllocateFileWrite(
 
 zb::msg::CommitFileWriteReply StorageServiceImpl::CommitFileWrite(const zb::msg::CommitFileWriteRequest& request) {
     zb::msg::CommitFileWriteReply reply;
+    std::shared_lock<std::shared_mutex> admission(write_admission_mu_);
+    if (write_admission_closed_) {
+        reply.status = zb::msg::Status::IoError("NODE_DRAINING: write admission is closed");
+        return reply;
+    }
     if (request.inode_id == 0) {
         reply.status = zb::msg::Status::InvalidArgument("inode_id is empty");
         return reply;

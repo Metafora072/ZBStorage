@@ -20,6 +20,12 @@ public:
                                uint32_t timeout_ms,
                                uint64_t copy_chunk_bytes,
                                InProcessDiskService* models = nullptr);
+    bool BeginSourceDrain(const std::string& node_id, const std::string& address,
+                           std::string* error) override;
+    bool CleanupSourceFile(const std::string& address, uint64_t inode_id,
+                             const std::string& disk_id, std::string* error) override;
+    bool SourceStillOwnsFile(const std::string& node_id, const std::string& disk_id,
+                              uint64_t inode_id, bool* owns, std::string* error) override;
     bool ListObjects(const std::string& source_address,
                      std::vector<MigrationObject>* objects,
                      std::string* error) override;

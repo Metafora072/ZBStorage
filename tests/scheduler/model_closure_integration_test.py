@@ -42,7 +42,7 @@ def stop(process):
         process.wait(timeout=5)
 
 
-def verify_fuse_read(root, client_path, mds_port, control_port):
+def verify_fuse_read(root, client_path, ctl_path, mds_port, control_port):
     if not pathlib.Path("/dev/fuse").exists() or not shutil.which("fusermount3"):
         print("SKIP: FUSE mount unavailable; RPC closure remains verified")
         return
@@ -53,6 +53,7 @@ def verify_fuse_read(root, client_path, mds_port, control_port):
         client = subprocess.Popen(
             [client_path, f"--mds=127.0.0.1:{mds_port}",
              f"--scheduler=127.0.0.1:{control_port}",
+             "--optical_read_enabled=true", f"--prepare_control_socket={root / 'prepare.sock'}",
              "--bootstrap_tier_dirs=false", "--default_object_unit_size=40",
              "--", str(mount), "-f", "-o", "attr_timeout=0,entry_timeout=0"],
             stdout=client_log, stderr=client_log,
@@ -64,6 +65,11 @@ def verify_fuse_read(root, client_path, mds_port, control_port):
             if not os.path.ismount(mount):
                 raise AssertionError("FUSE mount did not start: " +
                                      log_path.read_text(errors="replace")[-2000:])
+            handle = subprocess.check_output(
+                [ctl_path, "--socket", str(root / "prepare.sock"), "stage", "submit",
+                 str(mount / "virtual" / "model-closure")], text=True, timeout=10).strip()
+            subprocess.run([ctl_path, "--socket", str(root / "prepare.sock"), "stage", "wait", handle],
+                           check=True, timeout=15)
             subprocess.run(
                 [sys.executable, "-c",
                  "import pathlib,sys; assert pathlib.Path(sys.argv[1]).read_bytes() == b'x' * 40",
@@ -83,6 +89,7 @@ def main():
     parser.add_argument("--mds", required=True)
     parser.add_argument("--probe", required=True)
     parser.add_argument("--client", required=True)
+    parser.add_argument("--ctl", required=True)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="zb-model-closure-") as root_text:
         root = pathlib.Path(root_text)
@@ -185,7 +192,7 @@ def main():
                 if restored.returncode != 0:
                     raise AssertionError(restored.stdout + restored.stderr)
                 print(restored.stdout, end="")
-                verify_fuse_read(root, args.client, mds_port, control_port)
+                verify_fuse_read(root, args.client, args.ctl, mds_port, control_port)
         except BaseException:
             for filename in ("scheduler.log", "mds.log"):
                 path = root / filename

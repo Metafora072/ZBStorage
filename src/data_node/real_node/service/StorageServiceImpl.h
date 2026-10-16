@@ -6,6 +6,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -93,6 +94,14 @@ public:
                                   const std::string& secondary_address);
     ReplicationStatusSnapshot GetReplicationStatus() const;
 
+    // 启动时恢复持久写门禁；身份不匹配或状态损坏时拒绝启动。
+    bool InitWriteAdmission(const std::string& node_id, const std::string& state_dir,
+                            std::string* error);
+    // 等待在途写结束，持久关闭后续对象写、写计划与文件提交。
+    zb::msg::Status BeginDataDrain(const std::string& node_id);
+    zb::msg::Status InstallMigratedFile(const std::string& node_id, const std::string& migration_id,
+                                        const std::string& disk_id, const zb::msg::FileMeta& meta);
+
     zb::msg::WriteObjectReply WriteObject(const zb::msg::WriteObjectRequest& request);
     zb::msg::ReadObjectReply ReadObject(const zb::msg::ReadObjectRequest& request);
     zb::msg::ReadArchivedFileReply ReadArchivedFile(const zb::msg::ReadArchivedFileRequest& request);
@@ -167,6 +176,11 @@ private:
     bool PersistFileMetaStoreLocked(std::string* error) const;
 
     DiskManager* disk_manager_{};
+    mutable std::shared_mutex write_admission_mu_;
+    std::atomic<bool> write_admission_closed_{false};
+    bool write_admission_durable_{false};
+    std::string admission_node_id_;
+    std::string admission_state_path_;
     LocalPathResolver* path_resolver_{};
     IOExecutor* io_executor_{};
 

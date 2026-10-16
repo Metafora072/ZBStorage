@@ -25,16 +25,14 @@ struct OpticalNodeManagementSnapshot {
     zb::storage_model::OpticalLibraryStatus library;
 };
 
-// Routes the existing formal optical RPCs to isolated read models. Archive
-// metadata is deliberately rejected until the MDS completion contract exists.
+// 共享光盘数据入口：按逻辑节点和代际路由，兼容正式准备/读会话协议与旧读接口。
 class InProcessOpticalService final : public zb::rpc::OpticalNodeService {
 public:
     explicit InProcessOpticalService(NodePowerManager* manager = nullptr,
                                      std::string mds_address = {},
                                      std::string service_address = {},
-                                     InProcessDiskService* model_sources = nullptr)
-        : node_manager_(manager), mds_address_(std::move(mds_address)),
-          service_address_(std::move(service_address)), model_sources_(model_sources) {}
+                                     InProcessDiskService* model_sources = nullptr);
+    ~InProcessOpticalService() override;
     bool AddNode(OpticalReadConfig config, std::string* error);
     // Only use before the instance is exposed through Scheduler reporting.
     bool DiscardUnpublishedNode(const std::string& node_id);
@@ -47,6 +45,20 @@ public:
     bool GetManagementSnapshot(const std::string& node_id, uint64_t observed_at_ms,
                                OpticalNodeManagementSnapshot* output) const;
     bool ReconcileArchives(const std::string& node_id, std::string* error);
+
+    // 正式协议：通知订阅、异步准备、独立读取会话和两级引用释放。
+    void SubscribeReadEvents(google::protobuf::RpcController*, const zb::rpc::SubscribeReadEventsRequest*,
+                             zb::rpc::SubscribeReadEventsReply*, google::protobuf::Closure*) override;
+    void PrepareRead(google::protobuf::RpcController*, const zb::rpc::PrepareReadRequest*,
+                      zb::rpc::PrepareReadReply*, google::protobuf::Closure*) override;
+    void AcquireReadSession(google::protobuf::RpcController*, const zb::rpc::AcquireReadSessionRequest*,
+                             zb::rpc::AcquireReadSessionReply*, google::protobuf::Closure*) override;
+    void ReadPreparedFile(google::protobuf::RpcController*, const zb::rpc::ReadPreparedFileRequest*,
+                           zb::rpc::ReadPreparedFileReply*, google::protobuf::Closure*) override;
+    void ReleaseReadSession(google::protobuf::RpcController*, const zb::rpc::ReleaseReadSessionRequest*,
+                             zb::rpc::ReleaseReadSessionReply*, google::protobuf::Closure*) override;
+    void ReleasePreparedRead(google::protobuf::RpcController*, const zb::rpc::ReleasePreparedReadRequest*,
+                              zb::rpc::ReleasePreparedReadReply*, google::protobuf::Closure*) override;
 
     void SendArchiveMetadata(google::protobuf::RpcController* controller,
                              const zb::rpc::SendArchiveMetadataRequest* request,
@@ -66,6 +78,10 @@ public:
                              google::protobuf::Closure* done) override;
 
 private:
+    struct PreparedState;
+    std::shared_ptr<OpticalReadModel> ResolvePrepared(google::protobuf::RpcController*,
+                                                       zb::rpc::OpticalStatus*, bool ready) const;
+    uint32_t ActiveReadSessions(const std::string& node_id) const;
     std::shared_ptr<OpticalReadModel> Resolve(google::protobuf::RpcController* controller,
                                               zb::rpc::MdsStatus* status,
                                               bool requires_ready) const;
@@ -82,6 +98,7 @@ private:
     std::string mds_address_;
     std::string service_address_;
     InProcessDiskService* model_sources_{};
+    std::unique_ptr<PreparedState> prepared_;
 };
 
 } // namespace zb::scheduler

@@ -184,8 +184,8 @@ bool InProcessOpticalService::GetManagementSnapshot(
     snapshot.library.staging_used_bytes = snapshot.model.staging_used_bytes;
     snapshot.library.pending_write_tasks = snapshot.model.pending_write_tasks;
     snapshot.library.pending_read_tasks = snapshot.model.pending_tasks;
+    snapshot.library.pending_read_tasks += ActiveReadSessions(node_id);
     snapshot.library.busy_drives = snapshot.model.busy_drives;
-    // The current read-only core has no staging reservation or write task.
     snapshot.library.observed_at_ms = observed_at_ms;
     *output = std::move(snapshot);
     return true;

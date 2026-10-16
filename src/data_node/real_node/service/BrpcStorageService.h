@@ -8,6 +8,12 @@ namespace zb::real_node {
 
 class BrpcStorageService : public zb::rpc::RealNodeService {
 public:
+    void InstallMigratedFile(google::protobuf::RpcController*,
+                              const zb::rpc::InstallMigratedFileRequest*,
+                              zb::rpc::InstallMigratedFileReply*, google::protobuf::Closure*) override;
+    void BeginNodeDrain(google::protobuf::RpcController*,
+                        const zb::rpc::BeginNodeDrainRequest*,
+                        zb::rpc::BeginNodeDrainReply*, google::protobuf::Closure*) override;
     explicit BrpcStorageService(StorageServiceImpl* service,
                                 zb::metrics::NodeMetricsCollector* metrics = nullptr);
 

@@ -370,6 +370,10 @@ int main(int argc, char* argv[]) {
     options.idle_timeout_sec = FLAGS_idle_timeout_sec;
 
     std::string node_id = cfg.node_id.empty() ? ("real-node-" + std::to_string(FLAGS_port)) : cfg.node_id;
+    if (!storage_service.InitWriteAdmission(node_id, archive_meta_dir, &archive_meta_error)) {
+        std::cerr << "Write admission recovery failed: " << archive_meta_error << std::endl;
+        return 1;
+    }
     std::string node_address = cfg.node_address.empty()
                                    ? ("127.0.0.1:" + std::to_string(FLAGS_port))
                                    : cfg.node_address;

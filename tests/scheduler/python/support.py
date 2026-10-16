@@ -107,14 +107,17 @@ class LocalCluster:
         path = self.output / "config" / (name + ".conf")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(f"{k}={v}\n" for k, v in config.items()))
-        log = (self.output / (name + ".log")).open("ab")
+        log_path = self.output / (name + ".log")
+        log = log_path.open("ab")
         self.logs.append(log)
         process = subprocess.Popen([str(executable), f"--config={path}", f"--port={port}",
                                     "--bthread_concurrency=4"], stdout=log, stderr=log)
         self.processes.append(process)
         def listening():
-            if process.poll() is not None:
-                raise ValueError(f"{name} exited: see {name}.log")
+            exit_code = process.poll()
+            if exit_code is not None:
+                detail = log_path.read_text(encoding="utf-8", errors="replace")[-8000:]
+                raise ValueError(f"{name} exited ({exit_code}): {log_path}\n{detail}")
             with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                 return True
         wait_for(listening)

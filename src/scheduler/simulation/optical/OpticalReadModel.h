@@ -69,6 +69,12 @@ struct OpticalModelStats {
     uint64_t stored_bytes{0};
 };
 
+// 准备任务只提供状态与身份；查询不生成业务字节，也不重复计算设备耗时。
+struct OpticalPreparedInfo {
+    uint64_t inode_id{0}, version{0}, size{0};
+    bool ready{false};
+};
+
 class OpticalReadModel {
 public:
     explicit OpticalReadModel(OpticalReadConfig config);
@@ -86,7 +92,10 @@ public:
                                   const std::string& disc_id,
                                   const std::string& image_id);
     OpticalModelResult RequestRead(uint64_t inode_id, const std::string& disc_id,
-                                   const std::string& image_id);
+                                   const std::string& image_id, bool retained = false,
+                                   const OpticalPreparedInfo* expected = nullptr);
+    OpticalModelResult InspectPrepared(uint64_t task_id, OpticalPreparedInfo* output);
+    OpticalModelResult ReleasePrepared(uint64_t task_id);
     OpticalModelResult ReadTask(uint64_t task_id, uint64_t offset, uint64_t size);
     OpticalModelResult ReadLatest(uint64_t inode_id, uint64_t offset, uint64_t size);
     OpticalModelResult SubmitVerifiedArchive(const OpticalArchiveRecord& request);
@@ -118,6 +127,7 @@ private:
         Clock::time_point released_at;
         bool released{false};
         bool cache_hit{false};
+        bool retained{false}; // 进程内准备/读取引用；重启后失效，不持久化会话。
     };
     struct Cache {
         uint64_t version{0};

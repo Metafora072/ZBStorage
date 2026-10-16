@@ -56,6 +56,15 @@ struct DrainMigrationTask {
 class ObjectMigrationBackend {
 public:
     virtual ~ObjectMigrationBackend() = default;
+    // 源节点确认关闭写入并等待在途写结束后，才允许枚举和复制。
+    virtual bool BeginSourceDrain(const std::string& node_id,
+                                   const std::string& address,
+                                   std::string* error) = 0;
+    virtual bool CleanupSourceFile(const std::string& address, uint64_t inode_id,
+                                     const std::string& disk_id, std::string* error) = 0;
+    // 重试前读取权威位置；已提交到别处的文件只清理旧源，禁止再次覆盖目标。
+    virtual bool SourceStillOwnsFile(const std::string& node_id, const std::string& disk_id,
+                                      uint64_t inode_id, bool* owns, std::string* error) = 0;
     virtual bool ListObjects(const std::string& source_address,
                              std::vector<MigrationObject>* objects,
                              std::string* error) = 0;

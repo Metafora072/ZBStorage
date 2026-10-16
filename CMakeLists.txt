@@ -976,8 +976,8 @@ if(BRPC_DYNAMIC_LIB)
 endif()
 
 if(BUILD_TESTING)
-    # 仅构建独立服务进程闭环所需的 RPC 驱动，不交付本地单元/组件测试。
-    add_executable(scheduler_inprocess_disk_route_probe
+    # 系统闭环 RPC 驱动仅手动指定目标构建，不进入默认 ALL，也不注册全仓 CTest。
+    add_executable(scheduler_inprocess_disk_route_probe EXCLUDE_FROM_ALL
         tests/scheduler/inprocess_disk_route_probe.cpp)
     target_link_libraries(scheduler_inprocess_disk_route_probe PRIVATE zb_proto brpc-static)
     target_include_directories(scheduler_inprocess_disk_route_probe PRIVATE
@@ -986,7 +986,7 @@ if(BUILD_TESTING)
     if(BRPC_DYNAMIC_LIB)
         target_link_libraries(scheduler_inprocess_disk_route_probe PRIVATE ${BRPC_DYNAMIC_LIB})
     endif()
-    add_executable(scheduler_model_closure_probe
+    add_executable(scheduler_model_closure_probe EXCLUDE_FROM_ALL
         tests/scheduler/model_closure_probe.cpp)
     target_link_libraries(scheduler_model_closure_probe PRIVATE zb_proto brpc-static)
     target_include_directories(scheduler_model_closure_probe PRIVATE
@@ -1139,11 +1139,6 @@ if(UNIX)
         set_tests_properties(client_io_latency_test client_io_latency_integration_test PROPERTIES TIMEOUT 60)
         find_package(Python3 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
-            add_test(NAME scheduler_real_drain_integration_test
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/scheduler/real_drain_integration_test.py
-                    --build ${CMAKE_CURRENT_BINARY_DIR})
-            set_tests_properties(scheduler_real_drain_integration_test PROPERTIES
-                TIMEOUT 90 RUN_SERIAL TRUE LABELS "scheduler;integration;scheduler_system_closure")
             add_test(NAME client_optical_external_test
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/client/client_optical_external_test.py
                     --environment $<TARGET_FILE:optical_external_services>
@@ -1156,36 +1151,6 @@ if(UNIX)
                     --client $<TARGET_FILE:zb_fuse_client> --fixture $<TARGET_FILE:client_optical_read_test>
                     --ctl $<TARGET_FILE:zbctl>)
             set_tests_properties(client_optical_mount_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
-            add_test(NAME scheduler_inprocess_disk_server_restart_test
-                COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/scheduler/inprocess_disk_server_restart_test.py
-                    --scheduler $<TARGET_FILE:scheduler_server>
-                    --mds $<TARGET_FILE:mds_server>
-                    --probe $<TARGET_FILE:scheduler_inprocess_disk_route_probe>)
-            set_tests_properties(scheduler_inprocess_disk_server_restart_test
-                PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE LABELS "scheduler;integration;scheduler_system_closure")
-            add_test(NAME scheduler_model_closure_integration_test
-                COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/scheduler/model_closure_integration_test.py
-                    --scheduler $<TARGET_FILE:scheduler_server>
-                    --mds $<TARGET_FILE:mds_server>
-                    --probe $<TARGET_FILE:scheduler_model_closure_probe>
-                    --ctl $<TARGET_FILE:zbctl>
-                    --client $<TARGET_FILE:zb_fuse_client>)
-            set_tests_properties(scheduler_model_closure_integration_test
-                PROPERTIES TIMEOUT 55 RUN_SERIAL TRUE
-                           LABELS "scheduler;integration;scheduler_system_closure")
-            add_test(NAME scheduler_t03_local_smoke
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/scheduler/run.py
-                    local --build ${CMAKE_CURRENT_BINARY_DIR} --files 12 --optical-check)
-            add_test(NAME scheduler_t03_simulation
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/scheduler/run.py
-                    simulation --build ${CMAKE_CURRENT_BINARY_DIR})
-            add_test(NAME scheduler_t03_meter_closure
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/scheduler/run.py
-                    meter-closure --build ${CMAKE_CURRENT_BINARY_DIR} --files 20)
-            set_tests_properties(scheduler_t03_local_smoke scheduler_t03_simulation scheduler_t03_meter_closure
-                PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE LABELS "scheduler;integration")
             add_test(NAME client_io_latency_workflow_test
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/client/client_io_latency_workflow_test.py)
             set_tests_properties(client_io_latency_workflow_test PROPERTIES TIMEOUT 60)

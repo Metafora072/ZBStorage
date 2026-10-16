@@ -234,6 +234,22 @@ message CommitFileWriteReply {
   FileMeta meta = 2;
 }
 
+// Scheduler 排空前关闭源节点写入；成功时在途写已结束，门禁已持久化。
+// 重复调用幂等，节点重启后保持关闭；读取与迁移清理仍可执行。
+message BeginNodeDrainRequest { string node_id = 1; }
+message BeginNodeDrainReply {
+  Status status = 1;
+  bool write_admission_closed = 2;
+}
+// 迁移目标在 MDS 切换前持久化原文件版本和几何信息，不改变版本号。
+message InstallMigratedFileRequest {
+  string node_id = 1;
+  string migration_id = 2;
+  string disk_id = 3;
+  FileMeta meta = 4;
+}
+message InstallMigratedFileReply { Status status = 1; }
+
 service RealNodeService {
   rpc WriteObject(WriteObjectRequest) returns (WriteObjectReply);
   rpc ReadObject(ReadObjectRequest) returns (ReadObjectReply);
@@ -248,4 +264,6 @@ service RealNodeService {
   rpc ResolveFileRead(ResolveFileReadRequest) returns (ResolveFileReadReply);
   rpc AllocateFileWrite(AllocateFileWriteRequest) returns (AllocateFileWriteReply);
   rpc CommitFileWrite(CommitFileWriteRequest) returns (CommitFileWriteReply);
+  rpc BeginNodeDrain(BeginNodeDrainRequest) returns (BeginNodeDrainReply);
+  rpc InstallMigratedFile(InstallMigratedFileRequest) returns (InstallMigratedFileReply);
 }

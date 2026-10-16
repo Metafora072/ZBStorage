@@ -22,6 +22,9 @@ struct FileInfo {
     std::string image_id;
     uint64_t file_size{0};
     std::optional<uint64_t> file_version;
+    // 共享 Scheduler 数据入口的目标身份；留空时保持旧物理节点调用方式。
+    std::string node_id;
+    uint64_t instance_generation{0};
 };
 
 struct PrepareHandle {

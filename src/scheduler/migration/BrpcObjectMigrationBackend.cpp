@@ -42,6 +42,26 @@ brpc::Channel* BrpcObjectMigrationBackend::ChannelFor(const std::string& address
     return result;
 }
 
+bool BrpcObjectMigrationBackend::BeginSourceDrain(const std::string& node_id,
+                                                  const std::string& address,
+                                                  std::string* error) {
+    auto* channel = ChannelFor(address, error);
+    if (!channel) return false;
+    zb::rpc::BeginNodeDrainRequest request;
+    request.set_node_id(node_id);
+    zb::rpc::BeginNodeDrainReply response;
+    brpc::Controller controller;
+    zb::rpc::RealNodeService_Stub stub(channel);
+    stub.BeginNodeDrain(&controller, &request, &response, nullptr);
+    if (controller.Failed() || !response.has_status() ||
+        response.status().code() != zb::rpc::STATUS_OK || !response.write_admission_closed()) {
+        if (error) *error = controller.Failed() ? controller.ErrorText() :
+            (response.has_status() ? response.status().message() : "missing drain acknowledgement");
+        return false;
+    }
+    return true;
+}
+
 bool BrpcObjectMigrationBackend::ListObjects(const std::string& source_address,
                                              std::vector<MigrationObject>* objects,
                                              std::string* error) {
@@ -70,7 +90,7 @@ bool BrpcObjectMigrationBackend::ListObjects(const std::string& source_address,
         brpc::Controller controller;
         controller.set_timeout_ms(static_cast<int>(timeout_ms_));
         stub.ListObjects(&controller, &request, &response, nullptr);
-        if (controller.Failed() || response.status().code() != zb::rpc::STATUS_OK) {
+        if (controller.Failed() || !response.has_status() || response.status().code() != zb::rpc::STATUS_OK) {
             if (error) *error = controller.Failed() ? controller.ErrorText() : response.status().message();
             return false;
         }
@@ -87,6 +107,64 @@ bool BrpcObjectMigrationBackend::ListObjects(const std::string& source_address,
             return false;
         }
     } while (!token.empty());
+    return true;
+}
+
+bool BrpcObjectMigrationBackend::SourceStillOwnsFile(const std::string& node_id,
+    const std::string& disk_id, uint64_t inode_id, bool* owns, std::string* error) {
+    auto* channel = ChannelFor(mds_address_, error);
+    if (!channel || !owns) return false;
+    zb::rpc::GetFileLocationRequest request;
+    request.set_inode_id(inode_id);
+    zb::rpc::GetFileLocationReply response;
+    brpc::Controller controller;
+    zb::rpc::MdsService_Stub stub(channel);
+    stub.GetFileLocation(&controller, &request, &response, nullptr);
+    if (controller.Failed() || !response.has_status()) {
+        if (error) *error = controller.Failed() ? controller.ErrorText() : "missing MDS file location status";
+        return false;
+    }
+    if (response.status().code() != zb::rpc::MDS_OK || !response.has_location()) {
+        if (error) *error = "cannot resolve authoritative migration source: " + response.status().message();
+        return false;
+    }
+    const auto& location = response.location();
+    if (location.attr().storage_tier() == zb::rpc::INODE_STORAGE_OPTICAL &&
+        location.has_optical_location() && !location.optical_location().node_id().empty()) {
+        *owns = false;
+        return true;
+    }
+    if (!location.has_disk_location() || location.disk_location().node_id().empty() ||
+        location.disk_location().disk_id().empty()) {
+        if (error) *error = "MDS file has no resolvable authoritative data location";
+        return false;
+    }
+    if (location.disk_location().node_id() == node_id && location.disk_location().disk_id() != disk_id) {
+        if (error) *error = "source inode points to a different local disk; retain ambiguous source objects";
+        return false;
+    }
+    *owns = location.disk_location().node_id() == node_id && location.disk_location().disk_id() == disk_id;
+    return true;
+}
+
+bool BrpcObjectMigrationBackend::CleanupSourceFile(const std::string& address, uint64_t inode_id,
+                                                   const std::string& disk_id, std::string* error) {
+    if (address.rfind("model://", 0) == 0) return true; // 模型后端已在对象清理时同步清理文件。
+    auto* channel = ChannelFor(address, error);
+    if (!channel) return false;
+    zb::rpc::DeleteFileMetaRequest request;
+    request.set_inode_id(inode_id);
+    request.set_disk_id(disk_id);
+    request.set_purge_objects(false);
+    zb::rpc::DeleteFileMetaReply response;
+    brpc::Controller controller;
+    zb::rpc::RealNodeService_Stub stub(channel);
+    stub.DeleteFileMeta(&controller, &request, &response, nullptr);
+    if (controller.Failed() || !response.has_status() || (response.status().code() != zb::rpc::STATUS_OK &&
+        response.status().code() != zb::rpc::STATUS_NOT_FOUND)) {
+        if (error) *error = controller.Failed() ? controller.ErrorText() : response.status().message();
+        return false;
+    }
     return true;
 }
 
@@ -146,7 +224,7 @@ bool BrpcObjectMigrationBackend::CopyAndVerify(const std::string& source_address
         brpc::Controller read_controller;
         read_controller.set_timeout_ms(static_cast<int>(timeout_ms_));
         source.ReadObject(&read_controller, &read_request, &read_response, nullptr);
-        if (read_controller.Failed() || read_response.status().code() != zb::rpc::STATUS_OK ||
+        if (read_controller.Failed() || !read_response.has_status() || read_response.status().code() != zb::rpc::STATUS_OK ||
             read_response.data().size() != length) {
             if (error) *error = read_controller.Failed() ? read_controller.ErrorText() :
                 (read_response.status().code() != zb::rpc::STATUS_OK ? read_response.status().message() :
@@ -163,7 +241,8 @@ bool BrpcObjectMigrationBackend::CopyAndVerify(const std::string& source_address
         brpc::Controller write_controller;
         write_controller.set_timeout_ms(static_cast<int>(timeout_ms_));
         destination.WriteObject(&write_controller, &write_request, &write_response, nullptr);
-        if (write_controller.Failed() || write_response.status().code() != zb::rpc::STATUS_OK) {
+        if (write_controller.Failed() || !write_response.has_status() ||
+            write_response.status().code() != zb::rpc::STATUS_OK || write_response.bytes() != length) {
             if (error) *error = write_controller.Failed() ? write_controller.ErrorText() : write_response.status().message();
             return false;
         }
@@ -176,7 +255,7 @@ bool BrpcObjectMigrationBackend::CopyAndVerify(const std::string& source_address
         brpc::Controller verify_controller;
         verify_controller.set_timeout_ms(static_cast<int>(timeout_ms_));
         destination.ReadObject(&verify_controller, &verify_request, &verify_response, nullptr);
-        if (verify_controller.Failed() || verify_response.status().code() != zb::rpc::STATUS_OK ||
+        if (verify_controller.Failed() || !verify_response.has_status() || verify_response.status().code() != zb::rpc::STATUS_OK ||
             verify_response.data() != read_response.data()) {
             if (error) *error = verify_controller.Failed() ? verify_controller.ErrorText() : "target byte verification failed";
             return false;
@@ -217,6 +296,36 @@ bool BrpcObjectMigrationBackend::CommitFileLocation(const std::string& migration
     request.mutable_expected_source()->set_node_id(source_node_id);
     request.mutable_expected_source()->set_node_address(source_address);
     request.mutable_expected_source()->set_disk_id(source_disk_id);
+    if (!model_source) {
+        auto* source_channel = ChannelFor(source_address, error);
+        auto* target_channel = ChannelFor(target.address, error);
+        if (!source_channel || !target_channel) return false;
+        zb::rpc::RealNodeService_Stub source(source_channel), destination(target_channel);
+        zb::rpc::ResolveFileReadRequest describe;
+        describe.set_inode_id(inode_id);
+        describe.set_disk_id(source_disk_id);
+        zb::rpc::ResolveFileReadReply metadata;
+        brpc::Controller source_controller;
+        source.ResolveFileRead(&source_controller, &describe, &metadata, nullptr);
+        if (source_controller.Failed() || !metadata.has_status() || metadata.status().code() != zb::rpc::STATUS_OK ||
+            !metadata.has_meta() || metadata.meta().version() == 0) {
+            if (error) *error = "cannot obtain frozen source file metadata";
+            return false;
+        }
+        zb::rpc::InstallMigratedFileRequest install;
+        install.set_node_id(target.node_id);
+        install.set_migration_id(request.migration_id());
+        install.set_disk_id(target.disk_id);
+        *install.mutable_meta() = metadata.meta();
+        zb::rpc::InstallMigratedFileReply installed;
+        brpc::Controller target_controller;
+        destination.InstallMigratedFile(&target_controller, &install, &installed, nullptr);
+        if (target_controller.Failed() || !installed.has_status() || installed.status().code() != zb::rpc::STATUS_OK) {
+            if (error) *error = target_controller.Failed() ? target_controller.ErrorText() : installed.status().message();
+            return false;
+        }
+        request.set_expected_inode_version(metadata.meta().version());
+    }
     if (model_source) {
         request.set_expected_inode_version(model_file.version);
         request.mutable_expected_source()->set_instance_generation(
@@ -231,8 +340,13 @@ bool BrpcObjectMigrationBackend::CommitFileLocation(const std::string& migration
     brpc::Controller controller;
     controller.set_timeout_ms(static_cast<int>(timeout_ms_));
     stub.CommitFileMigration(&controller, &request, &response, nullptr);
-    if (controller.Failed() || response.status().code() != zb::rpc::MDS_OK) {
+    if (controller.Failed() || !response.has_status() || response.status().code() != zb::rpc::MDS_OK) {
         if (error) *error = controller.Failed() ? controller.ErrorText() : response.status().message();
+        return false;
+    }
+    if (!response.has_location() || response.location().node_id() != target.node_id ||
+        response.location().disk_id() != target.disk_id) {
+        if (error) *error = "MDS did not confirm the expected migration target";
         return false;
     }
     return true;
@@ -266,13 +380,14 @@ bool BrpcObjectMigrationBackend::VerifyCmsNodeReferencesZero(
         if (error) *error = controller.ErrorText();
         return false;
     }
-    if (response.status().code() != zb::rpc::MDS_OK) {
+    if (!response.has_status() || response.status().code() != zb::rpc::MDS_OK) {
         if (error) *error = response.status().message();
         return false;
     }
     if (disk_references) *disk_references = response.disk_inode_references();
     if (optical_references) *optical_references = response.optical_inode_references();
-    if (!response.zero_references()) {
+    if (!response.zero_references() || response.disk_inode_references() != 0 ||
+        response.optical_inode_references() != 0) {
         if (error) {
             *error = "CMS still references node (disk=" +
                      std::to_string(response.disk_inode_references()) +
@@ -313,8 +428,8 @@ bool BrpcObjectMigrationBackend::DeleteSourceObject(const std::string& source_ad
         if (error) *error = controller.ErrorText();
         return false;
     }
-    if (response.status().code() != zb::rpc::STATUS_OK &&
-        response.status().code() != zb::rpc::STATUS_NOT_FOUND) {
+    if (!response.has_status() || (response.status().code() != zb::rpc::STATUS_OK &&
+        response.status().code() != zb::rpc::STATUS_NOT_FOUND)) {
         if (error) *error = response.status().message();
         return false;
     }

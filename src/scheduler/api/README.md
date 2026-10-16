@@ -2,6 +2,19 @@
 
 本目录提供给其他模块调用 Scheduler 的 C++ 客户端。线协议仍是 [scheduler.proto](../../msg/scheduler.proto) 的 SchedulerService；没有新建一套节点结构，也不改变现有调用方。C++ 使用 [SchedulerClient.h](SchedulerClient.h)，链接 CMake 目标 zb_scheduler_api_client。非 C++ 调用方可直接使用 protobuf/brpc，或向 BRPC 的 HTTP/JSON 入口发送请求。
 
+## 开发与联调边界
+
+| 责任方 | 实现和维护的内容 |
+| --- | --- |
+| Scheduler（我们） | 节点状态与能耗、CMS 目录提案、排空协调；真实磁盘配套的写门禁与迁移；进程内磁盘/光盘模型及正式数据协议适配；本模块闭环回归 |
+| 光盘节点负责人 | 真实设备库存及后台下载/打包/取盘/刻录统计、实际数据执行和恢复、实际库存与任务快照的采集、归档完成回报 |
+| MDS 负责人 | 权威文件位置、冷目录判定、归档下发/租约/完成确认、Masstree 发布和冷热元数据清理 |
+| 客户端负责人 | 文件访问与准备入口、位置缓存和错误处理；与我们共同维护共享入口的节点 ID/实例代际传递 |
+
+缺少真实光盘库存或归档回报时，Scheduler 保持准入检查，不补成成功。模型控制状态与生成式字节不充当真实数据证明。
+
+本轮公共契约扩展为 `RealNodeService.BeginNodeDrain`、`InstallMigratedFile`，以及客户端 `FileInfo` 尾部可选的节点 ID/实例代际字段；后者在各光盘 RPC 上传递既有 LogicalNodeRoute。MDS 和真实光盘业务实现由对应负责人维护。
+
 ## 谁调用什么
 
 | 调用方 | 推荐接口 | 目的 |
@@ -51,10 +64,17 @@ curl -sS -H 'Content-Type: application/json' \
 
 单位：容量、IO 和带宽使用字节或字节/秒；报告时间使用毫秒，访问事件时间使用微秒；功率为毫瓦，累计能量为微焦。instance_generation 是服务实例代际，不是库存 generation、硬件 technology_generation、CMS 目录版本或文件版本。
 
+真实磁盘排空先调用 `BeginNodeDrain(node_id)`：回复须包含 `STATUS_OK` 且 `write_admission_closed=true`。源节点先拒绝新写，再等待在途对象写/文件提交结束，最后 fsync 关闭标记和目录；重启仍拒绝写计划、对象写和文件提交。该门禁用于退役，不因普通启动 RPC 自动打开；失败保持关闭并允许重试。复制和目标回读校验后，`InstallMigratedFile` 核对目标对象长度，保存源文件大小、对象单位、版本和修改时间，再向 MDS 条件提交位置。MDS 成功后才清理源对象和旧文件元数据，最终再次核验零引用。
+
+每次复制重试先调用 MDS `GetFileLocation` 核对权威源；若位置已经提交到其他节点，则只清理旧源，避免响应丢失或重启后用旧内容覆盖目标上的后续写入。位置无法解析时保留源并报告阻塞。部署排空能力时须同步更新真实磁盘服务；旧节点未实现门禁/元数据接收 RPC 时明确失败，不退回无保护迁移。
+
 ## 验证
 
-- scheduler_public_api_test：启动真正的 BRPC SchedulerService，验证注册、稳定翻页、查询及业务错误/传输错误区分。
-- scheduler_owner_smoke：节点模型、管理、迁移及进程内数据 RPC 的开发回归。
+- scheduler_real_drain_integration_test：真实 Scheduler、MDS 和磁盘进程检查持久写门禁、源进程异常重启、迁移版本接续和迁移后继续写入。
+- scheduler_inprocess_disk_server_restart_test：独立 Scheduler/MDS 进程检查 CMS 准入、模型持久化及异常重启。
+- scheduler_model_closure_integration_test：独立 Scheduler/MDS 进程检查模型迁移、代际与光盘归档；具备 FUSE 时通过正式客户端和 zbctl 检查准备及读取链路，数据为模型生成。
 - tests/scheduler/real_system_smoke.py：真实外存、FUSE、MDS/CMS 和两个真实数据节点的读写、重启、排空与退役闭环；不测物理功耗。
+
+单元/组件测试不交付；上述三个 CTest 系统集成用例统一使用 `scheduler_system_closure` 标签。
 
 本接口方便联调，但不声明物理电表、实体光盘刻录或其他模块的冷目录/Masstree 流程已经验收。

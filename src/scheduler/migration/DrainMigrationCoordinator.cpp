@@ -58,6 +58,12 @@ bool DrainMigrationCoordinator::BeginManagedDrain(const std::string& node_id,
         }
         return logical_empty_drain_begin_(node_id, now_ms, error);
     }
+    if (runtime.profile.kind == ManagedNodeKind::kStorage &&
+        runtime.profile.execution_mode == ExecutionMode::kPhysical) {
+        NodeState source;
+        if (!cluster_->GetNode(node_id, &source) ||
+            !backend_->BeginSourceDrain(node_id, source.address, error)) return false;
+    }
     return nodes_->BeginRemoveNode(node_id, now_ms, error);
 }
 
@@ -192,6 +198,12 @@ bool DrainMigrationCoordinator::ParseStableObjectId(const std::string& object_id
 bool DrainMigrationCoordinator::EnumerateLocked(InternalTask* task, uint64_t now_ms) {
     std::vector<MigrationObject> objects;
     std::string error;
+    // 自动寿命退役和 Scheduler 重启恢复也必须重新确认源节点持久门禁。
+    if (task->view.source_address.rfind("model://", 0) != 0 &&
+        !backend_->BeginSourceDrain(task->view.source_node_id, task->view.source_address, &error)) {
+        RetryLocked(task, now_ms, "source write fence failed: " + error);
+        return false;
+    }
     if (!backend_->ListObjects(task->view.source_address, &objects, &error)) {
         RetryLocked(task, now_ms, "object enumeration failed: " + error);
         return false;
@@ -312,7 +324,16 @@ bool DrainMigrationCoordinator::ProcessWorkLocked(InternalTask* task, uint64_t n
     }
     WorkItem& work = task->work[task->next_work];
     std::string error;
-    if (!work.target_selected) {
+    if (!work.metadata_committed) {
+        bool owns = true;
+        if (!backend_->SourceStillOwnsFile(task->view.source_node_id, work.source_disk_id,
+                                           work.inode_id, &owns, &error)) {
+            RetryLocked(task, now_ms, "authoritative source check failed: " + error);
+            return false;
+        }
+        if (!owns) work.metadata_committed = true;
+    }
+    if (!work.metadata_committed && !work.target_selected) {
         if (!SelectTargetLocked(*task, work, now_ms, &work.target, &error)) {
             RetryLocked(task, now_ms, error);
             return false;
@@ -340,6 +361,11 @@ bool DrainMigrationCoordinator::ProcessWorkLocked(InternalTask* task, uint64_t n
             RetryLocked(task, now_ms, "source cleanup " + object.object_id + " failed: " + error);
             return false;
         }
+    }
+    if (!backend_->CleanupSourceFile(task->view.source_address, work.inode_id,
+                                     work.source_disk_id, &error)) {
+        RetryLocked(task, now_ms, "source file metadata cleanup failed: " + error);
+        return false;
     }
     uint64_t bytes = 0;
     for (const auto& object : work.objects) bytes += object.size_bytes;

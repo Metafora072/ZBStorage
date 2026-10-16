@@ -2,7 +2,7 @@
 
 依据根目录 `测试任务书.pdf` 第 4–5 页（T03）及第 10–13 页的原测试案例。负责人：丁森凡。
 
-本目录交付可直接运行的批量文件处理、节点分布、磁电节点能耗数据处理、10 节点仿真能效及外存真实闭环测试；同时保留 Scheduler/节点管理的少量模块回归。T02 的通用 FUSE Trace 播放、T04 的长期仿真、T05 的实体光盘归档和机械调度不由本目录重新实现。
+本目录交付可直接运行的批量文件处理、节点分布、磁电节点能耗数据处理、10 节点仿真能效及系统闭环测试；不交付 Scheduler/节点管理的单元或组件测试。T02 的通用 FUSE Trace 播放、T04 的长期仿真、T05 的实体光盘归档和机械调度不由本目录重新实现。
 
 ## 目录组织
 
@@ -12,18 +12,26 @@ tests/scheduler/
 ├── run.py                 # 常规测试、仿真、电表分析入口
 ├── external_test.py       # 外存真实 FUSE 负载入口
 ├── real_system_smoke.py   # 精简真实系统闭环：外存、FUSE、迁移、重启
-├── *_test.cpp             # 节点管理与进程内模型回归
+├── real_drain_integration_test.py # 真实进程：并发写门禁、异常重启、迁移版本和后续写入
+├── inprocess_disk_server_restart_test.py # 独立服务进程：CMS 门禁、持久化和异常重启
+├── inprocess_disk_route_probe.cpp # 上述系统测试的 RPC 驱动（不是单元测试）
 ├── model_closure_*.{cpp,py} # 迁移、代际、模型光盘及 FUSE 闭环
 ├── python/                # 两个入口必需的支撑模块（包）
 ├── fixtures/              # 随代码提交的固定测试输入
 └── results/               # 本地运行结果、索引和历史报告，不提交
 ```
 
-模块回归位于本目录并由 CTest 构建；`results/` 仅保存本地实验结果，不提交。`run.py` 的 T03 任务入口与模块回归分别使用，前者不能替代迁移及光盘模型的故障门禁测试。
+系统集成测试由 CTest 调用；两个 C++ probe 仅负责驱动独立运行的服务进程。`results/` 仅保存本地实验结果，不提交。`run.py` 的 T03 任务入口不能替代迁移及光盘模型的故障门禁测试。
+
+责任边界见 [Scheduler 接口说明](../../src/scheduler/api/README.md#开发与联调边界)。本目录的真实磁盘适配和进程内光盘模型由 Scheduler 负责；真实光盘库存/任务采集及归档回报、MDS 冷目录和 Masstree 流程由对应负责人交付。
+
+`scheduler_model_closure_integration_test` 启动正式 Scheduler/MDS 并恢复模型归档位置后，以 `--optical_read_enabled=true` 挂载真实 FUSE，通过独立 `zbctl stage submit/wait` 进程准备文件后执行 POSIX 读取。构建该测试须包含 `zbctl`。这是完整软件调用链；读取内容为声明的模型生成数据。
+
+`scheduler_real_drain_integration_test` 启动真实 Scheduler/MDS/磁盘服务，四个并发写请求与退役请求竞争；确认普通写、复制写、写计划和文件提交均受门禁保护，源进程异常重启后仍关闭；新增目标后继续迁移，验证目标元数据版本接续、源清理、CMS 零引用和迁移后继续写。该用例使用隔离临时数据，不驱动硬件电源。
 
 Python 内部模块通过包相对导入复用，不直接运行内部文件。`fixtures/time_simulator_trace.csv` 是可直接传给 `--trace` 的最小 T04 格式示例，不是实验结果。
 
-`python/support.py` 固定以本测试目录定位结果和样例，不依赖调用者当前目录。`environment.json` 中的 `test_source_sha256` 以本目录为基准记录 T03 公开入口及支撑模块的相对路径；模块回归由 CTest 单独管理。
+`python/support.py` 固定以本测试目录定位结果和样例，不依赖调用者当前目录。`environment.json` 中的 `test_source_sha256` 以本目录为基准记录 T03 公开入口及支撑模块的相对路径。
 
 已知跨模块缺陷统一记录在 [docs/issues](../../docs/issues/fuse-concurrent-write-20260915.md)。原有 `REPORT-*.md` 已移到本地 `results/reports/`；历史结果保持原样，不因本次目录整理重写。
 
@@ -41,7 +49,7 @@ Python 内部模块通过包相对导入复用，不直接运行内部文件。`
 依赖项目已有的 CMake、C++ 工具链、bundled RocksDB/brpc、FUSE 开发库及 Python 3.9+。Python 工具只用标准库，不需要额外安装 SDK。HTTP RPC 使用 brpc 自带 protobuf JSON 接口，`bytes` 按 base64 传输。
 
 ```bash
-cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DPORTABLE=ON
 cmake --build build-release -j4
 ctest --test-dir build-release --output-on-failure
 
@@ -50,12 +58,14 @@ python3 tests/scheduler/run.py simulation
 python3 tests/scheduler/run.py meter-closure --files 1000
 ```
 
+项目默认使用 RocksDB portable 构建，CI 也显式指定 `-DPORTABLE=ON`。已有构建目录如缓存了 `PORTABLE=0`，须用上面的命令覆盖后重建，避免 `-march=native` 产物在不同 CPU 的 runner/节点上启动即收到 SIGILL。仅在编译与部署 CPU 确定兼容时才显式使用 `-DPORTABLE=0`。复核 CI 问题应使用 Release 及上述系统测试，不以 Debug 结果替代。
+
 `local` 启动独立端口的 Scheduler、MDS/CMS 和默认两个真实存储节点进程；`--optical-check` 额外启动新版光盘节点并验证库存未就绪时保持 JOINING。所有数据库、配置及节点数据均在本次结果目录中。结束时仅停止本工具启动的进程，文件保留。该环境是单服务器上的多进程功能实验，不是多台物理服务器的硬件性能验收。
 
-`scheduler_owner_smoke` 是开发回归，包含模型用例，**不能作为实际系统闭环验收**。实际验收运行 `real_system_smoke.py`：在指定的可写外存上创建唯一私有目录，启动真实 Scheduler、MDS/CMS、两个 `real_node_server` 和 FUSE；逐字节验证跨对象文件、后端对象文件、服务重启后的读回、排空迁移、CMS 零引用及退役后分配。它不运行模拟电表或仿真节点，也不声称测得物理功耗。
+`scheduler_system_closure` 运行上述三个独立进程集成用例，其中磁盘/光盘模型用例的数据是生成式数据，**不能替代真实外存验收**。真实外存验收运行 `real_system_smoke.py`：在指定的可写外存上创建唯一私有目录，启动真实 Scheduler、MDS/CMS、两个 `real_node_server` 和 FUSE；逐字节验证跨对象文件、后端对象文件、服务重启后的读回、排空迁移、CMS 零引用及退役后分配。它不运行模拟电表或仿真节点，也不声称测得物理功耗。
 
 ```bash
-ctest --test-dir build-release -L scheduler_owner_smoke --output-on-failure
+ctest --test-dir build-release -L scheduler_system_closure --output-on-failure
 python3 tests/scheduler/real_system_smoke.py --build build-release --external-root /mnt/md0
 ```
 

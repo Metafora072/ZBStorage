@@ -1,5 +1,6 @@
 #include "client/optical/OpticalReadClient.h"
 #include "optical_node.pb.h"
+#include "common/rpc/LogicalNodeRoute.h"
 #include <brpc/channel.h>
 #include <brpc/controller.h>
 #include <brpc/stream.h>
@@ -59,6 +60,8 @@ struct OpticalReadClient::Impl {
     struct Connection : brpc::StreamInputHandler {
         Impl* owner;
         std::string address;
+        std::string node_id;
+        uint64_t generation{0};
         brpc::Channel channel;
         std::mutex init_mu;
         uint64_t session_id{0};
@@ -66,7 +69,12 @@ struct OpticalReadClient::Impl {
         std::mutex close_mu;
         std::condition_variable close_cv;
         bool closed{false};
-        Connection(Impl* o, std::string a) : owner(o), address(std::move(a)) {}
+        Connection(Impl* o, const FileInfo& file)
+            : owner(o), address(file.node_address), node_id(file.node_id), generation(file.instance_generation) {}
+        void Route(brpc::Controller* controller) const {
+            if (!node_id.empty() && !zb::rpc_route::SetLogicalNodeRoute(controller, node_id, generation))
+                throw ClientError(EINVAL, "invalid logical optical node route");
+        }
         int on_received_messages(brpc::StreamId, butil::IOBuf* const messages[], size_t count) override {
             for (size_t i = 0; i < count; ++i) {
                 zb::rpc::ReadReadyEvent event;
@@ -121,13 +129,15 @@ struct OpticalReadClient::Impl {
     explicit Impl(Options o) : options(o) {
         if (o.rpc_timeout_ms <= 0) throw ClientError(EINVAL, "RPC timeout must be positive");
     }
-    std::shared_ptr<Connection> Connect(const std::string& address) {
+    std::shared_ptr<Connection> Connect(const FileInfo& file) {
+        const auto& address = file.node_address;
+        const std::string key = address + "\n" + file.node_id + "\n" + std::to_string(file.instance_generation);
         std::shared_ptr<Connection> c;
         {
             std::lock_guard<std::mutex> lock(mu);
             if (stopped) throw ClientError(ESHUTDOWN, "optical client stopped");
-            auto& slot = connections[address];
-            if (!slot) slot = std::make_shared<Connection>(this, address);
+            auto& slot = connections[key];
+            if (!slot) slot = std::make_shared<Connection>(this, file);
             c = slot;
         }
         std::lock_guard<std::mutex> lock(c->init_mu);
@@ -140,6 +150,7 @@ struct OpticalReadClient::Impl {
             throw ClientError(EIO, "cannot initialize optical channel: " + address);
         { std::lock_guard<std::mutex> closing(c->close_mu); c->closed = false; }
         brpc::Controller controller;
+        c->Route(&controller);
         brpc::StreamOptions stream_options;
         stream_options.handler = c.get();
         stream_options.idle_timeout_ms = -1;
@@ -216,7 +227,9 @@ const std::string& OpticalReadClient::instance_id() const { return impl_->instan
 PrepareHandle OpticalReadClient::Prepare(const FileInfo& file, const std::string& path) {
     if (!file.inode_id || file.node_address.empty() || file.disk_id.empty() || file.image_id.empty() || path.empty())
         throw ClientError(EINVAL, "incomplete optical file information");
-    auto c = impl_->Connect(file.node_address);
+    if (!file.node_id.empty() && file.instance_generation == 0)
+        throw ClientError(EINVAL, "logical optical node requires an instance generation");
+    auto c = impl_->Connect(file);
     auto r = std::make_shared<Impl::Record>();
     r->file = file;
     r->key = Key(file.inode_id, file.file_version);
@@ -229,7 +242,8 @@ PrepareHandle OpticalReadClient::Prepare(const FileInfo& file, const std::string
             const auto& old = *existing->second;
             if ((old.state == Impl::State::Accepted || old.state == Impl::State::Ready) &&
                 old.file.node_address == file.node_address && old.file.disk_id == file.disk_id &&
-                old.file.image_id == file.image_id && old.file.file_size == file.file_size)
+                old.file.image_id == file.image_id && old.file.file_size == file.file_size &&
+                old.file.node_id == file.node_id && old.file.instance_generation == file.instance_generation)
                 return old.result.handle; // Repeated prepare reuses the node-owned cached result.
             throw ClientError(EEXIST, "file already has an active preparation");
         }
@@ -248,6 +262,7 @@ PrepareHandle OpticalReadClient::Prepare(const FileInfo& file, const std::string
     if (file.file_version) request.set_file_version(*file.file_version);
     zb::rpc::PrepareReadReply reply;
     brpc::Controller controller;
+    c->Route(&controller);
     zb::rpc::OpticalNodeService_Stub stub(&c->channel);
     try {
         stub.PrepareRead(&controller, &request, &reply, nullptr);
@@ -304,6 +319,7 @@ OpticalReadClient::Session OpticalReadClient::Open(uint64_t inode, std::optional
     request.set_task_id(r->task_id);
     zb::rpc::AcquireReadSessionReply reply;
     brpc::Controller controller;
+    r->connection->Route(&controller);
     zb::rpc::OpticalNodeService_Stub stub(&r->connection->channel);
     stub.AcquireReadSession(&controller, &request, &reply, nullptr);
     if (!controller.Failed() && reply.has_status() && reply.status().code() == zb::rpc::OPTICAL_NOT_FOUND) {
@@ -357,6 +373,7 @@ size_t OpticalReadClient::Read(const Session& s, uint64_t offset, size_t size, c
         request.set_size(chunk);
         zb::rpc::ReadPreparedFileReply reply;
         brpc::Controller controller;
+        s->record->connection->Route(&controller);
         {
             metrics::RpcLatencyScope timing(trace, metrics::RpcTarget::DataNode);
             stub.ReadPreparedFile(&controller, &request, &reply, nullptr);
@@ -382,6 +399,7 @@ void OpticalReadClient::Close(const Session& s) {
     request.set_read_handle(s->read_handle);
     zb::rpc::ReleaseReadSessionReply reply;
     brpc::Controller controller;
+    s->record->connection->Route(&controller);
     zb::rpc::OpticalNodeService_Stub stub(&s->record->connection->channel);
     stub.ReleaseReadSession(&controller, &request, &reply, nullptr);
     Check(controller, reply, true);
@@ -404,6 +422,7 @@ void OpticalReadClient::Release(const PrepareHandle& handle) {
     request.set_task_id(r->task_id);
     zb::rpc::ReleasePreparedReadReply reply;
     brpc::Controller controller;
+    r->connection->Route(&controller);
     zb::rpc::OpticalNodeService_Stub stub(&r->connection->channel);
     stub.ReleasePreparedRead(&controller, &request, &reply, nullptr);
     Check(controller, reply);

@@ -101,6 +101,31 @@ BrpcStorageService::BrpcStorageService(StorageServiceImpl* service,
                                        zb::metrics::NodeMetricsCollector* metrics)
     : service_(service), metrics_(metrics) {}
 
+void BrpcStorageService::InstallMigratedFile(google::protobuf::RpcController*,
+    const zb::rpc::InstallMigratedFileRequest* request, zb::rpc::InstallMigratedFileReply* response,
+    google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    if (!response) return;
+    const auto status = service_ && request && request->has_meta()
+        ? service_->InstallMigratedFile(request->node_id(), request->migration_id(),
+                                        request->disk_id(), ToInternalFileMeta(request->meta()))
+        : zb::msg::Status::InvalidArgument("missing migrated file metadata");
+    FillStatus(status, response->mutable_status());
+}
+
+void BrpcStorageService::BeginNodeDrain(google::protobuf::RpcController*,
+                                        const zb::rpc::BeginNodeDrainRequest* request,
+                                        zb::rpc::BeginNodeDrainReply* response,
+                                        google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    if (!response) return;
+    const auto status = service_ && request
+        ? service_->BeginDataDrain(request->node_id())
+        : zb::msg::Status::InvalidArgument("missing drain request or storage service");
+    FillStatus(status, response->mutable_status());
+    response->set_write_admission_closed(status.ok());
+}
+
 void BrpcStorageService::WriteObject(google::protobuf::RpcController* cntl_base,
                                      const zb::rpc::WriteObjectRequest* request,
                                      zb::rpc::WriteObjectReply* response,

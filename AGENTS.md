@@ -5,11 +5,12 @@
 ## GitHub 身份与分支
 
 - 上述工作统一使用 GitHub 用户 `musenhuo`，不能使用 `Metafora072` 或其他账号代为创建 PR。
+- 提交、推送与 PR 操作通过终端执行（`git` / `gh`），不使用 GitHub 连接器。
 - Git 提交身份使用 `musenhuo <113900758+musenhuo@users.noreply.github.com>`；仅设置当前仓库的 Git 配置，不修改全局配置。
 - 在独立的 Scheduler 功能分支上提交和推送，不直接推送 `main`。已有分支能承载本次工作时应复用，避免重复分支和 PR。
 - 推送前核验所用 SSH 身份为 `musenhuo`；提交作者、SSH 推送账号和 PR 发起账号是三个不同的核验项，不能相互替代。
-- 每次创建 PR 前必须查询实际 GitHub API/连接登录身份，确认其为 `musenhuo` 后才能创建。
-- 若 API/连接登录身份不是 `musenhuo`，停止创建 PR 并请用户切换连接。不能只修改 Git 的 `user.name`、PR 描述或分支名来冒充已切换账号；不能索取或输出私钥、Token。
+- 每次创建 PR 前必须通过终端查询实际 GitHub API 登录身份（例如 `gh api user --jq .login`），确认其为 `musenhuo` 后才能创建。
+- 若终端缺少 API 登录或登录身份不是 `musenhuo`，停止创建 PR 并请用户通过 GitHub CLI 授权或切换账号。不能只修改 Git 的 `user.name`、PR 描述或分支名来冒充已切换账号；不能索取或输出私钥、Token。
 - PR 创建后再次核验发起人为 `musenhuo`，且来源为本次 Scheduler 功能分支；没有创建成功时必须明确告知，不能把比较链接说成已创建的 PR。
 
 ## 交付内容

@@ -60,14 +60,18 @@ cmake --build build -j8 --target optical_node_archive_integration_test
 
 ## 四、运行
 
-### 方式 A：ctest（推荐）
+### 方式 A：ctest
+
+> **临时屏蔽**：综合用例 `optical_node` 在 `CMakeLists.txt` 中被临时加上 `DISABLED TRUE`，`ctest` 默认不执行它，
+> `ctest -R '^optical_node$'` 也会因该用例被禁用而选不到。只想单跑这个综合用例 → 用**方式 B**；
+> 要恢复随 `ctest` 一起跑 → 删掉那处 `DISABLED TRUE`（及其注释）并重新构建。
 
 ```bash
-# 综合用例（精确匹配用例名，避免误带上 codec 单测 optical_node_runtime_state_codec）
-ctest --test-dir build -R '^optical_node$' --output-on-failure
-
-# optical_node 相关的全部用例（综合集成 + codec 单测）
+# optical_node 相关的全部用例（codec 单测会执行；综合用例处于禁用态，被跳过）
 ctest --test-dir build -L optical_node -j1 --output-on-failure
+
+# 综合用例（精确匹配用例名；需先移除 DISABLED 属性才会执行）
+ctest --test-dir build -R '^optical_node$' --output-on-failure
 ```
 
 用例注册参数：
@@ -80,11 +84,15 @@ ctest --test-dir build -L optical_node -j1 --output-on-failure
 ctest 通过 `$<TARGET_FILE:optical_node_server>` 把真 server 二进制路径经驱动脚本传给综合用例
 （其中的 `C1` 上报测试点会 fork/exec 它），并与之建立构建依赖，无需手工准备。
 
-### 方式 B：python 驱动脚本（备语料 → 跑二进制 → 汇总）
+### 方式 B：python 驱动脚本（推荐；备语料 → 跑二进制 → 汇总）
+
+`optical_node` ctest 用例本质就是执行本脚本，因此**直接调用它即可单跑综合用例，不受上面的 ctest 禁用影响**：
 
 ```bash
 python3 tests/optical_node/run_optical_node_archive_test.py \
-  --driver "$PWD/build/optical_node_archive_integration_test"
+  --driver "$PWD/build/optical_node_archive_integration_test" \
+  --server-bin "$PWD/build/optical_node_server" \
+  --keep
 ```
 
 常用可选项：
@@ -92,6 +100,7 @@ python3 tests/optical_node/run_optical_node_archive_test.py \
 | 参数 | 说明 |
 | --- | --- |
 | `--driver` | C++ 测试二进制路径，**必须是绝对路径**（脚本会把工作目录切到工作目录下再执行） |
+| `--server-bin` | 真 `optical_node_server` 二进制路径（绝对路径）；`C1` 节点上报测试点会 fork/exec 它，不传则打印 `[SKIP] C1` |
 | `--work-dir` | 工作目录，默认 `tests/optical_node/results/optical_node-<时间戳>` |
 | `--keep` | 成功时也保留 `corpus/`、`archive/` 与 `reporting/`（默认成功后只保留 `output.log`，失败则全部保留） |
 

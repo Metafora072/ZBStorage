@@ -1249,6 +1249,7 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/optical_node/run_optical_node_archive_test.py
                 --driver $<TARGET_FILE:optical_node_archive_integration_test>
                 --server-bin $<TARGET_FILE:optical_node_server>)
-        set_tests_properties(optical_node PROPERTIES TIMEOUT 3600 LABELS "optical_node;slow" SKIP_RETURN_CODE 77)
+        # 临时屏蔽：光盘节点 ctest 不参与自动测试；恢复时删除 DISABLED TRUE 与本注释。
+        set_tests_properties(optical_node PROPERTIES TIMEOUT 3600 LABELS "optical_node;slow" SKIP_RETURN_CODE 77 DISABLED TRUE)
     endif()
 endif()

@@ -22,6 +22,7 @@
 #include <volume_manager/serializer.h>
 
 #include <brpc/channel.h>
+#include "common/metrics/NodeMetricsCollector.h"
 #include "real_node.pb.h"
 #include "scheduler.pb.h"
 
@@ -479,7 +480,8 @@ namespace optical_node_manager {
                                            uint32_t standard_images_per_disc,
                                            uint64_t disc_block_size_bytes,
                                            uint32_t max_write_images,
-                                           const std::string& scheduler_addr)
+                                           const std::string& scheduler_addr,
+                                           cd_manager_sim::CDManagerConfig cd_manager_config)
         : volume_manager_(volume_size, size_threshold),
           cd_read_task_queue_(new WR_task::WRTaskQueue()),
           zip_task_queue_(new WR_task::WRTaskQueue()),
@@ -495,6 +497,7 @@ namespace optical_node_manager {
         disc_capacity_bytes_ = disc_capacity_bytes;
         standard_images_per_disc_ = standard_images_per_disc;
         disc_block_size_bytes_ = disc_block_size_bytes;
+        cd_manager_config_ = std::move(cd_manager_config);
         max_write_images_ = max_write_images < 1 ? 1 : max_write_images;
     }
 
@@ -565,6 +568,59 @@ namespace optical_node_manager {
                   std::to_string(backpressure.input_pending_limit);
         detail += ")";
         return detail;
+    }
+
+    OpticalLibraryInventory OpticalNodeManager::GetInventory() const {
+        OpticalLibraryInventory inv;
+        // 静态硬件属性（光驱总数、盘片槽位）以配置为准——与注册使用同一来源，
+        // 避免组件侧归一导致“注册值 ≠ 库存值”的双真源。
+        inv.drive_total = static_cast<uint32_t>(std::max(1, cd_manager_config_.num_drives));
+        inv.disc_count = cd_manager_config_.total_disc_count;
+        inv.slot_count = cd_manager_config_.slot_count;
+        // 运行时属性以 cd_manager 为准：忙光驱、已用盘数、正在执行的刻录任务数。
+        if (cd_manager_ != nullptr) {
+            inv.drive_busy = static_cast<uint32_t>(cd_manager_->BusyDriveCount());
+            inv.disc_used = cd_manager_->UsedDiscCount();
+            inv.disc_burning = static_cast<uint64_t>(cd_manager_->ActiveBurnTaskCount());
+        }
+        // 暂存区：image_dir 的容量/占用（单位为镜像数）。
+        // 容量以 SpaceManager 运行态为唯一真源；尚未就绪时回退到构造配置，保证对外上报的容量始终有效。
+        inv.staging_capacity_images = capacity_in_images_;
+        if (space_manager_ != nullptr) {
+            space_manager::ImageDirStats stats{};
+            if (space_manager_->GetStats(stats) == volumemanager::ErrorCode::SUCCESS) {
+                inv.staging_capacity_images = stats.capacity_images;
+                inv.staging_used_images = stats.used_images;
+                inv.staging_write_images = stats.write_images;
+                inv.staging_read_images = stats.read_images;
+            }
+        }
+        // 后台任务：按类型统计非终态读/写任务（刻录任务数已由 cd_manager 提供）。
+        if (task_map_ != nullptr) {
+            for (const WR_task::WRTask& task : task_map_->SnapshotAll()) {
+                if (task.isTaskTerminal()) {
+                    continue;
+                }
+                switch (task.type) {
+                    case WR_task::WRTaskType::READ:
+                    case WR_task::WRTaskType::CD_READ:
+                        ++inv.pending_read_tasks;
+                        break;
+                    case WR_task::WRTaskType::WRITE:
+                        ++inv.pending_write_tasks;
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+        return inv;
+    }
+
+    void OpticalNodeManager::SetMetricsCollectors(zb::metrics::NodeMetricsCollector* cache_hit,
+                                                  zb::metrics::NodeMetricsCollector* disc) {
+        metrics_cache_hit_ = cache_hit;
+        metrics_disc_ = disc;
     }
 // #endregion
 
@@ -927,7 +983,7 @@ namespace optical_node_manager {
             cd_manager_.reset();
         }
 
-        cd_manager_sim::CDManagerConfig config{};
+        cd_manager_sim::CDManagerConfig config = cd_manager_config_;
         config.workspace_root = disc_sim_dir_;
         try {
             cd_manager_ = std::make_unique<cd_manager_sim::CDManager>(config);
@@ -1116,9 +1172,9 @@ namespace optical_node_manager {
 
     // 把运行期内存态写入 log/runtime_state_snapshot：
     //   [RuntimeStateMetaHeader][kCounters][kAvailableIds][kTasks][kQueues]
-    //   [kArchiveQueue][kVolumeReadIndex][kPendingFiles][kImages]
+    //   [kArchiveQueue][kVolumeReadIndex][kPendingFiles][kImages][kDiscUsage]
     // 不落盘的状态（重启后由任务 + 磁盘产物重放恢复）：
-    //   pending_pack_inode_ids_（单步临时集合）、cd_manager 活跃任务。
+    //   pending_pack_inode_ids_（单步临时集合）、cd_manager 活跃任务与总光盘数。
     bool OpticalNodeManager::PersistRuntimeState() {
         if (log_dir_.empty()) {
             last_sidecar_failure_reason_buf_ = FormatFailureDetail(
@@ -1293,6 +1349,16 @@ namespace optical_node_manager {
                 AppendU32(payload, static_cast<uint32_t>(image.category));
             }
             append_section(RuntimeStateSectionTag::kImages, payload);
+        }
+
+        // ⑨ 光盘使用计数：只落已使用光盘数（每完成一张盘刻录 +1）。
+        //    总光盘数由启动配置决定、运行期不变，不落盘。
+        {
+            std::vector<uint8_t> payload;
+            const uint64_t used_disc_count =
+                (cd_manager_ != nullptr) ? cd_manager_->UsedDiscCount() : 0;
+            AppendU64(payload, used_disc_count);
+            append_section(RuntimeStateSectionTag::kDiscUsage, payload);
         }
 
         RuntimeStateMetaHeader header;
@@ -1831,7 +1897,19 @@ namespace optical_node_manager {
             }
         }
 
-        // ⑩ ID 计数对齐与可用 ID 池去重。
+        // ⑩ 光盘使用计数：把快照里的已使用光盘数注入 cd_manager。
+        //    总光盘数由启动配置决定、不落盘；段缺失（旧快照 / 首次启动）时保持 0。
+        if (auto it = find_section(RuntimeStateSectionTag::kDiscUsage); it != sections.end()) {
+            uint64_t used_disc_count = 0;
+            if (!it->second.ReadU64(&used_disc_count)) {
+                last_sidecar_failure_reason_buf_ = FormatFailureDetail(
+                    start_failure_phase::kLoadRuntimeState, "disc_usage_truncated");
+            } else if (cd_manager_ != nullptr) {
+                cd_manager_->SetUsedDiscCount(used_disc_count);
+            }
+        }
+
+        // ⑪ ID 计数对齐与可用 ID 池去重。
         //    即使快照缺失也要做：计数器若从 1 重来，MoveFrom 的 rename 会覆盖 image/
         //    中的 volume_<id>.vimg（文件被替换），disc_<id>_meta / vdisc 同理。
         {
@@ -3274,6 +3352,14 @@ namespace optical_node_manager {
                 // 本轮下载量按文件原始大小累计（与卷镜像容量的口径一致）。
                 archive_round_downloaded_bytes_ += file.size;
 
+                // 写记账（I/O）：一次归档下载记为一次写操作，字节取文件原始大小，
+                // 表示由磁电节点到光盘节点的数据 I/O，计入 disc 路径（归档写盘侧）。
+                const uint64_t written_bytes = static_cast<uint64_t>(file.size);
+                if (metrics_disc_ != nullptr) {
+                    auto write_op = metrics_disc_->Start(zb::metrics::OperationKind::kWrite);
+                    write_op.SetBytes(written_bytes);
+                }
+
                 if (!SubmitWriteTaskForArchive(file.inode_id, relative_path)) {
                     // 队列已关闭 / 正在停止：清理已下载文件，避免残留，并退出消费循环。
                     ::unlink((input_file_dir_ + relative_path).c_str());
@@ -3423,6 +3509,12 @@ namespace optical_node_manager {
                         " volume_id=" + std::to_string(read_volume_id) +
                         " task_id=" + std::to_string(event.task_id));
                 } else {
+                    // 光盘读记账（I/O）：一次 DISC miss 的镜像回读，字节为从光盘读出的镜像大小，
+                    // 计入 optical-disc 访问路径，与缓存命中的区间读分开统计。
+                    if (metrics_disc_ != nullptr) {
+                        auto disc_op = metrics_disc_->Start(zb::metrics::OperationKind::kRead);
+                        disc_op.SetBytes(location.image_size_bytes);
+                    }
                     // 3. 校验提取内容与元数据记录的 SHA-256 一致（镜像级完整性校验）。
                     std::string extracted_sha256;
                     if (!space_manager::Sha256FileHex(extracted_path, &extracted_sha256) ||

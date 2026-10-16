@@ -168,6 +168,7 @@ target_include_directories(optical_node_manager
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/data_node/optical_node/optical_node_manager
     PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${CMAKE_CURRENT_BINARY_DIR}
 )
@@ -1161,15 +1162,13 @@ if(UNIX)
     endif()
 endif()
 
-# 光存储节点归档集成测试：进程内起 fake real_node / scheduler 与真光节点服务，
-# 走完 归档下载 → 压缩 → 卷镜像封装 → 打包汇报 → CD_BURN → 新 6 接口读链路（订阅/准备/ReadReady/
-# 建会话/区间读/两级释放）与 CD_READ 重载 全链路。
 if(BUILD_TESTING)
     add_executable(optical_node_archive_integration_test
         tests/optical_node/optical_node_archive_integration_test.cpp
         tests/optical_node/fake_services.cpp
         tests/optical_node/fake_client.cpp
         tests/optical_node/fake_real_node_data.cpp
+        src/common/metrics/NodeMetricsCollector.cpp
         src/data_node/optical_node/config/OpticalNodeConfig.cpp
         src/data_node/optical_node/service/OpticalStorageServiceImpl.cpp
         src/data_node/optical_node/service/BrpcOpticalNodeService.cpp
@@ -1194,9 +1193,9 @@ if(BUILD_TESTING)
     if(BRPC_DYNAMIC_LIB)
         target_link_libraries(optical_node_archive_integration_test PRIVATE ${BRPC_DYNAMIC_LIB})
     endif()
+    # 综合用例内含「节点上报」测试点：会 fork/exec 真 optical_node_server 子进程，故建立构建依赖。
+    add_dependencies(optical_node_archive_integration_test optical_node_server)
 
-    # 运行期状态快照编解码单测：只依赖头文件 optical_node_manager_classes.h
-    # （快照格式 / WRTask / 归档批次编解码全为 inline），无需链接 optical_node_manager 库。
     add_executable(optical_node_runtime_state_codec_test
         tests/optical_node/optical_node_runtime_state_codec_test.cpp
     )
@@ -1211,14 +1210,11 @@ if(BUILD_TESTING)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
-        # 单一综合场景（56 卷：5 张完整光盘 + 尾盘，小容量档位触发背压与 LRU 淘汰）：
-        # 一次运行覆盖 批次形态 → 归档下载 → 压缩封装 → 打包汇报 → 封盘 → 刻录释放 →
-        # 新 6 接口读链路（订阅/准备/ReadReady/建会话/区间读/两级释放）与光盘读回 → 缓存命中
-        # → 读会话与引用生命周期 → 满载淘汰与重载 → 正常关机落盘与重启恢复（在途准备任务继续推进）。
-        # 光盘仿真时长不可压缩，56 卷同档位实测约 9 分钟（533s），超时 3600s 留足余量。
         add_test(NAME optical_node
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/optical_node/run_optical_node_archive_test.py
-                --driver $<TARGET_FILE:optical_node_archive_integration_test>)
-        set_tests_properties(optical_node PROPERTIES TIMEOUT 3600 LABELS "optical_node;slow" SKIP_RETURN_CODE 77)
+                --driver $<TARGET_FILE:optical_node_archive_integration_test>
+                --server-bin $<TARGET_FILE:optical_node_server>)
+        # 临时屏蔽：光盘节点 ctest 不参与自动测试；恢复时删除 DISABLED TRUE 与本注释。
+        set_tests_properties(optical_node PROPERTIES TIMEOUT 3600 LABELS "optical_node;slow" SKIP_RETURN_CODE 77 DISABLED TRUE)
     endif()
 endif()

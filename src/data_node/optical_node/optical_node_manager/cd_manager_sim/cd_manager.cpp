@@ -12,6 +12,7 @@
 #include <random>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -29,6 +30,12 @@ Duration SecondsToDuration(double seconds) {
         return Duration::zero();
     }
     return std::chrono::duration_cast<Duration>(std::chrono::duration<double>(seconds));
+}
+
+// 货架某一维的随机下标上界（含）：维度 <= 1 时退化为 0（单一槽位）。
+int RackIndexBound(double dimension) {
+    const int cells = static_cast<int>(dimension);
+    return cells > 1 ? cells - 1 : 0;
 }
 
 }  // namespace
@@ -102,9 +109,11 @@ struct CDManager::Impl {
     explicit Impl(CDManagerConfig cfg)
         : config(std::move(cfg)),
           rng(std::random_device{}()),
-          dist_row(0, static_cast<int>(kRackRows) - 1),
-          dist_col(0, static_cast<int>(kRackCols) - 1),
-          dist_depth(0, static_cast<int>(kRackDepth) - 1) {}
+          dist_row(0, RackIndexBound(config.rack_rows)),
+          dist_col(0, RackIndexBound(config.rack_cols)),
+          dist_depth(0, RackIndexBound(config.rack_depth)) {
+        total_disc_count_ = std::max<uint64_t>(1, config.total_disc_count);
+    }
 
     CDManagerConfig config;
     mutable std::mutex mutex;
@@ -124,25 +133,15 @@ struct CDManager::Impl {
                         std::greater<BurnCompleteDeadline>> burn_complete_heap;
     bool schedule_dirty = false;
 
+    // 库内总光盘数（构造时由 config 初始化，运行期不变）与已使用光盘数
+    // （每完成一张盘的刻录 +1；由上层写入快照并在重启时通过 SetUsedDiscCount 注入）。
+    uint64_t total_disc_count_ = 0;
+    uint64_t used_disc_count_ = 0;
+
     std::mt19937 rng;
     std::uniform_int_distribution<int> dist_row;
     std::uniform_int_distribution<int> dist_col;
     std::uniform_int_distribution<int> dist_depth;
-
-    static constexpr double kTimeGraspSeconds = 2.0;
-    static constexpr double kTimeDriveLoadSeconds = 12.0;
-    static constexpr double kTimeDriveEjectSeconds = 3.0;
-    static constexpr double kTimeReadFixedSeconds = 0.5;
-    static constexpr double kReadBandwidthMbPerSecond = 100.0;
-    static constexpr double kArmSpeedX = 2.0;
-    static constexpr double kArmSpeedY = 1.0;
-    static constexpr double kArmSpeedZ = 1.0;
-    static constexpr double kRackRows = 50.0;
-    static constexpr double kRackCols = 200.0;
-    static constexpr double kRackDepth = 10.0;
-    static constexpr double kSlotWidth = 0.015;
-    static constexpr double kSlotHeight = 0.15;
-    static constexpr double kSlotDepth = 0.3;
 
     // Start/Stop 维护一个后台调度线程：
     // 线程只负责等待最早完成的任务并在到点后触发回调。
@@ -258,6 +257,49 @@ struct CDManager::Impl {
     std::size_t ActiveTaskCount() const {
         std::lock_guard<std::mutex> lock(mutex);
         return active_tasks.size();
+    }
+
+    // 返回库内总光盘数（启动时初始化，运行期不变）。
+    uint64_t TotalDiscCount() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return total_disc_count_;
+    }
+
+    // 返回已使用光盘数（每完成一张盘的刻录 +1）。
+    uint64_t UsedDiscCount() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return used_disc_count_;
+    }
+
+    // 注入已使用光盘数，供上层在重启时用快照值回填。
+    void SetUsedDiscCount(uint64_t count) {
+        std::lock_guard<std::mutex> lock(mutex);
+        used_disc_count_ = count;
+    }
+
+    // 返回当前被活动任务占用的光驱数：按 assigned_drive_index 去重，
+    // 同一光驱被多个任务短时共用（卸载与新任务重叠）时只计一次。
+    std::size_t BusyDriveCount() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::unordered_set<int> busy_drives;
+        for (const auto& pair : active_tasks) {
+            if (pair.second.assigned_drive_index >= 0) {
+                busy_drives.insert(pair.second.assigned_drive_index);
+            }
+        }
+        return busy_drives.size();
+    }
+
+    // 返回当前正在执行的写(刻录)任务数（active_tasks 中 type == BURN 的数量）。
+    std::size_t ActiveBurnTaskCount() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::size_t count = 0;
+        for (const auto& pair : active_tasks) {
+            if (pair.second.type == TaskType::BURN) {
+                ++count;
+            }
+        }
+        return count;
     }
 
     // 后台线程维护一个预测调度：
@@ -378,6 +420,11 @@ struct CDManager::Impl {
         }
 
         it->second.complete_notified = true;
+
+        // 一张盘刻录完成即视为占用一张盘片，累计已使用光盘数。
+        // complete_notified 保证同一任务只递增一次；未完成的刻录在重启后重刻时再计数，
+        // 因此与快照注入的历史计数不会重复。
+        ++used_disc_count_;
 
         BurnCompleteEvent event;
         event.task_id = it->second.burn_request.task_id;
@@ -633,9 +680,9 @@ struct CDManager::Impl {
             const TimePoint arm_ready = arm_available_at[arm_idx];
 
             const Duration outbound_move = CalculateArmMoveDuration(task.disc_location);
-            const double time_z = task.disc_location.z / kArmSpeedZ;
-            const double time_xy = std::max(task.disc_location.x / kArmSpeedX,
-                                            task.disc_location.y / kArmSpeedY);
+            const double time_z = task.disc_location.z / config.arm_speed_z;
+            const double time_xy = std::max(task.disc_location.x / config.arm_speed_x,
+                                            task.disc_location.y / config.arm_speed_y);
             const Duration inbound_move = SecondsToDuration(time_z + time_xy);
 
             const TimePoint drive_allocated_at = std::max(task.arrival_time, drive_ready);
@@ -679,15 +726,15 @@ struct CDManager::Impl {
         const int r = dist_row(rng);
         const int c = dist_col(rng);
         const int d = dist_depth(rng);
-        return Point3D(c * kSlotWidth, r * kSlotHeight, d * kSlotDepth);
+        return Point3D(c * config.slot_width, r * config.slot_height, d * config.slot_depth);
     }
 
     // 估算一次读请求的纯读取阶段耗时。
     // 入参为实际读取的字节数，而不是固定用 config.volume_size。
     Duration CalculateReadDuration(uint64_t read_size_bytes) const {
         const double read_file_size_mb = static_cast<double>(read_size_bytes) / (1024.0 * 1024.0);
-        const double transfer_time = read_file_size_mb / kReadBandwidthMbPerSecond;
-        return SecondsToDuration(kTimeReadFixedSeconds + transfer_time);
+        const double transfer_time = read_file_size_mb / config.read_bandwidth_mbps;
+        return SecondsToDuration(config.time_read_fixed_seconds + transfer_time);
     }
 
     // 估算一次刻录请求的纯刻录阶段耗时。
@@ -702,19 +749,20 @@ struct CDManager::Impl {
 
     // 返回光驱执行装盘动作的固定耗时。
     Duration CalculateDriveLoadDuration() const {
-        return SecondsToDuration(kTimeDriveLoadSeconds);
+        return SecondsToDuration(config.time_drive_load_seconds);
     }
 
     // 返回光驱执行退盘动作的固定耗时。
     Duration CalculateDriveEjectDuration() const {
-        return SecondsToDuration(kTimeDriveEjectSeconds);
+        return SecondsToDuration(config.time_drive_eject_seconds);
     }
 
     // 根据盘片所在三维坐标估算机械臂的单程移动时间。
     Duration CalculateArmMoveDuration(const Point3D& disc_location) const {
-        const double time_z = disc_location.z / kArmSpeedZ;
-        const double time_xy = std::max(disc_location.x / kArmSpeedX, disc_location.y / kArmSpeedY);
-        return SecondsToDuration(time_z + time_xy + kTimeGraspSeconds);
+        const double time_z = disc_location.z / config.arm_speed_z;
+        const double time_xy = std::max(disc_location.x / config.arm_speed_x,
+                                        disc_location.y / config.arm_speed_y);
+        return SecondsToDuration(time_z + time_xy + config.time_grasp_seconds);
     }
 
     // 在一组资源可用时间中找到最早空闲的那一个。
@@ -772,6 +820,31 @@ bool CDManager::HasActiveTask(uint64_t task_id) const {
 // 返回当前处于内部模拟生命周期中的任务总数。
 std::size_t CDManager::ActiveTaskCount() const {
     return impl_->ActiveTaskCount();
+}
+
+// 返回库内总光盘数。
+uint64_t CDManager::TotalDiscCount() const {
+    return impl_->TotalDiscCount();
+}
+
+// 返回已使用光盘数。
+uint64_t CDManager::UsedDiscCount() const {
+    return impl_->UsedDiscCount();
+}
+
+// 注入已使用光盘数（重启恢复用）。
+void CDManager::SetUsedDiscCount(uint64_t count) {
+    impl_->SetUsedDiscCount(count);
+}
+
+// 返回当前忙光驱数。
+std::size_t CDManager::BusyDriveCount() const {
+    return impl_->BusyDriveCount();
+}
+
+// 返回当前正在执行的写(刻录)任务数。
+std::size_t CDManager::ActiveBurnTaskCount() const {
+    return impl_->ActiveBurnTaskCount();
 }
 
 }  // namespace cd_manager_sim

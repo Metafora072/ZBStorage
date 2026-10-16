@@ -51,11 +51,35 @@ struct BurnCompleteEvent {
 struct CDManagerConfig {
     int num_drives = 20;
     int num_arms = 4;
+    // 库内光盘数量（对应 Scheduler 的 local_disc_count）。启动时初始化，运行期不变；
+    // 0 或非法值按 1 生效。
+    uint64_t total_disc_count = 1000;
+    // 光盘库槽位数（光盘架总槽数，对应 Scheduler 的 total_slots）。应 >= total_disc_count。
+    uint64_t slot_count = 100000;
     uint64_t volume_size = 1024ULL * 1024ULL * 1024ULL;
     // 刻录相关参数
     uint64_t burn_image_size = 10ULL * 1024ULL * 1024ULL * 1024ULL;  // 默认10GB镜像大小
     double burn_bandwidth_mbps = 20.0;  // 刻录带宽 MB/s
     double time_burn_fixed_seconds = 1.0;  // 刻录固定延迟
+    // 读盘相关参数
+    double read_bandwidth_mbps = 100.0;    // 读盘带宽 MB/s
+    double time_read_fixed_seconds = 0.5;  // 读盘固定延迟
+    // 光驱 / 机械臂动作耗时（秒）
+    double time_drive_load_seconds = 12.0;   // 装盘
+    double time_drive_eject_seconds = 3.0;   // 退盘
+    double time_grasp_seconds = 2.0;         // 抓取
+    // 机械臂移动速度（米/秒）
+    double arm_speed_x = 2.0;
+    double arm_speed_y = 1.0;
+    double arm_speed_z = 1.0;
+    // 货架几何（行/列/深度，用于随机盘位分配）
+    double rack_rows = 50.0;
+    double rack_cols = 200.0;
+    double rack_depth = 10.0;
+    // 单个盘位尺寸（米），用于机械臂移动距离估算
+    double slot_width = 0.015;
+    double slot_height = 0.15;
+    double slot_depth = 0.3;
     std::string workspace_root = "/tmp/cd_manager/";
 };
 
@@ -104,6 +128,22 @@ public:
 
     // ActiveTaskCount() 返回当前仍由 cd_manager 管理的活跃任务数量。
     std::size_t ActiveTaskCount() const;
+
+    // TotalDiscCount() 返回库内总光盘数（由 CDManagerConfig::total_disc_count 在
+    // 启动时初始化，运行期不变）。
+    uint64_t TotalDiscCount() const;
+
+    // UsedDiscCount() 返回已使用光盘数：每完成一张盘的刻录后递增一次。
+    uint64_t UsedDiscCount() const;
+
+    // SetUsedDiscCount() 注入已使用光盘数，供上层在重启时用快照值回填。
+    void SetUsedDiscCount(uint64_t count);
+
+    // BusyDriveCount() 返回当前被活动任务占用的光驱数（按 assigned_drive_index 去重）。
+    std::size_t BusyDriveCount() const;
+
+    // ActiveBurnTaskCount() 返回当前正在执行的写（刻录）任务数。
+    std::size_t ActiveBurnTaskCount() const;
 
 private:
     struct Impl;

@@ -12,8 +12,11 @@
 //     → 满载后的 LRU 淘汰与重新提取
 //     → 正常关机落盘（log/runtime_state_snapshot）→ 以同一 archive_root 重启恢复
 //       → 在途准备任务继续推进到可读并被读回
+//     → 节点上报（C1）：以真 optical_node_server 子进程验证一次性注册 / 周期心跳+设备清单 / 光盘库状态
+//       （上报组件是 server 启动期逻辑，进程内综合场景触发不到；子进程复用本用例的假 scheduler 作为上报终点）
 //
-// 用法: optical_node_archive_integration_test --corpus <dir> --work-dir <dir>
+// 用法: optical_node_archive_integration_test --corpus <dir> --work-dir <dir> [--server-bin <optical_node_server>]
+//       （--server-bin 为空则跳过 C1；ctest 由驱动脚本自动传入。）
 // 输出: 全程日志写到 stderr（由 run_optical_node_archive_test.py 落盘为 <work-dir>/output.log）。
 //       日志按"测试点"组织：
 //         [CASE] A3.1 第 1/12 卷：数据面读 + CD_READ 重载
@@ -33,16 +36,24 @@
 #include "BrpcOpticalNodeService.h"
 #include "OpticalStorageServiceImpl.h"
 
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -71,6 +82,19 @@ constexpr uint8_t kAvailableIdCount = 5;
 // 读会话单次读取上限（OpticalNodeManager::kMaxReadBytes）。PrepareRead 成功后
 // AcquireReadSession 返回的 max_read_bytes 必须等于该值且 > 0。
 constexpr uint32_t kExpectedMaxReadBytes = 4u * 1024 * 1024;
+
+// 「节点上报」测试点（C1）：以真 optical_node_server 子进程（配置指向本用例内的假 scheduler）
+// 验证注册 / 心跳+设备清单 / 光盘库状态。以下为该子进程临时配置的取值与等待上限。
+constexpr const char* kReportingNodeId = "optical-report-1";
+constexpr uint32_t kReportingHeartbeatMs = 200;
+constexpr uint64_t kReportingVolumeSizeBytes = 10ull * 1024 * 1024;
+constexpr uint64_t kReportingCapacityInImages = 14;
+constexpr uint64_t kReportingDiscCapacityBytes = 100ull * 1024 * 1024;
+constexpr uint64_t kReportingTotalDiscCount = 1000;
+constexpr uint64_t kReportingSlotCount = 100000;
+constexpr uint32_t kReportingDriveCount = 20;
+constexpr int kReportingStartupMs = 30000;   // 子进程启动 → 首次注册/心跳
+constexpr int kReportingShutdownMs = 10000;  // SIGINT → 子进程退出
 
 // ---------------------------------------------------------------------------
 // 单一综合档位：容量约束参数只有一个取值，覆盖「写链路顺跑」与「容量满载边界」两类观察面。
@@ -259,6 +283,25 @@ constexpr const char* kCaseB2Method =
     "逐批次采样 GetArchiveStatusDetail() 的 backpressure 快照并累计"
     "（触发过/峰值/最近一次），以快照数值而非最终文件数作为判定与失败证据。";
 
+constexpr const char* kCaseC1Objective =
+    "验证光盘节点对调度器的上报链路（跑真 server 子进程，触发 server 启动期的注册与心跳逻辑）："
+    "启动阶段一次性 RegisterManagedNode（携带设备组/功率/光盘延迟，且不立即激活）；"
+    "运行期周期 ReportHeartbeat（含 hdd-cache / disc / optical-drive 设备清单）与"
+    " ReportOpticalLibraryStatus（盘片分类计数、暂存区、后台任务、忙光驱）；"
+    "无数据面 I/O 时不应上报 ReportNodeMetrics。";
+constexpr const char* kCaseC1Expectation =
+    "注册恰好发送一次且被确认；spec 的 kind=OPTICAL_LIBRARY、execution_mode=PHYSICAL、不参与普通放置、"
+    "activate_immediately=false、3 个设备组容量/数量与配置一致、功率四级非递增且峰值 >0、光盘延迟 >0；"
+    "收到心跳且 node_type=NODE_OPTICAL、就绪标志为真、设备清单含 1 个 hdd-cache（容量=CAPACITY_IN_IMAGES×VOLUME_SIZE）"
+    "+ 1 个 disc（容量=盘容量×盘数）+ DRIVE_COUNT 个 optical-drive；"
+    "收到光盘库状态且 observed=true、local_disc_count=TOTAL_DISC_COUNT、total_slots=SLOT_COUNT、"
+    "空库 blank=local 且 recorded=recording=defective=0、分类守恒、staging_capacity_bytes=CAPACITY_IN_IMAGES×VOLUME_SIZE；"
+    "ReportNodeMetrics 调用次数为 0；SIGINT 后子进程正常退出（exit=0）。";
+constexpr const char* kCaseC1Method =
+    "本用例内既有的假 scheduler 同时作为该子进程的上报终点：fork/exec 真 optical_node_server"
+    "（临时配置 SCHEDULER_ADDR 指向假 scheduler、--port=0），轮询其调用计数并对捕获的 brpc 请求逐字段断言，"
+    "结束后对子进程发 SIGINT 验证优雅退出；等待全部使用轮询（不使用固定 sleep），子进程日志落盘便于排障。";
+
 std::string NowString() {
     const std::time_t now = std::time(nullptr);
     char buf[32] = {0};
@@ -269,6 +312,9 @@ std::string NowString() {
 struct Options {
     std::string corpus_dir;
     std::string work_dir;
+    // 真 optical_node_server 二进制路径（可执行「节点上报」测试点 C1 时 fork/exec 它）；
+    // 为空则跳过 C1（仍完整跑其余全部测试点）。
+    std::string server_bin;
 };
 
 // 被测节点的工作目录（与 OpticalNodeManager::InitializeDir 的派生规则保持一致）。
@@ -291,13 +337,15 @@ Options ParseArgs(int argc, char** argv) {
     Options options;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--corpus" || arg == "--work-dir") {
+        if (arg == "--corpus" || arg == "--work-dir" || arg == "--server-bin") {
             Require(i + 1 < argc, "参数缺少取值: " + arg);
             const std::string value = argv[++i];
             if (arg == "--corpus") {
                 options.corpus_dir = value;
-            } else {
+            } else if (arg == "--work-dir") {
                 options.work_dir = value;
+            } else {
+                options.server_bin = value;
             }
         } else {
             std::cerr << "未知参数: " << arg << std::endl;
@@ -1150,6 +1198,86 @@ private:
     bool saw_write_overloaded_{false};
     bool saw_input_overloaded_{false};
 };
+
+// ---------------------------------------------------------------------------
+// 「节点上报」测试点（C1）的子进程辅助
+//
+// 上报组件（一次性注册 / 周期心跳）是 optical_node_server 的启动期逻辑，进程内综合用例触发不到；
+// 因此 C1 在本用例内 fork/exec 真 server 子进程，并复用本用例既有的假 scheduler 作为其上报终点。
+// ---------------------------------------------------------------------------
+
+pid_t g_reporting_child_pid = -1;
+
+// 收尸兜底：即便用例中途 Require 走 std::exit，也确保子进程被回收（SIGINT → 必要时 SIGKILL）。
+void ReapReportingChild() {
+    if (g_reporting_child_pid <= 0) {
+        return;
+    }
+    const pid_t pid = g_reporting_child_pid;
+    g_reporting_child_pid = -1;
+    // brpc 默认只对 SIGINT 注册优雅退出处理（SIGTERM 需 --graceful_quit_on_sigterm=true）。
+    ::kill(pid, SIGINT);
+    int status = 0;
+    for (int i = 0; i < kReportingShutdownMs / 50; ++i) {
+        if (::waitpid(pid, &status, WNOHANG) == pid) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ::kill(pid, SIGKILL);
+    ::waitpid(pid, &status, 0);
+}
+
+void WriteReportingConfig(const std::string& path,
+                          const std::string& scheduler_addr,
+                          const std::string& archive_root) {
+    std::ofstream out(path);
+    out << "# 由综合集成测试生成：节点上报测试点（C1）的子进程配置\n";
+    out << "NODE_ID=" << kReportingNodeId << "\n";
+    out << "SCHEDULER_ADDR=" << scheduler_addr << "\n";
+    out << "ARCHIVE_ROOT=" << archive_root << "\n";
+    out << "HEARTBEAT_INTERVAL_MS=" << kReportingHeartbeatMs << "\n";
+    out << "VOLUME_SIZE_BYTES=" << kReportingVolumeSizeBytes << "\n";
+    out << "CAPACITY_IN_IMAGES=" << kReportingCapacityInImages << "\n";
+    out << "DISC_CAPACITY_BYTES=" << kReportingDiscCapacityBytes << "\n";
+    out << "TOTAL_DISC_COUNT=" << kReportingTotalDiscCount << "\n";
+    out << "SLOT_COUNT=" << kReportingSlotCount << "\n";
+    out << "DRIVE_COUNT=" << kReportingDriveCount << "\n";
+}
+
+// fork/exec 真 server（--port=0 由内核分配端口）；子进程 stdout/stderr 重定向到 log_path。
+bool SpawnReportingServer(const std::string& server_bin,
+                          const std::string& config_path,
+                          const std::string& log_path,
+                          std::string* error) {
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        if (error != nullptr) {
+            *error = std::string("fork 失败: ") + std::strerror(errno);
+        }
+        return false;
+    }
+    if (pid == 0) {
+        const int fd = ::open(log_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd >= 0) {
+            ::dup2(fd, STDOUT_FILENO);
+            ::dup2(fd, STDERR_FILENO);
+            if (fd > STDERR_FILENO) {
+                ::close(fd);
+            }
+        }
+        std::string config_arg = "--config=" + config_path;
+        std::string port_arg = "--port=0";
+        char* child_argv[] = {const_cast<char*>(server_bin.c_str()),
+                              const_cast<char*>(config_arg.c_str()),
+                              const_cast<char*>(port_arg.c_str()), nullptr};
+        ::execv(server_bin.c_str(), child_argv);
+        // execv 失败：仅退出子进程；父进程会因收不到上报而超时失败，日志见 log_path。
+        _exit(127);
+    }
+    g_reporting_child_pid = pid;
+    return true;
+}
 
 int RunOpticalNodeTest(const Options& options) {
     const auto run_begin = std::chrono::steady_clock::now();
@@ -2062,6 +2190,182 @@ int RunOpticalNodeTest(const Options& options) {
     {
         CaseScope scope("A6", "归档中间态清理", kCaseA6Objective, kCaseA6Expectation, kCaseA6Method);
         ExpectCleanEndState(env);
+    }
+
+    // 测试点 C1：节点上报（一次性注册 / 心跳+设备清单 / 光盘库状态）。
+    // 上报组件是 optical_node_server 启动期逻辑，进程内综合用例触发不到；故 fork/exec 真 server 子进程，
+    // 并复用本用例既有的假 scheduler（scheduler / scheduler_server）作为其上报终点。
+    if (options.server_bin.empty()) {
+        std::cerr << "\n[SKIP] C1 调度器上报链路：未提供 --server-bin，跳过（其余测试点不受影响）"
+                  << std::endl;
+    } else {
+        CaseScope scope("C1", "调度器上报链路（注册 / 心跳+设备清单 / 光盘库状态）", kCaseC1Objective,
+                        kCaseC1Expectation, kCaseC1Method);
+        const std::string reporting_dir = options.work_dir + "/reporting";
+        const bool reporting_dir_ok = ::mkdir(reporting_dir.c_str(), 0755) == 0 || errno == EEXIST;
+        ExpectWithDetail(reporting_dir_ok, "上报子进程工作目录可创建（" + reporting_dir + "）",
+                         std::string("mkdir 失败: ") + std::strerror(errno));
+        const std::string config_path = reporting_dir + "/optical_node.conf";
+        const std::string archive_root = reporting_dir + "/archive/";
+        const std::string server_log = reporting_dir + "/server.log";
+
+        Step("写临时配置（SCHEDULER_ADDR=" + scheduler_server.Address() +
+             "）并启动真 server 子进程（--server-bin=" + options.server_bin + "）");
+        WriteReportingConfig(config_path, scheduler_server.Address(), archive_root);
+        std::string spawn_error;
+        Require(SpawnReportingServer(options.server_bin, config_path, server_log, &spawn_error),
+                "启动光学节点子进程" +
+                    (spawn_error.empty() ? std::string() : "；失败详情: " + spawn_error));
+        std::atexit(ReapReportingChild);
+
+        const bool registered = WaitFor([&] { return scheduler.register_calls.load() >= 1; },
+                                        kReportingStartupMs, "RegisterManagedNode 到达假 scheduler");
+        ExpectWithDetail(registered, "子进程启动阶段完成一次性注册",
+                         "超时未收到注册；子进程日志: " + server_log);
+        const bool heartbeated = WaitFor([&] { return scheduler.heartbeat_calls.load() >= 1; },
+                                         kReportingStartupMs, "ReportHeartbeat 到达假 scheduler");
+        ExpectWithDetail(heartbeated, "子进程周期心跳到达假 scheduler",
+                         "超时未收到心跳；子进程日志: " + server_log);
+        const bool statused =
+            WaitFor([&] { return scheduler.optical_status_calls.load() >= 1; }, kReportingStartupMs,
+                    "ReportOpticalLibraryStatus 到达假 scheduler");
+        ExpectWithDetail(statused, "子进程上报警光盘库状态",
+                         "超时未收到光盘库状态；子进程日志: " + server_log);
+
+        // 注册内容：身份、语义、设备组、功率。
+        ExpectEqualU64(static_cast<uint64_t>(scheduler.register_calls.load()), 1,
+                       "RegisterManagedNode 恰好发送一次（成功后不再重复注册）");
+        const zb::rpc::RegisterManagedNodeRequest reg = scheduler.RegisterSnapshot();
+        const zb::rpc::ManagedNodeSpec& spec = reg.spec();
+        ExpectWithDetail(spec.node_id() == kReportingNodeId,
+                         "注册 spec.node_id 与配置一致（=" + spec.node_id() + "）",
+                         "actual=" + spec.node_id() + " expected=" + std::string(kReportingNodeId));
+        Expect(spec.kind() == zb::rpc::MANAGED_KIND_OPTICAL_LIBRARY,
+               "注册 kind=MANAGED_KIND_OPTICAL_LIBRARY");
+        Expect(spec.execution_mode() == zb::rpc::MANAGED_EXECUTION_PHYSICAL,
+               "注册 execution_mode=MANAGED_EXECUTION_PHYSICAL");
+        Expect(!spec.participates_in_placement(),
+               "光盘库不参与普通副本放置（participates_in_placement=false）");
+        Expect(!reg.activate_immediately(),
+               "注册不立即激活（真实库存由心跳/库状态补齐后再进入 WORKING）");
+        ExpectEqualU64(static_cast<uint64_t>(spec.device_groups_size()), 3,
+                       "注册携带 3 个设备组（hdd-cache / disc / optical-drive）");
+        const zb::rpc::ManagedDeviceGroup* reg_cache = nullptr;
+        const zb::rpc::ManagedDeviceGroup* reg_disc = nullptr;
+        const zb::rpc::ManagedDeviceGroup* reg_drive = nullptr;
+        for (const zb::rpc::ManagedDeviceGroup& group : spec.device_groups()) {
+            if (group.name() == "hdd-cache") {
+                reg_cache = &group;
+            } else if (group.name() == "disc") {
+                reg_disc = &group;
+            } else if (group.name() == "optical-drive") {
+                reg_drive = &group;
+            }
+        }
+        Expect(reg_cache != nullptr && reg_cache->kind() == zb::rpc::MANAGED_DEVICE_HDD &&
+                   reg_cache->device_capacity_bytes() ==
+                       kReportingCapacityInImages * kReportingVolumeSizeBytes,
+               "注册 hdd-cache 组容量 = CAPACITY_IN_IMAGES × VOLUME_SIZE_BYTES");
+        Expect(reg_disc != nullptr && reg_disc->kind() == zb::rpc::MANAGED_DEVICE_DISC &&
+                   reg_disc->device_capacity_bytes() == kReportingDiscCapacityBytes &&
+                   reg_disc->device_count() == kReportingTotalDiscCount,
+               "注册 disc 组容量/数量 = DISC_CAPACITY_BYTES / TOTAL_DISC_COUNT");
+        Expect(reg_drive != nullptr && reg_drive->kind() == zb::rpc::MANAGED_DEVICE_OPTICAL_DRIVE &&
+                   reg_drive->device_count() == kReportingDriveCount,
+               "注册 optical-drive 组数量 = DRIVE_COUNT（=" + std::to_string(kReportingDriveCount) +
+                   "）");
+        Expect(spec.power().peak_milliwatts() >= spec.power().medium_milliwatts() &&
+                   spec.power().medium_milliwatts() >= spec.power().standby_milliwatts() &&
+                   spec.power().standby_milliwatts() >= spec.power().off_milliwatts() &&
+                   spec.power().peak_milliwatts() > 0,
+               "注册功率四级非递增且峰值 > 0（峰/中/待机/关）");
+        Expect(spec.optical_load_latency_us() > 0 && spec.optical_seek_latency_us() > 0,
+               "注册光盘装载/寻道延迟 > 0");
+
+        // 心跳内容：身份、就绪与设备清单。
+        const zb::rpc::HeartbeatRequest hb = scheduler.HeartbeatSnapshot();
+        ExpectWithDetail(hb.node_id() == kReportingNodeId &&
+                             hb.node_type() == zb::rpc::NODE_OPTICAL,
+                         "心跳身份正确（node_id / node_type=NODE_OPTICAL）",
+                         "node_id=" + hb.node_id() + " type=" +
+                             std::to_string(static_cast<int>(hb.node_type())));
+        Expect(hb.readiness_reported() && hb.initialization_complete() && hb.metadata_ready(),
+               "心跳声明已上报就绪且 initialization_complete/metadata_ready=true");
+        const zb::rpc::DiskHeartbeat* hb_cache = nullptr;
+        const zb::rpc::DiskHeartbeat* hb_disc = nullptr;
+        size_t hb_drives = 0;
+        for (const zb::rpc::DiskHeartbeat& disk : hb.disks()) {
+            if (disk.disk_id() == "hdd-cache") {
+                hb_cache = &disk;
+            } else if (disk.disk_id() == "disc") {
+                hb_disc = &disk;
+            } else if (disk.disk_id().rfind("optical-drive-", 0) == 0) {
+                ++hb_drives;
+            }
+        }
+        Expect(hb_cache != nullptr && hb_cache->device_kind() == zb::rpc::MANAGED_DEVICE_HDD &&
+                   hb_cache->capacity_bytes() == kReportingCapacityInImages * kReportingVolumeSizeBytes,
+               "心跳含 hdd-cache 设备（容量 = CAPACITY_IN_IMAGES × VOLUME_SIZE_BYTES）");
+        Expect(hb_disc != nullptr && hb_disc->device_kind() == zb::rpc::MANAGED_DEVICE_DISC &&
+                   hb_disc->capacity_bytes() == kReportingDiscCapacityBytes * kReportingTotalDiscCount,
+               "心跳含 disc 设备（容量 = DISC_CAPACITY_BYTES × TOTAL_DISC_COUNT）");
+        ExpectEqualU64(static_cast<uint64_t>(hb_drives), kReportingDriveCount,
+                       "心跳含 DRIVE_COUNT 个 optical-drive 设备条目");
+
+        // 光盘库状态内容：空库盘片分类计数、暂存区容量、忙光驱。
+        const zb::rpc::ReportOpticalLibraryStatusRequest ls = scheduler.LibraryStatusSnapshot();
+        const zb::rpc::ManagedOpticalLibraryStatus& st = ls.status();
+        ExpectWithDetail(ls.node_id() == kReportingNodeId && st.observed(),
+                         "库状态上报带 node_id 且 observed=true", "node_id=" + ls.node_id());
+        ExpectEqualU64(st.local_disc_count(), kReportingTotalDiscCount,
+                       "库状态 local_disc_count = TOTAL_DISC_COUNT");
+        ExpectEqualU64(st.total_slots(), kReportingSlotCount, "库状态 total_slots = SLOT_COUNT");
+        ExpectEqualU64(static_cast<uint64_t>(st.recorded_disc_count()), 0,
+                       "空库 recorded_disc_count = 0（未刻录任何盘）");
+        ExpectEqualU64(st.recording_disc_count(), 0, "空库 recording_disc_count = 0");
+        ExpectEqualU64(st.blank_disc_count(), kReportingTotalDiscCount,
+                       "空库 blank_disc_count = local（全部空白盘）");
+        ExpectEqualU64(st.defective_disc_count(), 0, "库状态 defective_disc_count = 0");
+        ExpectEqualU64(static_cast<uint64_t>(st.staging_capacity_bytes()),
+                       kReportingCapacityInImages * kReportingVolumeSizeBytes,
+                       "库状态 staging_capacity_bytes = CAPACITY_IN_IMAGES × VOLUME_SIZE_BYTES");
+        Expect(st.busy_drives() <= kReportingDriveCount,
+               "库状态 busy_drives 不超过光驱总数（=" + std::to_string(st.busy_drives()) + "/" +
+                   std::to_string(kReportingDriveCount) + "）");
+
+        // 无数据面 I/O：ReportCollectedMetrics 因无活动跳过，不产生指标上报。
+        ExpectEqualU64(static_cast<uint64_t>(scheduler.node_metrics_calls.load()), 0,
+                       "无数据面 I/O 时不上报 ReportNodeMetrics");
+
+        // SIGINT 优雅退出：brpc 默认对 SIGINT 注册优雅退出处理（RunUntilAskedToQuit 返回后
+        // 节点执行 reporter.Stop() + storage_service.Shutdown() 再退出，退出码 0）。
+        Step("对子进程发 SIGINT，验证优雅退出");
+        const pid_t pid = g_reporting_child_pid;
+        Require(pid > 0, "子进程 pid 有效");
+        g_reporting_child_pid = -1;  // 改由本分支显式收尸，避免 atexit 重复处理
+        ::kill(pid, SIGINT);
+        int status = 0;
+        pid_t done = 0;
+        const auto shutdown_begin = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - shutdown_begin <
+               std::chrono::milliseconds(kReportingShutdownMs)) {
+            done = ::waitpid(pid, &status, WNOHANG);
+            if (done == pid) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (done != pid) {
+            ::kill(pid, SIGKILL);
+            ::waitpid(pid, &status, 0);
+            Expect(false, "SIGINT 后子进程在 " + std::to_string(kReportingShutdownMs) + "ms 内退出");
+        } else {
+            const bool exited_normally = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+            ExpectWithDetail(exited_normally, "SIGINT 后子进程正常退出（exit=0）",
+                             "WIFEXITED=" + std::string(WIFEXITED(status) ? "true" : "false") +
+                                 " exit=" +
+                                 std::to_string(WIFEXITED(status) ? WEXITSTATUS(status) : -1));
+        }
     }
 
     const uint64_t elapsed_s = static_cast<uint64_t>(

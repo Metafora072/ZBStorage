@@ -73,7 +73,7 @@
 
 本组节点管理/Scheduler闭环已经完成。下列事项属于相邻模块或实验编排，不作为本组未完成项：
 
-- 指标生产者已接入主要数据 I/O 和 MDS 文件系统 RPC；更细的光盘 HDD cache hit/DISC miss 分路统计仍待下沉到 ImageStore。
+- 指标生产者已接入主要数据 I/O 和 MDS 文件系统 RPC；光盘库已按 HDD cache hit 与 DISC miss 两条访问路径分采集器上报（缓存命中区间读为 `OPTICAL_CACHE_HIT`，归档写与光盘回读镜像为 `OPTICAL_DISC`）。
 - MDS 已作为 managed metadata node 注册和上报指标，并用其RocksDB所在文件系统的实际容量/可用量作为SSD清单观测值。
 - `ClusterState`已收敛为统一目录的兼容投影，不再有第二份心跳节点事实表。
 - simulated node已可按任意步长快速推进并输出时序；采购批次和场景输入由实验驱动器编排，Scheduler只执行换代约束。
@@ -601,7 +601,7 @@ Remove request
 1. **已完成主体**：统一数据模型、默认节点模板、性能公式、寿命抽样和纯计算单元测试；当前以真实/模拟时间双入口实现所需时间隔离，全局Clock类只是可选内部重构。
 2. **已完成第二版**：显式加入、派生列表、可核验排空、退休、tombstone 和 managed catalog 快照恢复。
 3. **已完成第二版**：窗口指标 RPC、幂等重试、四级功耗策略与能耗统计。
-4. **已完成主要链路**：MDS、Real、Virtual 和 Optical 自动指标上报；光盘访问分路精度待完善。
+4. **已完成主要链路**：MDS、Real、Virtual 和 Optical 自动指标上报；Optical 已按 cache hit / DISC 两条访问路径分路上报。
 5. **已完成当前闭环**：trace adapter、单事件RPC、模拟节点墙钟隔离、显式时间推进及正态/浴盆可靠性失效事件。
 6. **已完成当前闭环**：v2 managed快照恢复、批量RPC、代际替换、长期演进和前端所需节点/时序视图。
 7. **已完成节点目录收敛**：心跳、旧集群视图、托管API、健康检测、能耗与快照共用NodeRecord。

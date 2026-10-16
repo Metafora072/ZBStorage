@@ -21,7 +21,7 @@
 
 产物保留约定（实测占用约 1.5GB：56 卷语料 + 5 张 vdisc + image_dir 峰值，
 含语料与 vdisc 光盘文件）：
-    默认（成功）          删除 corpus/ 与 archive/，保留 output.log 作为可追溯的测试记录；
+    默认（成功）          删除 corpus/、archive/ 与 reporting/，保留 output.log 作为可追溯的测试记录；
     失败                  全部保留以便排查；
     --keep                无论成败全部保留。
 
@@ -93,6 +93,8 @@ def print_case_summary(log_path):
 def main():
     parser = argparse.ArgumentParser(description="光存储节点归档集成测试驱动")
     parser.add_argument("--driver", required=True, help="C++ 测试二进制路径")
+    parser.add_argument("--server-bin", default=None,
+                        help="真 optical_node_server 二进制路径（综合用例内的“节点上报”测试点会 fork/exec 它）")
     parser.add_argument("--work-dir", default=None, help="工作目录")
     parser.add_argument("--keep", action="store_true",
                         help="保留全部产物（默认成功后只保留 output.log）")
@@ -141,6 +143,8 @@ def main():
             "--corpus", corpus_out,
             "--work-dir", work_dir,
         ]
+        if args.server_bin:
+            driver_cmd += ["--server-bin", args.server_bin]
         rc = run_tee(driver_cmd, log, cwd=work_dir)
 
     # 步骤 3：回显测试点汇总
@@ -151,14 +155,15 @@ def main():
     print("[summary] exit_code=%d" % rc)
     print("[summary] 完整日志：%s" % log_path)
     if rc == 0 and not args.keep:
-        for heavy in ("corpus", "archive"):
+        # reporting/ 为「节点上报」测试点（C1）真 server 子进程的产物（配置/server.log/子进程 archive）。
+        for heavy in ("corpus", "archive", "reporting"):
             shutil.rmtree(os.path.join(work_dir, heavy), ignore_errors=True)
-        print("[summary] 已清理大体积产物 corpus/ 与 archive/，保留日志与工作目录：%s"
+        print("[summary] 已清理大体积产物 corpus/、archive/ 与 reporting/，保留日志与工作目录：%s"
               % work_dir)
     elif rc == 0:
         print("[summary] 已保留全部产物（--keep）：%s" % work_dir)
     else:
-        print("[summary] 测试失败，全部产物保留在 %s（corpus/ 与节点产物）" % work_dir)
+        print("[summary] 测试失败，全部产物保留在 %s（corpus/、archive/、reporting/）" % work_dir)
 
     sys.exit(rc)
 

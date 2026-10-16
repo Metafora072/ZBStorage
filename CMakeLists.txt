@@ -45,6 +45,11 @@ set(WITH_ALL_TESTS OFF CACHE BOOL "" FORCE)
 set(WITH_TOOLS OFF CACHE BOOL "" FORCE)
 set(WITH_BENCHMARK_TOOLS OFF CACHE BOOL "" FORCE)
 
+# 默认产物需要能在不同 CPU 的 CI runner / 存储节点运行。RocksDB 默认
+# PORTABLE=0 会启用 -march=native，其全局初始化也可能生成宿主特有指令。
+# 保留显式 -DPORTABLE=0 的同机优化入口，不强制覆盖调用者配置。
+set(PORTABLE ON CACHE STRING "Minimum CPU arch to support; ON builds portable RocksDB")
+
 add_subdirectory(${ROCKSDB_ROOT} ${CMAKE_CURRENT_BINARY_DIR}/third_party/rocksdb EXCLUDE_FROM_ALL)
 
 set(ROCKSDB_TARGET "")

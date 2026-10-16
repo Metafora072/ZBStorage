@@ -49,7 +49,7 @@ Python 内部模块通过包相对导入复用，不直接运行内部文件。`
 依赖项目已有的 CMake、C++ 工具链、bundled RocksDB/brpc、FUSE 开发库及 Python 3.9+。Python 工具只用标准库，不需要额外安装 SDK。HTTP RPC 使用 brpc 自带 protobuf JSON 接口，`bytes` 按 base64 传输。
 
 ```bash
-cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DPORTABLE=ON
 cmake --build build-release -j4
 ctest --test-dir build-release --output-on-failure
 
@@ -57,6 +57,8 @@ python3 tests/scheduler/run.py local --files 12 --optical-check
 python3 tests/scheduler/run.py simulation
 python3 tests/scheduler/run.py meter-closure --files 1000
 ```
+
+项目默认使用 RocksDB portable 构建，CI 也显式指定 `-DPORTABLE=ON`。已有构建目录如缓存了 `PORTABLE=0`，须用上面的命令覆盖后重建，避免 `-march=native` 产物在不同 CPU 的 runner/节点上启动即收到 SIGILL。仅在编译与部署 CPU 确定兼容时才显式使用 `-DPORTABLE=0`。复核 CI 问题应使用 Release 及上述系统测试，不以 Debug 结果替代。
 
 `local` 启动独立端口的 Scheduler、MDS/CMS 和默认两个真实存储节点进程；`--optical-check` 额外启动新版光盘节点并验证库存未就绪时保持 JOINING。所有数据库、配置及节点数据均在本次结果目录中。结束时仅停止本工具启动的进程，文件保留。该环境是单服务器上的多进程功能实验，不是多台物理服务器的硬件性能验收。
 

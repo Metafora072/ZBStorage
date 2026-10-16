@@ -6,10 +6,12 @@
 → 数据面读（新 6 接口：SubscribeReadEvents → PrepareRead → ReadReady 通知 → AcquireReadSession
 → ReadPreparedFile 区间读 → ReleaseReadSession / ReleasePreparedRead）/ CD_READ 重载 → 缓存命中
 → 读会话与引用生命周期（多次独立打开 / EOF 与随机重读 / 两级释放）→ LRU 淘汰与重载
-→ 正常关机落盘（log/runtime_state_snapshot）→ 同 root 重启恢复 → 在途准备任务继续推进到可读**
+→ 正常关机落盘（log/runtime_state_snapshot）→ 同 root 重启恢复 → 在途准备任务继续推进到可读
+→ 节点上报（以真 server 子进程验证注册 / 心跳+设备清单 / 光盘库状态）**
 全链路，断言只依赖文件系统产物、RPC 返回码、通知 Stream 消息与控制台汇报行，不使用固定 sleep。
 
-ctest 只注册 **一个综合用例**（`optical_node`），一次运行覆盖以上全部环节。
+ctest 只注册 **一个综合用例**（`optical_node`）：一次运行覆盖以上全部环节，含末尾的「节点上报」测试点
+（`C1`）——它 fork/exec 真 `optical_node_server` 子进程，复用本用例的假 scheduler 作为上报终点。
 
 ## 一、前置条件
 
@@ -58,14 +60,18 @@ cmake --build build -j8 --target optical_node_archive_integration_test
 
 ## 四、运行
 
-### 方式 A：ctest（推荐）
+### 方式 A：ctest
+
+> **临时屏蔽**：综合用例 `optical_node` 在 `CMakeLists.txt` 中被临时加上 `DISABLED TRUE`，`ctest` 默认不执行它，
+> `ctest -R '^optical_node$'` 也会因该用例被禁用而选不到。只想单跑这个综合用例 → 用**方式 B**；
+> 要恢复随 `ctest` 一起跑 → 删掉那处 `DISABLED TRUE`（及其注释）并重新构建。
 
 ```bash
-# 综合用例（精确匹配用例名，避免误带上 codec 单测 optical_node_runtime_state_codec）
-ctest --test-dir build -R '^optical_node$' --output-on-failure
-
-# optical_node 相关的全部用例（综合集成 + codec 单测）
+# optical_node 相关的全部用例（codec 单测会执行；综合用例处于禁用态，被跳过）
 ctest --test-dir build -L optical_node -j1 --output-on-failure
+
+# 综合用例（精确匹配用例名；需先移除 DISABLED 属性才会执行）
+ctest --test-dir build -R '^optical_node$' --output-on-failure
 ```
 
 用例注册参数：
@@ -73,12 +79,20 @@ ctest --test-dir build -L optical_node -j1 --output-on-failure
 | 用例 | TIMEOUT | SKIP_RETURN_CODE | LABELS |
 | --- | --- | --- | --- |
 | `optical_node` | 3600s | 77 | `optical_node;slow` |
+| `optical_node_runtime_state_codec` | 60s | — | `optical_node;unit` |
 
-### 方式 B：python 驱动脚本（备语料 → 跑二进制 → 汇总）
+ctest 通过 `$<TARGET_FILE:optical_node_server>` 把真 server 二进制路径经驱动脚本传给综合用例
+（其中的 `C1` 上报测试点会 fork/exec 它），并与之建立构建依赖，无需手工准备。
+
+### 方式 B：python 驱动脚本（推荐；备语料 → 跑二进制 → 汇总）
+
+`optical_node` ctest 用例本质就是执行本脚本，因此**直接调用它即可单跑综合用例，不受上面的 ctest 禁用影响**：
 
 ```bash
 python3 tests/optical_node/run_optical_node_archive_test.py \
-  --driver "$PWD/build/optical_node_archive_integration_test"
+  --driver "$PWD/build/optical_node_archive_integration_test" \
+  --server-bin "$PWD/build/optical_node_server" \
+  --keep
 ```
 
 常用可选项：
@@ -86,8 +100,9 @@ python3 tests/optical_node/run_optical_node_archive_test.py \
 | 参数 | 说明 |
 | --- | --- |
 | `--driver` | C++ 测试二进制路径，**必须是绝对路径**（脚本会把工作目录切到工作目录下再执行） |
+| `--server-bin` | 真 `optical_node_server` 二进制路径（绝对路径）；`C1` 节点上报测试点会 fork/exec 它，不传则打印 `[SKIP] C1` |
 | `--work-dir` | 工作目录，默认 `tests/optical_node/results/optical_node-<时间戳>` |
-| `--keep` | 成功时也保留 `corpus/` 与 `archive/`（默认成功后只保留 `output.log`，失败则全部保留） |
+| `--keep` | 成功时也保留 `corpus/`、`archive/` 与 `reporting/`（默认成功后只保留 `output.log`，失败则全部保留） |
 
 卷数固定为 56（脚本内置），无需也无法通过参数改变。脚本不再需要 jpg 语料目录，也没有「语料缺失 → 跳过」分支，
 会先在 `<work>/corpus/` 内合成语料再运行二进制。
@@ -128,14 +143,15 @@ python3 tests/optical_node/prepare_archive_corpus.py --selftest
 │   ├── expected_pack_plan.tsv    # volume_index / count / inode_ids —— 由 zlib9 精确预测的打包分组，断言真值
 │   ├── corpus_meta.txt           # 压缩率与各尺寸参数
 │   └── real-1/disk0/obj-<inode>-<index>.dat   # 每个文件 4 个 256KiB 分片
-└── archive/                      # 光节点工作目录
-    ├── input/  temp/             # 归档中间文件（最终应为空）
-    ├── image/                    # 卷镜像平铺（容量 14）：volume_<id>.vimg ≈9.7MiB
-    ├── disc_sim/                 # 光盘库模拟区（已物化光盘本体）：disc_<id>.vdisc ≈97MiB
-    ├── read/                     # 数据面读产物（读完应被清理）
-    ├── meta/                     # pending_disc_meta（未封盘集合）、node_discs_meta（已刻录索引，持久）；
-    │                             # disc_<disk_id>_meta 为**临时**中间态，刻录 + 索引完成后即被删除
-    └── log/                      # 任务日志 + 关机快照 runtime_state_snapshot(.loaded)
+├── archive/                      # 光节点工作目录
+│   ├── input/  temp/             # 归档中间文件（最终应为空）
+│   ├── image/                    # 卷镜像平铺（容量 14）：volume_<id>.vimg ≈9.7MiB
+│   ├── disc_sim/                 # 光盘库模拟区（已物化光盘本体）：disc_<id>.vdisc ≈97MiB
+│   ├── read/                     # 数据面读产物（读完应被清理）
+│   ├── meta/                     # pending_disc_meta（未封盘集合）、node_discs_meta（已刻录索引，持久）；
+│   │                             # disc_<disk_id>_meta 为**临时**中间态，刻录 + 索引完成后即被删除
+│   └── log/                      # 任务日志 + 关机快照 runtime_state_snapshot(.loaded)
+└── reporting/                    # 节点上报测试点（C1）子进程：optical_node.conf、server.log、archive/（成功默认清理）
 ```
 
 成功时的标志性输出：
@@ -149,7 +165,7 @@ python3 tests/optical_node/prepare_archive_corpus.py --selftest
 
 | 情况 | 保留内容 |
 | --- | --- |
-| 成功（默认） | 只保留 `output.log`，删除 `corpus/` 与 `archive/`（两者合计实测约 1.5GB） |
+| 成功（默认） | 只保留 `output.log`，删除 `corpus/`、`archive/` 与 `reporting/`（合计实测约 1.5GB；`reporting/` 为 C1 子进程产物，很小） |
 | 失败 | 全部保留，便于按日志与目录快照定位问题 |
 | `--keep` | 无论成败全部保留 |
 
@@ -176,6 +192,23 @@ python3 tests/optical_node/prepare_archive_corpus.py --selftest
 | `A8` | 正常关机落盘与重启恢复（在途准备任务继续推进） | `Shutdown()` 把运行期内存态落到 `log/runtime_state_snapshot`；同 root 重启后读回并让关机前未完成的准备任务继续推进到可读——节点重启不丢在途工作（通知会话 / 读会话表为进程内易失态，不落盘） | 关机快照生成且非空、状态切 `STOPPED`；重启后 `RUNNING` 且原因含 `runtime state restored`、快照被消费为 `.loaded`、`image/` 与 `disc_sim/` 前后完全一致、`node_discs_meta` 块数与字节数不变、`meta/` 无残留 `disc_<id>_meta`；**在途任务用原 `task_id` 经 `AcquireReadSession` 轮询到 `OPTICAL_OK` 后仍能读回完整数据**（字节与语料一致），且不补发 `ReadReady` |
 | `B1` | 批次形态覆盖（下发切分不改变卷分组） | 批次边界（单文件小批次 / 跨卷边界批次 / 大小混合批次）不应改变卷分组、不应遗漏或重复文件；顺带覆盖「多个 MDS 批次累计成一轮下载」（一轮配额 = 卷镜像容量） | 四种形态均出现、单文件批次 ≥10、跨卷边界批次 ≥2、第 1 卷由 10 个单文件批次累计而成、汇报数 == 卷数、全部 inode 无遗漏无重复 |
 | `B2` | 背压触发与恢复 | 写镜像数达 `MAX_WRITE_IMAGES` 时暂停下载、不把 `image/` 堆到硬上限；刻录完成释放写镜像后应唤醒被阻塞的下载线程（不能睡死） | 采样到 `throttled=true`、写镜像数确实堆到上限、过冲 ≤1 个镜像、触发原因覆盖「写镜像达上限」、随后采样到 `throttled=false`（写镜像占用回落） |
+
+### 节点上报测试点（`C1`，并入综合用例）
+
+节点上报（启动期注册、运行期心跳与光盘库状态）由 `optical_node_server.cpp` 的启动逻辑触发，进程内的综合
+场景（直接构造 `OpticalStorageServiceImpl`、不走 `main()`）触发不到。因此把该测试点并入综合用例：在用例
+末尾**`fork/exec` 启动真 `optical_node_server` 子进程**（生成临时配置把 `SCHEDULER_ADDR` 指向本用例既有的
+假 scheduler、`--port=0` 由内核分配端口），轮询假 scheduler 的调用计数并对捕获的 brpc 请求逐字段断言，
+结束后对子进程发 `SIGINT` 验证优雅退出（brpc 默认只对 SIGINT 注册优雅退出处理；SIGTERM 需
+`--graceful_quit_on_sigterm=true`）。子进程配置与 stdout/stderr 落盘到 `<work>/reporting/`（成功默认随 `corpus/`、`archive/` 一并清理）。
+
+| 编号 | 测试点 | 测试目标 | 主要断言 |
+| --- | --- | --- | --- |
+| `C1` | 调度器上报链路（注册 / 心跳+设备清单 / 光盘库状态） | 光盘节点启动后应完成一次性注册并周期上报心跳（含设备清单）与光盘库状态；无数据面 I/O 时不应上报指标 | 注册恰好 1 次、`kind=OPTICAL_LIBRARY`/`execution_mode=PHYSICAL`/不参与放置/`activate_immediately=false`、3 个设备组容量与数量一致、功率四级非递增且峰值 >0、光盘延迟 >0；心跳 `node_type=NODE_OPTICAL`、就绪标志为真、含 1 个 `hdd-cache`(容量=容量上限×卷大小) + 1 个 `disc`(容量=盘容量×盘数) + `DRIVE_COUNT` 个 `optical-drive`；库状态 `observed=true`、`local_disc_count=TOTAL_DISC_COUNT`、`total_slots=SLOT_COUNT`、空库 `blank=local` 且 `recorded=recording=defective=0`、分类守恒、`staging_capacity_bytes=容量上限×卷大小`；`ReportNodeMetrics` 调用次数为 0；`SIGINT` 后子进程 `exit=0` |
+
+子进程二进制路径由 ctest 经驱动脚本自动传入（`--server-bin`）；手工直跑二进制时若不传该参数，则打印
+`[SKIP] C1` 并跳过该测试点（其余测试点不受影响）。断言只依赖假 scheduler 捕获的 brpc 请求与子进程退出码，
+不使用固定 sleep。
 
 日志的构造方式（每项检查都记录实际值，便于回溯时序特征）。以下是实跑日志的原文摘录
 （仅把绝对路径缩写成 `.../archive/…`、把过长的文件清单用 `…` 折叠）：
@@ -282,11 +315,35 @@ python3 tests/optical_node/prepare_archive_corpus.py --selftest
 [CASE-END] A5 result=PASS checks=11 failed=0
 ```
 
+`C1`（节点上报，真 server 子进程）的关键观测事实：
+
+```text
+[CASE] C1  调度器上报链路（注册 / 心跳+设备清单 / 光盘库状态）
+  [STEP] 写临时配置（SCHEDULER_ADDR=127.0.0.1:37931）并启动真 server 子进程（--server-bin=.../optical_node_server）
+    [PASS] RegisterManagedNode 到达假 scheduler —— 已在 20ms 内满足
+    [PASS] ReportHeartbeat 到达假 scheduler —— 已在 0ms 内满足
+    [PASS] ReportOpticalLibraryStatus 到达假 scheduler —— 已在 0ms 内满足
+    [PASS] RegisterManagedNode 恰好发送一次（成功后不再重复注册）（actual=1 expected=1）
+    [PASS] 注册 kind=MANAGED_KIND_OPTICAL_LIBRARY
+    [PASS] 注册携带 3 个设备组（hdd-cache / disc / optical-drive）（actual=3 expected=3）
+    [PASS] 心跳身份正确（node_id / node_type=NODE_OPTICAL）
+    [PASS] 心跳含 DRIVE_COUNT 个 optical-drive 设备条目（actual=20 expected=20）
+    [PASS] 库状态 local_disc_count = TOTAL_DISC_COUNT（actual=1000 expected=1000）
+    [PASS] 空库 blank_disc_count = local（全部空白盘）（actual=1000 expected=1000）
+    [PASS] 无数据面 I/O 时不上报 ReportNodeMetrics（actual=0 expected=0）
+  [STEP] 对子进程发 SIGINT，验证优雅退出
+    [PASS] SIGINT 后子进程正常退出（exit=0）
+[CASE-END] C1 result=PASS checks=35 failed=0
+```
+
 实测汇总（机器负载不同会有差异；总耗时指 C++ 二进制内部计时，不含语料生成）：
 
 | 用例 | 测试点 | 检查 | 失败 | 总耗时 |
 | --- | --- | --- | --- | --- |
-| `optical_node`（56 卷） | 89（A0 + A1×56 + A2 + A7 + A8 + A3×12 + A4×12 + A9 + A5 + A6 + B1 + B2） | 534 | 0 | 533s |
+| `optical_node`（56 卷） | 90（A0 + A1×56 + A2 + A7 + A8 + A3×12 + A4×12 + A9 + A5 + A6 + B1 + B2 + C1） | 569 | 0 | 509s |
+
+> `C1`（节点上报，末尾以真 server 子进程覆盖）未提供 `--server-bin` 时会被跳过（打印 `[SKIP] C1`），
+> 此时测试点数为 89、检查数为 534。ctest 已自动传入该参数。
 
 > 实测覆盖了「`disc_<id>_meta` 刻录完成后删除」：A7 断言 `node_discs_meta` 追加块数 == 汇报盘数（5）且
 > `meta/` 无残留 `disc_<id>_meta`，A8 断言重启后仍无残留、索引块数与字节数均不变。
@@ -320,6 +377,12 @@ python3 tests/optical_node/prepare_archive_corpus.py --selftest
 - 新读接口语义尚未完全覆盖：`PrepareRead` 的可选 `file_version` 只走了「未提供」分支
   （测试不传版本，`has_file_version=false`），未验证携带版本时 `ReadReady` 的回传；
   也未断言「同一 `request_id` 恰好收到一次」`ReadReady`（重复通知未验证）。
+- 节点上报测试点（`C1`，并入综合用例）以真 server 子进程 + 假 scheduler 覆盖注册/心跳/光盘库状态，但**不覆盖**
+  数据面 I/O 指标上报（`ReportNodeMetrics`）：子进程无归档/读 I/O，`ReportCollectedMetrics` 因无活动跳过，
+  用例只断言「无 I/O 时不上报」；指标内容仍由综合用例侧的两个采集器记账间接保证。
+  同样未覆盖注册的传输层失败重试/服务端拒绝分支、心跳的 `SCHED_ALREADY_EXISTS` 幂等路径
+  （假 scheduler 恒返回 `SCHED_OK`），以及 `WarnIfProfileMismatch` 的「不一致告警」分支
+  （假 scheduler 回显 `spec`，走一致分支）。
 - `prepare_archive_corpus.py` 的 `--volumes` 默认值仍是 26，与测试用的 56 不一致（驱动脚本每次都显式传参，
   只有手工调用该脚本时才需注意）。
 

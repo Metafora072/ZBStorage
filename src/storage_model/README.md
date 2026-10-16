@@ -435,5 +435,5 @@ NamespaceLeaf
 6. 光盘状态属于 `OpticalDisc`，槽位只保存物理占用。
 7. `Retired`节点保留tombstone；`Retired`光盘库必须零本地光盘。
 8. 无论`force`取值为何，退役都不能绕过零驻留数据、光盘库零本地光盘和物理节点已确认断电三项安全条件。
-9. 修改结构或校验逻辑后运行 Scheduler 系统集成测试：`ctest --test-dir build -L scheduler_system_closure --output-on-failure`，并按变更范围补充真实外存闭环验证。单元/组件测试不作为仓库交付内容。
+9. 修改结构或校验逻辑后按 [系统测试说明](../../tests/scheduler/README.md#构建及快速验证) 手动运行 Scheduler 系统集成脚本，并按变更范围补充真实外存闭环验证；不注册到全仓 CTest。单元/组件测试不作为仓库交付内容。
 10. 紧凑ID只由CMS分配且分配后不可变；Scheduler与DataNode不得自行生成。

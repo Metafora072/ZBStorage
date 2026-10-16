@@ -21,7 +21,7 @@ tests/scheduler/
 └── results/               # 本地运行结果、索引和历史报告，不提交
 ```
 
-系统集成测试由 CTest 调用；两个 C++ probe 仅负责驱动独立运行的服务进程。`results/` 仅保存本地实验结果，不提交。`run.py` 的 T03 任务入口不能替代迁移及光盘模型的故障门禁测试。
+本目录测试仅手动运行，不注册到全仓 CTest，不阻塞其他模块的 PR。两个 C++ probe 仅负责驱动独立运行的服务进程，以 `EXCLUDE_FROM_ALL` 保留，需显式构建。`results/` 仅保存本地实验结果，不提交。`run.py` 的 T03 任务入口不能替代迁移及光盘模型的故障门禁测试。
 
 责任边界见 [Scheduler 接口说明](../../src/scheduler/api/README.md#开发与联调边界)。本目录的真实磁盘适配和进程内光盘模型由 Scheduler 负责；真实光盘库存/任务采集及归档回报、MDS 冷目录和 Masstree 流程由对应负责人交付。
 
@@ -51,7 +51,6 @@ Python 内部模块通过包相对导入复用，不直接运行内部文件。`
 ```bash
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DPORTABLE=ON
 cmake --build build-release -j4
-ctest --test-dir build-release --output-on-failure
 
 python3 tests/scheduler/run.py local --files 12 --optical-check
 python3 tests/scheduler/run.py simulation
@@ -60,12 +59,22 @@ python3 tests/scheduler/run.py meter-closure --files 1000
 
 项目默认使用 RocksDB portable 构建，CI 也显式指定 `-DPORTABLE=ON`。已有构建目录如缓存了 `PORTABLE=0`，须用上面的命令覆盖后重建，避免 `-march=native` 产物在不同 CPU 的 runner/节点上启动即收到 SIGILL。仅在编译与部署 CPU 确定兼容时才显式使用 `-DPORTABLE=0`。复核 CI 问题应使用 Release 及上述系统测试，不以 Debug 结果替代。
 
-`local` 启动独立端口的 Scheduler、MDS/CMS 和默认两个真实存储节点进程；`--optical-check` 额外启动新版光盘节点并验证库存未就绪时保持 JOINING。所有数据库、配置及节点数据均在本次结果目录中。结束时仅停止本工具启动的进程，文件保留。该环境是单服务器上的多进程功能实验，不是多台物理服务器的硬件性能验收。
+`local` 启动独立端口的 Scheduler、MDS/CMS 和默认两个真实存储节点进程。可选的 `--optical-check` 额外启动真实光盘节点，仅验证 Scheduler 自身准入：通过真实 Scheduler RPC 向独立身份分别上报缺库存、未初始化、元数据未就绪三种心跳，均须保持 `Joining`，并核对本轮状态已提交到 CMS。实际光盘进程的状态仅作观察，不要求它永远没有库存，也不把设备格式、任务采集或其他负责人的实现进度作为测试前提；只检查 Scheduler 不得把未就绪节点置为 `Working`。详情保留在本地 `optical_boundary.json`，不代表已验收光盘库业务。
 
-`scheduler_system_closure` 运行上述三个独立进程集成用例，其中磁盘/光盘模型用例的数据是生成式数据，**不能替代真实外存验收**。真实外存验收运行 `real_system_smoke.py`：在指定的可写外存上创建唯一私有目录，启动真实 Scheduler、MDS/CMS、两个 `real_node_server` 和 FUSE；逐字节验证跨对象文件、后端对象文件、服务重启后的读回、排空迁移、CMS 零引用及退役后分配。它不运行模拟电表或仿真节点，也不声称测得物理功耗。
+所有数据库、配置及节点数据均在本次结果目录中。结束时仅停止本工具启动的进程，文件保留。该环境是单服务器上的多进程功能实验，不是多台物理服务器的硬件性能验收；上述检查不代表实体光盘刻录或物理功耗验收。
+
+其余三个独立进程集成脚本按下面的命令手动运行。其中磁盘/光盘模型用例的数据是生成式数据，**不能替代真实外存验收**。真实外存验收运行 `real_system_smoke.py`：在指定的可写外存上创建唯一私有目录，启动真实 Scheduler、MDS/CMS、两个 `real_node_server` 和 FUSE；逐字节验证跨对象文件、后端对象文件、服务重启后的读回、排空迁移、CMS 零引用及退役后分配。它不运行模拟电表或仿真节点，也不声称测得物理功耗。
 
 ```bash
-ctest --test-dir build-release -L scheduler_system_closure --output-on-failure
+cmake --build build-release --target scheduler_inprocess_disk_route_probe scheduler_model_closure_probe -j4
+python3 tests/scheduler/real_drain_integration_test.py --build build-release
+python3 tests/scheduler/inprocess_disk_server_restart_test.py \
+  --scheduler build-release/scheduler_server --mds build-release/mds_server \
+  --probe build-release/scheduler_inprocess_disk_route_probe
+python3 tests/scheduler/model_closure_integration_test.py \
+  --scheduler build-release/scheduler_server --mds build-release/mds_server \
+  --probe build-release/scheduler_model_closure_probe \
+  --ctl build-release/zbctl --client build-release/zb_fuse_client
 python3 tests/scheduler/real_system_smoke.py --build build-release --external-root /mnt/md0
 ```
 

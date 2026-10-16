@@ -75,6 +75,6 @@ curl -sS -H 'Content-Type: application/json' \
 - scheduler_model_closure_integration_test：独立 Scheduler/MDS 进程检查模型迁移、代际与光盘归档；具备 FUSE 时通过正式客户端和 zbctl 检查准备及读取链路，数据为模型生成。
 - tests/scheduler/real_system_smoke.py：真实外存、FUSE、MDS/CMS 和两个真实数据节点的读写、重启、排空与退役闭环；不测物理功耗。
 
-单元/组件测试不交付；上述三个 CTest 系统集成用例统一使用 `scheduler_system_closure` 标签。
+单元/组件测试不交付；上述系统集成脚本仅手动运行，不注册到全仓 CTest。两个配套 RPC 驱动需显式构建，不参与默认 ALL；具体命令见 [系统测试说明](../../../tests/scheduler/README.md#构建及快速验证)。
 
 本接口方便联调，但不声明物理电表、实体光盘刻录或其他模块的冷目录/Masstree 流程已经验收。

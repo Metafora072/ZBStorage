@@ -1,5 +1,8 @@
 #pragma once
 
+#include <functional>
+#include <utility>
+
 #include "../lifecycle/LifecycleManager.h"
 #include "../model/ClusterState.h"
 #include "../power/NodePowerManager.h"
@@ -10,10 +13,17 @@ namespace zb::scheduler {
 
 class SchedulerServiceImpl : public zb::rpc::SchedulerService {
 public:
+    void SetModelReloadRequest(std::function<void()> request) { model_reload_request_ = std::move(request); }
+    void ReloadModelConfigs(google::protobuf::RpcController*, const zb::rpc::ReloadModelConfigsRequest*,
+                            zb::rpc::ReloadModelConfigsReply*, google::protobuf::Closure*) override;
     SchedulerServiceImpl(ClusterState* state,
                          LifecycleManager* lifecycle,
                          NodePowerManager* node_manager = nullptr,
                          DrainMigrationCoordinator* migration = nullptr);
+    // 配置管理快照时，生命周期成功应答前同步提交，避免恢复成操作中间态。
+    void SetDurableStateCommit(std::function<bool(std::string*)> commit) {
+        durable_state_commit_ = std::move(commit);
+    }
 
     void ReportHeartbeat(google::protobuf::RpcController* cntl_base,
                          const zb::rpc::HeartbeatRequest* request,
@@ -135,6 +145,9 @@ public:
                                   zb::rpc::GetManagedMetricsHistoryReply*, google::protobuf::Closure*) override;
 
 private:
+    std::function<void()> model_reload_request_;
+    void FinishLifecycleOperation(const NodeOperationState&, zb::rpc::NodeOperationReply*);
+    bool CommitManagedState(zb::rpc::SchedulerStatus*);
     static void FillStatus(zb::rpc::SchedulerStatus* status,
                            zb::rpc::SchedulerStatusCode code,
                            const std::string& message);
@@ -146,6 +159,7 @@ private:
     LifecycleManager* lifecycle_{};
     NodePowerManager* node_manager_{};
     DrainMigrationCoordinator* migration_{};
+    std::function<bool(std::string*)> durable_state_commit_;
 };
 
 } // namespace zb::scheduler

@@ -233,6 +233,18 @@ bool ValidateNodeInventorySnapshot(const NodeInventorySnapshot& snapshot, std::s
 }
 
 bool ValidateOpticalLibraryStatus(const OpticalLibraryStatus& status, std::string* error) {
+    if (status.telemetry_version > 1) return Fail("unsupported optical telemetry version", error);
+    if (status.telemetry_version == 1) {
+        if (status.observed_at_ms == 0 || status.valid_until_ms < status.observed_at_ms)
+            return Fail("optical telemetry needs a sample time and validity deadline", error);
+        if (status.inventory_valid && !status.observed)
+            return Fail("valid optical inventory must be observed", error);
+        if (status.staging_valid &&
+            (status.staging_read_reserved_bytes > status.staging_used_bytes ||
+             status.staging_write_reserved_bytes >
+                 status.staging_used_bytes - status.staging_read_reserved_bytes))
+            return Fail("optical staging reservations exceed used space", error);
+    }
     if (!status.observed) {
         return true;
     }

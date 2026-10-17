@@ -70,10 +70,11 @@ class FuseFiles(Files):
 
 class FuseMount:
     """Own mount/process only. Workload O_DIRECT bypasses FUSE cache, not backend OS cache."""
-    def __init__(self, cluster, output):
+    def __init__(self, cluster, output, optical_reads=False):
         self.cluster, self.output = cluster, Path(output)
         self.mount = self.output / "mnt"
         self.process = None
+        self.optical_reads = optical_reads
 
     def __enter__(self):
         self.output.mkdir(parents=True, exist_ok=True)
@@ -85,6 +86,9 @@ class FuseMount:
                    "--bootstrap_tier_dirs=true", "--io_latency_enabled=true",
                    f"--io_latency_dir={self.output / 'metrics'}", "--io_latency_flush_ms=100",
                    "--", str(self.mount), "-f", "-s", "-o", "attr_timeout=0,entry_timeout=0"]
+        if self.optical_reads:
+            command[1:1] = ["--optical_read_enabled=true",
+                            f"--prepare_control_socket={self.output / 'prepare.sock'}"]
         save_json(self.output / "command.json", {"argv": command,
                   "fuse_workers": 1, "reason": "serial T03 baseline; multi-callback file-size commit race tracked separately",
                   "binary_sha256": file_hash(self.cluster.build / "zb_fuse_client")})

@@ -225,6 +225,11 @@ bool NodePowerManager::FinalizeRemoveNode(const std::string& node_id,
         node.optical_library.busy_drives == 0;
     if (node.profile.kind == ManagedNodeKind::kOpticalLibrary &&
         (!node.optical_library.observed ||
+         (node.optical_library.telemetry_version != 0 &&
+          (!node.optical_library.inventory_valid || !node.optical_library.background_valid ||
+           now_ms > node.optical_library.valid_until_ms ||
+           node.optical_library.pending_archive_batches != 0 ||
+           node.optical_library.background_tasks != 0)) ||
          (node.optical_library.local_disc_count != 0 && !empty_virtual_optical))) {
         if (error) {
             *error = !node.optical_library.observed
@@ -373,7 +378,7 @@ bool NodePowerManager::ReportHeartbeat(const std::string& node_id,
 bool NodePowerManager::ReportReadiness(
     const std::string& node_id,
     const zb::storage_model::NodeReadinessStatus& readiness,
-    std::string* error) {
+    std::string* error, uint64_t instance_generation) {
     std::lock_guard<std::mutex> lock(mu_);
     auto it = nodes_.find(node_id);
     if (it == nodes_.end()) {
@@ -383,6 +388,12 @@ bool NodePowerManager::ReportReadiness(
     ManagedNodeRuntime& node = it->second;
     if (node.lifecycle == LifecycleState::kRetired) {
         if (error) *error = "retired node cannot report readiness";
+        return false;
+    }
+    if ((node.profile.kind == ManagedNodeKind::kOpticalLibrary &&
+         node.optical_library.telemetry_version != 0 && instance_generation == 0) ||
+        (instance_generation != 0 && instance_generation != node.profile.instance_generation)) {
+        if (error) *error = "readiness instance generation mismatch";
         return false;
     }
     if (!readiness.observed || readiness.observed_at_ms == 0) {
@@ -401,7 +412,7 @@ bool NodePowerManager::ReportReadiness(
 bool NodePowerManager::ReportOpticalLibraryStatus(
     const std::string& node_id,
     const zb::storage_model::OpticalLibraryStatus& status,
-    std::string* error) {
+    std::string* error, uint64_t instance_generation) {
     if (!zb::storage_model::ValidateOpticalLibraryStatus(status, error)) return false;
     std::lock_guard<std::mutex> lock(mu_);
     auto it = nodes_.find(node_id);
@@ -410,6 +421,16 @@ bool NodePowerManager::ReportOpticalLibraryStatus(
         return false;
     }
     ManagedNodeRuntime& node = it->second;
+    if (((node.optical_library.telemetry_version != 0 || status.telemetry_version != 0) &&
+         instance_generation == 0) ||
+        (instance_generation != 0 && instance_generation != node.profile.instance_generation)) {
+        if (error) *error = "optical status instance generation mismatch";
+        return false;
+    }
+    if (node.optical_library.telemetry_version != 0 && status.telemetry_version == 0) {
+        if (error) *error = "optical telemetry cannot downgrade to an unqualified report";
+        return false;
+    }
     if (node.profile.kind != ManagedNodeKind::kOpticalLibrary) {
         if (error) *error = "node is not an optical library";
         return false;
@@ -425,15 +446,17 @@ bool NodePowerManager::ReportOpticalLibraryStatus(
     AdvancePowerPolicyLocked(&node, status.observed_at_ms);
     node.optical_library = status;
     if (status.observed &&
-        (status.pending_write_tasks != 0 || status.pending_read_tasks != 0 ||
+        (status.pending_archive_batches != 0 || status.background_tasks != 0 ||
+         status.pending_write_tasks != 0 || status.pending_read_tasks != 0 ||
          status.busy_drives != 0) &&
         IsServingLifecycle(node.lifecycle) &&
         node.health == ManagedHealthState::kHealthy &&
         node.administrative_state == zb::storage_model::AdministrativeState::kEnabled) {
-        SetPowerLevelLocked(&node, PowerLevel::kMedium,
-                            status.observed_at_ms, true);
+        if (node.power_level < PowerLevel::kMedium)
+            SetPowerLevelLocked(&node, PowerLevel::kMedium, status.observed_at_ms, true);
     }
-    if (status.observed && status.local_disc_count > 0 &&
+    if (status.observed && (status.telemetry_version == 0 || status.inventory_valid) &&
+        status.local_disc_count > 0 &&
         status.recorded_disc_count == status.local_disc_count &&
         status.pending_write_tasks == 0) {
         node.service_mode = zb::storage_model::NodeServiceMode::kReadOnly;
@@ -667,24 +690,50 @@ bool NodePowerManager::ReportMetrics(const std::string& node_id,
         }
         return false;
     }
+    if ((node.profile.kind == ManagedNodeKind::kOpticalLibrary &&
+         node.optical_library.telemetry_version != 0 && metrics.instance_generation == 0) ||
+        (metrics.instance_generation != 0 &&
+         metrics.instance_generation != node.profile.instance_generation)) {
+        if (error) *error = "metrics instance generation mismatch";
+        return false;
+    }
+    auto found = std::find_if(node.metrics_streams.begin(), node.metrics_streams.end(),
+                             [&](const auto& stream) {
+                                 return stream.access_path == metrics.access_path &&
+                                        stream.reporter_epoch == metrics.reporter_epoch;
+                             });
+    zb::storage_model::NodeMetricsStreamState previous;
+    if (found != node.metrics_streams.end()) previous = *found;
+    else if (metrics.access_path == AccessPath::kDefault && node.metrics_streams.empty()) {
+        // 兼容没有分路水位的旧快照。
+        previous.reporter_epoch = node.last_metrics_reporter_epoch;
+        previous.report_sequence = node.last_metrics_sequence;
+        previous.window_end_ms = node.last_metrics_end_ms;
+    }
     const bool same_reporter = metrics.reporter_epoch == 0 ||
-                               metrics.reporter_epoch == node.last_metrics_reporter_epoch;
+                               metrics.reporter_epoch == previous.reporter_epoch;
     if (same_reporter && metrics.report_sequence != 0 &&
-        metrics.report_sequence == node.last_metrics_sequence) {
+        metrics.report_sequence == previous.report_sequence) {
         return true;
     }
-    if (metrics.window_end_ms < node.last_metrics_end_ms ||
+    uint64_t path_end_ms = previous.window_end_ms;
+    for (const auto& stream : node.metrics_streams)
+        if (stream.access_path == metrics.access_path)
+            path_end_ms = std::max(path_end_ms, stream.window_end_ms);
+    if (previous.retired || metrics.window_end_ms < path_end_ms ||
         (same_reporter && metrics.report_sequence != 0 &&
-         metrics.report_sequence < node.last_metrics_sequence) ||
-        (metrics.report_sequence == 0 && metrics.window_end_ms <= node.last_metrics_end_ms &&
-         node.last_metrics_end_ms != 0)) {
+         metrics.report_sequence < previous.report_sequence) ||
+        (metrics.report_sequence == 0 && metrics.window_end_ms <= previous.window_end_ms &&
+         previous.window_end_ms != 0)) {
         if (error) {
             *error = "stale or duplicate metrics window";
         }
         return false;
     }
 
-    AdvancePowerPolicyLocked(&node, metrics.window_end_ms);
+    const uint64_t accounting_ms = std::max({metrics.window_end_ms, node.last_metrics_end_ms,
+                                            node.last_energy_update_ms});
+    AdvancePowerPolicyLocked(&node, accounting_ms);
     const uint64_t operations = SaturatingAdd(
         SaturatingAdd(metrics.read_operations, metrics.write_operations), metrics.other_operations);
     const uint64_t window_ms = std::max<uint64_t>(1, metrics.window_end_ms - metrics.window_start_ms);
@@ -710,8 +759,30 @@ bool NodePowerManager::ReportMetrics(const std::string& node_id,
         std::min<long double>(1.0L, read_utilization + write_utilization));
     const double busy_utilization = std::min(
         1.0, static_cast<double>(metrics.busy_time_ms) / static_cast<double>(window_ms));
-    node.last_utilization = std::min(1.0, std::max(bandwidth_utilization, busy_utilization));
-    node.last_queue_depth = metrics.max_queue_depth;
+    zb::storage_model::NodeMetricsStreamState stream{
+        metrics.access_path, metrics.reporter_epoch, metrics.report_sequence,
+        metrics.window_end_ms, std::min(1.0, std::max(bandwidth_utilization, busy_utilization)),
+        metrics.max_queue_depth};
+    stream.read_operations = SaturatingAdd(same_reporter ? previous.read_operations : 0, metrics.read_operations);
+    stream.write_operations = SaturatingAdd(same_reporter ? previous.write_operations : 0, metrics.write_operations);
+    stream.read_bytes = SaturatingAdd(same_reporter ? previous.read_bytes : 0, metrics.read_bytes);
+    stream.write_bytes = SaturatingAdd(same_reporter ? previous.write_bytes : 0, metrics.write_bytes);
+    // 一个路径仅有一个活动报告者；旧报告者水位留在快照中，迟到的重试不会重复记账。
+    for (auto& old : node.metrics_streams)
+        if (old.access_path == metrics.access_path && old.reporter_epoch != metrics.reporter_epoch)
+            old.retired = true;
+    if (found == node.metrics_streams.end()) node.metrics_streams.push_back(stream);
+    else *found = stream;
+    node.last_utilization = 0;
+    node.last_queue_depth = 0;
+    for (const auto& current : node.metrics_streams) {
+        if (current.retired) continue;
+        if (accounting_ms - current.window_end_ms >= policy_.metrics_freshness_ms) continue;
+        node.last_utilization = std::max(node.last_utilization, current.utilization);
+        node.last_queue_depth = static_cast<uint32_t>(std::min<uint64_t>(
+            std::numeric_limits<uint32_t>::max(),
+            static_cast<uint64_t>(node.last_queue_depth) + current.queue_depth));
+    }
     node.last_metrics_end_ms = std::max(node.last_metrics_end_ms, metrics.window_end_ms);
     node.last_metrics_sequence = metrics.report_sequence == 0
                                      ? node.last_metrics_sequence
@@ -730,8 +801,9 @@ bool NodePowerManager::ReportMetrics(const std::string& node_id,
         node.last_access_ms = std::max(node.last_access_ms, reported_access);
         const bool peak = node.last_utilization >= policy_.peak_utilization ||
                           node.last_queue_depth >= policy_.peak_queue_depth;
-        SetPowerLevelLocked(&node, peak ? PowerLevel::kPeak : PowerLevel::kMedium,
-                            metrics.window_end_ms, true);
+        if (accounting_ms - metrics.window_end_ms < policy_.metrics_freshness_ms)
+            SetPowerLevelLocked(&node, peak ? PowerLevel::kPeak : PowerLevel::kMedium,
+                                accounting_ms, true);
     }
     ++generation_;
     return true;
@@ -1336,6 +1408,8 @@ bool NodePowerManager::AdvancePowerPolicyLocked(ManagedNodeRuntime* node, uint64
         consider_boundary(SaturatingAdd(node->last_access_ms, policy_.off_after_ms));
         consider_boundary(SaturatingAdd(node->power_state_enter_ms,
                                         policy_.minimum_residency_ms));
+        if (node->optical_library.telemetry_version != 0)
+            consider_boundary(SaturatingAdd(node->optical_library.valid_until_ms, 1));
         IntegrateEnergyLocked(node, next_ms);
     }
 
@@ -1383,11 +1457,25 @@ PowerLevel NodePowerManager::DesiredPowerLevelLocked(const ManagedNodeRuntime& n
         return PowerLevel::kOff;
     }
     if (node.profile.kind == ManagedNodeKind::kOpticalLibrary &&
+        node.optical_library.telemetry_version != 0 &&
+        (!node.optical_library.observed || !node.optical_library.inventory_valid ||
+         !node.optical_library.staging_valid || !node.optical_library.background_valid ||
+         now_ms > node.optical_library.valid_until_ms)) {
+        // 未知或失效的采样不能当作空闲证据；不影响旧协议或其他类型节点。
+        return PowerLevel::kMedium;
+    }
+    if (node.profile.kind == ManagedNodeKind::kOpticalLibrary &&
         node.optical_library.observed &&
-        (node.optical_library.pending_write_tasks != 0 ||
+        (node.optical_library.pending_archive_batches != 0 ||
+         node.optical_library.background_tasks != 0 ||
+         node.optical_library.pending_write_tasks != 0 ||
          node.optical_library.pending_read_tasks != 0 ||
          node.optical_library.busy_drives != 0)) {
-        return PowerLevel::kMedium;
+        const bool fresh = now_ms >= node.last_metrics_end_ms &&
+                           now_ms - node.last_metrics_end_ms < policy_.metrics_freshness_ms;
+        return fresh && (node.last_utilization >= policy_.peak_utilization ||
+                         node.last_queue_depth >= policy_.peak_queue_depth)
+                   ? PowerLevel::kPeak : PowerLevel::kMedium;
     }
     const uint64_t idle_ms = now_ms > node.last_access_ms ? now_ms - node.last_access_ms : 0;
     const bool may_power_off = policy_.allow_off_with_resident_data || node.resident_data_bytes == 0;

@@ -39,7 +39,10 @@ bool CmsNodeRegistry::IsRetired(const zb::rpc::ManagedNodeView& node) {
 }
 
 bool CmsNodeRegistry::IsWriteAllocatable(const zb::rpc::ManagedNodeView& node) {
-    if (!node.has_spec() || !node.spec().participates_in_placement() ||
+    const bool optical_archive = node.spec().kind() == zb::rpc::MANAGED_KIND_OPTICAL_LIBRARY &&
+                                 node.optical_library().telemetry_version() == 1 &&
+                                 node.optical_library().accepts_archive_writes();
+    if (!node.has_spec() || (!node.spec().participates_in_placement() && !optical_archive) ||
         node.lifecycle() != zb::rpc::MANAGED_LIFECYCLE_WORKING ||
         node.health() != zb::rpc::MANAGED_HEALTH_HEALTHY ||
         node.administrative_state() != zb::rpc::MANAGED_ADMIN_ENABLED ||
@@ -51,6 +54,16 @@ bool CmsNodeRegistry::IsWriteAllocatable(const zb::rpc::ManagedNodeView& node) {
     if (node.spec().kind() == zb::rpc::MANAGED_KIND_METADATA) return false;
     if (node.spec().kind() == zb::rpc::MANAGED_KIND_OPTICAL_LIBRARY) {
         const auto& optical = node.optical_library();
+        // 仅适配新版光盘采集契约；旧节点和普通数据节点的准入语义不变。
+        if (optical.telemetry_version() != 0 &&
+            (!optical.accepts_archive_writes() || !optical.observed() ||
+             !optical.inventory_valid() || !optical.staging_valid() ||
+             !optical.background_valid() || !node.readiness().observed() ||
+             !node.readiness().initialization_complete() || !node.readiness().metadata_ready() ||
+             !node.readiness().inventory_ready() ||
+             node.last_heartbeat_ms() > optical.valid_until_ms())) {
+            return false;
+        }
         if (optical.staging_capacity_bytes() > 0 &&
             static_cast<long double>(optical.staging_used_bytes()) /
                     static_cast<long double>(optical.staging_capacity_bytes()) >= 0.80L) {

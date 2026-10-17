@@ -144,6 +144,8 @@ uint64_t CalculateInternalBandwidthBytesPerSecond(
     const ManagedNodeProfile& profile,
     AccessPath path,
     zb::storage_model::IoDirection direction) {
+    if (path == AccessPath::kArchive || path == AccessPath::kMigration)
+        path = profile.kind == ManagedNodeKind::kOpticalLibrary ? AccessPath::kOpticalDisc : AccessPath::kDefault;
     uint64_t total = 0;
     for (const auto& group : profile.device_groups) {
         if (!GroupMatchesPath(group.kind, path)) continue;
@@ -309,6 +311,10 @@ const char* AccessPathName(AccessPath path) {
         return "OPTICAL_CACHE_HIT";
     case AccessPath::kOpticalDisc:
         return "OPTICAL_DISC";
+    case AccessPath::kArchive:
+        return "ARCHIVE";
+    case AccessPath::kMigration:
+        return "MIGRATION";
     }
     return "UNKNOWN";
 }

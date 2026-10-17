@@ -31,6 +31,8 @@ enum class AccessPath {
     kDefault = 0,
     kOpticalCacheHit = 1,
     kOpticalDisc = 2,
+    kArchive = 3,
+    kMigration = 4,
 };
 
 enum class IoDirection {
@@ -167,6 +169,7 @@ struct DeviceInventory {
     uint64_t write_bandwidth_bytes_per_sec{0};
     uint64_t accumulated_write_bytes{0};
     uint64_t last_update_ms{0};
+    std::string health_source; // 空值兼容旧节点；software/model/unknown 不声称硬件实测
 };
 
 struct NodeInventorySnapshot {
@@ -195,6 +198,31 @@ struct OpticalLibraryStatus {
     uint32_t pending_read_tasks{0};
     uint32_t busy_drives{0};
     uint64_t observed_at_ms{0};
+    uint32_t telemetry_version{0};
+    bool inventory_valid{false};
+    bool staging_valid{false};
+    bool background_valid{false};
+    bool physical_health_observed{false};
+    std::string observation_source;
+    std::string collection_error;
+    uint64_t pending_archive_batches{0};
+    uint64_t background_tasks{0};
+    uint64_t staging_read_reserved_bytes{0};
+    uint64_t staging_write_reserved_bytes{0};
+    uint64_t configured_disc_count{0};
+    uint64_t valid_until_ms{0};
+    bool accepts_archive_writes{false};
+};
+
+struct NodeMetricsStreamState {
+    AccessPath access_path{AccessPath::kDefault};
+    uint64_t reporter_epoch{0};
+    uint64_t report_sequence{0};
+    uint64_t window_end_ms{0};
+    double utilization{0.0};
+    uint32_t queue_depth{0};
+    bool retired{false};
+    uint64_t read_operations{0}, write_operations{0}, read_bytes{0}, write_bytes{0};
 };
 
 struct NodeReadinessStatus {
@@ -261,6 +289,7 @@ struct NodeRecord {
     uint64_t failure_count{0};
     OpticalLibraryStatus optical_library;
     NodeReadinessStatus readiness;
+    std::vector<NodeMetricsStreamState> metrics_streams;
 };
 
 inline constexpr uint32_t kNodeCatalogSnapshotFormatVersion = 2;

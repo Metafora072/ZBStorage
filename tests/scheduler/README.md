@@ -6,6 +6,17 @@
 
 ## 目录组织
 
+`model_closure_integration_test.py` 还覆盖原归档租约过期后的权威核对/重新申领及原请求幂等、成功启停操作在立即 SIGKILL 后仍可查询、后台分路计数恢复、磁盘与光盘的请求失败/超时及容量保护，以及 `ReloadModelConfigs` 热加实例后的共享入口读写、有限并发下管理 RPC 响应、重启恢复和最终退役。这些仍是实际服务手动闭环，不新增组件/单元测试或全仓 CTest 注册。
+
+MDS 清单接口手动系统闭环：先显式构建 `scheduler_server optical_node_server mds_server real_node_server scheduler_model_closure_probe`，再运行：
+
+```sh
+python3 tests/scheduler/optical_reporting_integration_test.py --build build-release --inventory-only
+# 可选 --external-root /mnt/md0，把私有真实数据放在指定外存，不改已有部署。
+```
+
+测试经过实际 Scheduler/MDS/磁盘/光盘服务，由既有归档入口下载真实文件并产生文件化介质，再用供 MDS 使用的 RPC/C++ 客户端查询；覆盖分页、旧代际、错误后端、令牌冲突和重启重建。只断言新增查询契约，不代替 MDS 位置提交、物理刻录或功耗验收。模型同协议在 `model_closure_integration_test.py` 的恢复阶段验证。均为手动入口，不新增 CTest/默认 ALL 测试目标。
+
 ```text
 tests/scheduler/
 ├── README.md
@@ -13,6 +24,7 @@ tests/scheduler/
 ├── external_test.py       # 外存真实 FUSE 负载入口
 ├── real_system_smoke.py   # 精简真实系统闭环：外存、FUSE、迁移、重启
 ├── real_drain_integration_test.py # 真实进程：并发写门禁、异常重启、迁移版本和后续写入
+├── optical_reporting_integration_test.py # 真实光盘/Scheduler/MDS：采集质量、准入、代际及去重恢复
 ├── inprocess_disk_server_restart_test.py # 独立服务进程：CMS 门禁、持久化和异常重启
 ├── inprocess_disk_route_probe.cpp # 上述系统测试的 RPC 驱动（不是单元测试）
 ├── model_closure_*.{cpp,py} # 迁移、代际、模型光盘及 FUSE 闭环
@@ -25,7 +37,11 @@ tests/scheduler/
 
 责任边界见 [Scheduler 接口说明](../../src/scheduler/api/README.md#开发与联调边界)。本目录的真实磁盘适配和进程内光盘模型由 Scheduler 负责；真实光盘库存/任务采集及归档回报、MDS 冷目录和 Masstree 流程由对应负责人交付。
 
+受托维护的光盘只读采集/上报适配也由本目录手动验证；不验收或改写光盘内部业务。`optical_reporting_integration_test.py` 启动正式进程，使用私有端口与数据库验证完整属性重报、质量来源、代际拒绝、双路去重和 Scheduler 重启恢复。CMS 准入探测使用私有空库中不存在的 inode，只执行门禁与查询，不提交文件位置变更；不代表完成光盘归档或迁移。
+
 `scheduler_model_closure_integration_test` 启动正式 Scheduler/MDS 并恢复模型归档位置后，以 `--optical_read_enabled=true` 挂载真实 FUSE，通过独立 `zbctl stage submit/wait` 进程准备文件后执行 POSIX 读取。构建该测试须包含 `zbctl`。这是完整软件调用链；读取内容为声明的模型生成数据。
+
+该用例还通过同一入口检查两个文件共卷/尾批、无目标时保留源、带数据模型光盘库迁移至第二库、强制逻辑停机时任务冻结、迁移中 `SIGKILL` 恢复及重启时延；随后重启 Scheduler/MDS 验证两个文件的位置和读回。只断言我们交付的模型和必要 MDS 位置接口，不将冷目录扫描、Masstree 发布或真实光盘业务作为通过条件。
 
 `scheduler_real_drain_integration_test` 启动真实 Scheduler/MDS/磁盘服务，四个并发写请求与退役请求竞争；确认普通写、复制写、写计划和文件提交均受门禁保护，源进程异常重启后仍关闭；新增目标后继续迁移，验证目标元数据版本接续、源清理、CMS 零引用和迁移后继续写。该用例使用隔离临时数据，不驱动硬件电源。
 
@@ -55,6 +71,7 @@ cmake --build build-release -j4
 python3 tests/scheduler/run.py local --files 12 --optical-check
 python3 tests/scheduler/run.py simulation
 python3 tests/scheduler/run.py meter-closure --files 1000
+python3 tests/scheduler/optical_reporting_integration_test.py --build build-release
 ```
 
 项目默认使用 RocksDB portable 构建，CI 也显式指定 `-DPORTABLE=ON`。已有构建目录如缓存了 `PORTABLE=0`，须用上面的命令覆盖后重建，避免 `-march=native` 产物在不同 CPU 的 runner/节点上启动即收到 SIGILL。仅在编译与部署 CPU 确定兼容时才显式使用 `-DPORTABLE=0`。复核 CI 问题应使用 Release 及上述系统测试，不以 Debug 结果替代。
@@ -300,6 +317,15 @@ python3 tests/scheduler/external_test.py \
 硬件分析完成前，单节点报告为 `PENDING_ANALYSIS`，顶层为 `RUNNING`；只有负载、服务清理、采样收尾及全部必需窗口分析都成功后才发布顶层 `PASS`。任一步失败，外存顶层和仓库索引统一为 `FAIL`。CLI 分别显示软件闭环、硬件测量和容量功率比目标，不把三者合并成一个笼统的通过结论。
 
 ## 审查后的错误处理约定
+
+真实文件化光盘库带数据退役闭环（手动，不注册 CTest）：
+
+```bash
+CCACHE_DISABLE=1 CCACHE_TEMPDIR=/tmp cmake --build build-release --target scheduler_server mds_server real_node_server optical_node_server zb_fuse_client zbctl -j6
+python3 tests/scheduler/physical_optical_handoff_integration_test.py --build build-release --external-root /mnt/md0
+```
+
+覆盖实际 FUSE 写入、真实下载/压缩/盘文件、排空源归档版本/摘要/租约提交、正式准备会话回读、未提交禁止源清理、源/目标强杀恢复、Scheduler 续传、目标重建、MDS 权威位置切换、旧源隔离、零引用及私有源进程实际停止，最后重启 MDS/目标后原路径读取。脚本内停止执行器只允许信号发送给本次 PID 文件对应的光盘源；不停止共享服务。不测硬件瓦数，不代表实体光驱验收；原始结果留在新建外存私有目录，不提交。
 
 - 配置、对象 ID 和分页 token 要求完整解析，拒绝非法值，不通过异常捕获后补默认值继续运行。
 - CMS compact ID 只在完整提案持久化成功后发布；失败提案/失败写库不消耗权威 ID，恢复时一次性校正下一个 ID，无需每次分配重复扫描全部节点。

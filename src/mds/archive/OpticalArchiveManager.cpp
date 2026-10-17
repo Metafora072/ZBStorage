@@ -167,7 +167,7 @@ OpticalArchiveManager::OpticalArchiveManager(RocksMetaStore* store,
                                              ArchiveBatchStager* batch_stager,
                                              ArchiveLeaseManager* lease_manager,
                                              Options options,
-                                             std::shared_mutex* placement_transaction_mu)
+                                             zb::rpc_support::FiberSharedMutex* placement_transaction_mu)
     : store_(store),
       cache_(cache),
       candidate_queue_(candidate_queue),
@@ -615,9 +615,9 @@ bool OpticalArchiveManager::RunOnce(std::string* error) {
                     }
                 }
                 if (!file_failed) {
-                    std::shared_lock<std::shared_mutex> placement_guard;
+                    std::shared_lock<zb::rpc_support::FiberSharedMutex> placement_guard;
                     if (placement_transaction_mu_) {
-                        placement_guard = std::shared_lock<std::shared_mutex>(*placement_transaction_mu_);
+                        placement_guard = std::shared_lock<zb::rpc_support::FiberSharedMutex>(*placement_transaction_mu_);
                     }
                     if (!cache_->IsWriteAdmitted(last_optical_location.node_id())) {
                         file_failed = true;
@@ -984,9 +984,9 @@ bool OpticalArchiveManager::BurnSealedBatch(const NodeSelection& optical,
 
         rocksdb::WriteBatch metadata_batch;
         std::string local_error;
-        std::shared_lock<std::shared_mutex> placement_guard;
+        std::shared_lock<zb::rpc_support::FiberSharedMutex> placement_guard;
         if (placement_transaction_mu_) {
-            placement_guard = std::shared_lock<std::shared_mutex>(*placement_transaction_mu_);
+            placement_guard = std::shared_lock<zb::rpc_support::FiberSharedMutex>(*placement_transaction_mu_);
         }
         std::unordered_map<uint64_t, const PreparedBurnTask*> representative_tasks;
         for (const auto& item : prepared) {

@@ -1,12 +1,18 @@
 #include "ManagedNodeSnapshotStore.h"
 
 #include <filesystem>
+#include <cmath>
 #include <fstream>
 #include <functional>
 #include <utility>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
 
 #include "../service/ManagedNodeProtoAdapter.h"
 #include "scheduler.pb.h"
+#include "../model/ClusterState.h"
 
 namespace zb::scheduler {
 
@@ -216,6 +222,7 @@ bool RuntimeFromProto(const zb::rpc::ManagedNodeRuntimeSnapshot& input,
         device.write_bandwidth_bytes_per_sec = item.write_bandwidth_bytes_per_sec();
         device.accumulated_write_bytes = item.accumulated_write_bytes();
         device.last_update_ms = item.last_update_ms();
+        device.health_source = item.health_source();
         node.inventory.devices.push_back(std::move(device));
     }
     node.accumulated_write_bytes = view.accumulated_write_bytes();
@@ -234,20 +241,20 @@ bool RuntimeFromProto(const zb::rpc::ManagedNodeRuntimeSnapshot& input,
         break;
     }
     if (view.has_optical_library()) {
-        const auto& optical = view.optical_library();
-        node.optical_library.observed = optical.observed();
-        node.optical_library.total_slots = optical.total_slots();
-        node.optical_library.local_disc_count = optical.local_disc_count();
-        node.optical_library.blank_disc_count = optical.blank_disc_count();
-        node.optical_library.recording_disc_count = optical.recording_disc_count();
-        node.optical_library.recorded_disc_count = optical.recorded_disc_count();
-        node.optical_library.defective_disc_count = optical.defective_disc_count();
-        node.optical_library.staging_capacity_bytes = optical.staging_capacity_bytes();
-        node.optical_library.staging_used_bytes = optical.staging_used_bytes();
-        node.optical_library.pending_write_tasks = optical.pending_write_tasks();
-        node.optical_library.pending_read_tasks = optical.pending_read_tasks();
-        node.optical_library.busy_drives = optical.busy_drives();
-        node.optical_library.observed_at_ms = optical.observed_at_ms();
+        if (!OpticalLibraryStatusFromProto(view.optical_library(), &node.optical_library, error))
+            return false;
+    }
+    for (const auto& item : view.metrics_streams()) {
+        if (!zb::rpc::ManagedAccessPath_IsValid(item.access_path()) ||
+            !std::isfinite(item.utilization()) || item.utilization() < 0 ||
+            item.utilization() > 1) {
+            if (error) *error = "invalid metrics stream in managed snapshot";
+            return false;
+        }
+        node.metrics_streams.push_back({AccessPathFromProto(item.access_path()),
+                                       item.reporter_epoch(), item.report_sequence(),
+                                       item.window_end_ms(), item.utilization(), item.queue_depth(), item.retired(),
+                                       item.read_operations(), item.write_operations(), item.read_bytes(), item.write_bytes()});
     }
     if (view.has_readiness()) {
         node.readiness.observed = view.readiness().observed();
@@ -278,7 +285,8 @@ bool RuntimeFromProto(const zb::rpc::ManagedNodeRuntimeSnapshot& input,
 
 } // namespace
 
-ManagedNodeSnapshotStore::ManagedNodeSnapshotStore(std::string path) : path_(std::move(path)) {}
+ManagedNodeSnapshotStore::ManagedNodeSnapshotStore(std::string path, ClusterState* state)
+    : path_(std::move(path)), state_(state) {}
 
 bool ManagedNodeSnapshotStore::Save(const NodePowerManager& manager,
                                     uint64_t now_ms,
@@ -286,8 +294,15 @@ bool ManagedNodeSnapshotStore::Save(const NodePowerManager& manager,
     if (path_.empty()) {
         return true;
     }
+    std::lock_guard<std::mutex> write_lock(write_mu_);
+    // 先复制操作结果再复制节点状态；成功操作产生于状态更新后，不能反向取样。
+    std::vector<zb::rpc::NodeOperation> operations;
+    uint64_t next_operation_id = 0;
+    if (state_) state_->SnapshotOperations(&operations, &next_operation_id);
     const NodePowerManagerSnapshot snapshot = manager.Snapshot();
     zb::rpc::ManagedNodeCatalogSnapshot encoded;
+    for (const auto& operation : operations) *encoded.add_operations() = operation;
+    encoded.set_next_operation_id(next_operation_id);
     encoded.set_format_version(snapshot.format_version);
     encoded.set_generation(snapshot.generation);
     encoded.set_saved_at_ms(now_ms);
@@ -337,6 +352,16 @@ bool ManagedNodeSnapshotStore::Save(const NodePowerManager& manager,
             return false;
         }
     }
+    const auto sync_path = [&](const std::filesystem::path& path, bool directory) {
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | (directory ? O_DIRECTORY : 0));
+        if (fd < 0) { if (error) *error = "snapshot sync open: " + std::string(std::strerror(errno)); return false; }
+        const int result = ::fsync(fd);
+        const int sync_error = errno;
+        ::close(fd);
+        if (result != 0 && error) *error = "snapshot fsync: " + std::string(std::strerror(sync_error));
+        return result == 0;
+    };
+    if (!sync_path(temporary, false)) return false;
     std::filesystem::rename(temporary, target, ec);
     if (ec) {
         if (error) {
@@ -344,7 +369,7 @@ bool ManagedNodeSnapshotStore::Save(const NodePowerManager& manager,
         }
         return false;
     }
-    return true;
+    return sync_path(target.parent_path().empty() ? std::filesystem::path(".") : target.parent_path(), true);
 }
 
 bool ManagedNodeSnapshotStore::Load(NodePowerManager* manager,
@@ -382,6 +407,9 @@ bool ManagedNodeSnapshotStore::Load(NodePowerManager* manager,
     snapshot.history.reserve(static_cast<size_t>(encoded.history_size()));
     for (const auto& item : encoded.history()) {
         snapshot.history.push_back({item.timestamp_ms(), SummaryFromProto(item.summary())});
+    }
+    if (state_ && !state_->RestoreOperations(encoded.operations(), encoded.next_operation_id(), restore_time_ms, error)) {
+        return false;
     }
     if (!manager->Restore(snapshot, error)) {
         return false;

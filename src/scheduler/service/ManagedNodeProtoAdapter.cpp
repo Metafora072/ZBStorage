@@ -349,6 +349,10 @@ AccessPath AccessPathFromProto(zb::rpc::ManagedAccessPath path) {
         return AccessPath::kOpticalCacheHit;
     case zb::rpc::MANAGED_ACCESS_OPTICAL_DISC:
         return AccessPath::kOpticalDisc;
+    case zb::rpc::MANAGED_ACCESS_ARCHIVE:
+        return AccessPath::kArchive;
+    case zb::rpc::MANAGED_ACCESS_MIGRATION:
+        return AccessPath::kMigration;
     case zb::rpc::MANAGED_ACCESS_DEFAULT:
         return AccessPath::kDefault;
     }
@@ -430,6 +434,20 @@ bool OpticalLibraryStatusFromProto(const zb::rpc::ManagedOpticalLibraryStatus& i
     status.pending_read_tasks = input.pending_read_tasks();
     status.busy_drives = input.busy_drives();
     status.observed_at_ms = input.observed_at_ms();
+    status.telemetry_version = input.telemetry_version();
+    status.inventory_valid = input.inventory_valid();
+    status.staging_valid = input.staging_valid();
+    status.background_valid = input.background_valid();
+    status.physical_health_observed = input.physical_health_observed();
+    status.observation_source = input.observation_source();
+    status.collection_error = input.collection_error();
+    status.pending_archive_batches = input.pending_archive_batches();
+    status.background_tasks = input.background_tasks();
+    status.staging_read_reserved_bytes = input.staging_read_reserved_bytes();
+    status.staging_write_reserved_bytes = input.staging_write_reserved_bytes();
+    status.configured_disc_count = input.configured_disc_count();
+    status.valid_until_ms = input.valid_until_ms();
+    status.accepts_archive_writes = input.accepts_archive_writes();
     if (!zb::storage_model::ValidateOpticalLibraryStatus(status, error)) return false;
     *output = status;
     return true;
@@ -484,6 +502,7 @@ void FillManagedNodeView(const ManagedNodeRuntime& node, zb::rpc::ManagedNodeVie
         out->set_write_bandwidth_bytes_per_sec(device.write_bandwidth_bytes_per_sec);
         out->set_accumulated_write_bytes(device.accumulated_write_bytes);
         out->set_last_update_ms(device.last_update_ms);
+        out->set_health_source(device.health_source);
     }
     output->set_accumulated_write_bytes(node.accumulated_write_bytes);
     output->set_failure_source(FailureSourceToProto(node.failure_source));
@@ -501,6 +520,34 @@ void FillManagedNodeView(const ManagedNodeRuntime& node, zb::rpc::ManagedNodeVie
     optical->set_pending_read_tasks(node.optical_library.pending_read_tasks);
     optical->set_busy_drives(node.optical_library.busy_drives);
     optical->set_observed_at_ms(node.optical_library.observed_at_ms);
+    optical->set_telemetry_version(node.optical_library.telemetry_version);
+    optical->set_inventory_valid(node.optical_library.inventory_valid);
+    optical->set_staging_valid(node.optical_library.staging_valid);
+    optical->set_background_valid(node.optical_library.background_valid);
+    optical->set_physical_health_observed(node.optical_library.physical_health_observed);
+    optical->set_observation_source(node.optical_library.observation_source);
+    optical->set_collection_error(node.optical_library.collection_error);
+    optical->set_pending_archive_batches(node.optical_library.pending_archive_batches);
+    optical->set_background_tasks(node.optical_library.background_tasks);
+    optical->set_staging_read_reserved_bytes(node.optical_library.staging_read_reserved_bytes);
+    optical->set_staging_write_reserved_bytes(node.optical_library.staging_write_reserved_bytes);
+    optical->set_configured_disc_count(node.optical_library.configured_disc_count);
+    optical->set_valid_until_ms(node.optical_library.valid_until_ms);
+    optical->set_accepts_archive_writes(node.optical_library.accepts_archive_writes);
+    for (const auto& stream : node.metrics_streams) {
+        auto* out = output->add_metrics_streams();
+        out->set_access_path(static_cast<zb::rpc::ManagedAccessPath>(stream.access_path));
+        out->set_reporter_epoch(stream.reporter_epoch);
+        out->set_report_sequence(stream.report_sequence);
+        out->set_window_end_ms(stream.window_end_ms);
+        out->set_utilization(stream.utilization);
+        out->set_queue_depth(stream.queue_depth);
+        out->set_retired(stream.retired);
+        out->set_read_operations(stream.read_operations);
+        out->set_write_operations(stream.write_operations);
+        out->set_read_bytes(stream.read_bytes);
+        out->set_write_bytes(stream.write_bytes);
+    }
     output->set_wake_count(node.wake_count);
     output->set_standby_transition_count(node.standby_transition_count);
     output->set_power_off_count(node.power_off_count);

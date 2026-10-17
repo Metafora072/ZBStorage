@@ -32,6 +32,15 @@ message SendArchiveMetadataRequest {
 
 message ArchiveReply {
   MdsStatus status = 1;
+  // 批次按文件幂等受理，不保证跨文件原子性。失败时已受理项继续执行；
+  // 使用相同操作 ID 重试整个批次不会重复预留容量。
+  repeated ArchiveFileAdmission admissions = 2;
+}
+
+message ArchiveFileAdmission {
+  string operation_id = 1;
+  uint64 inode_id = 2;
+  MdsStatus status = 3;
 }
 
 // —— 光盘读接口（客户端与真实光盘库节点的文件读取）——
@@ -42,11 +51,115 @@ enum OpticalStatusCode {
   OPTICAL_NOT_FOUND = 2;           // 引用的文件 / 会话 / 任务不存在
   OPTICAL_NOT_READY = 3;           // 文件准备尚未完成，不能建立读取会话
   OPTICAL_INTERNAL_ERROR = 4;      // 光盘库内部处理失败
+  OPTICAL_STALE_GENERATION = 5;    // 节点身份或实例代际不匹配，须重新查询 CMS
+  OPTICAL_CONFLICT = 6;            // 分页期间清单改变，丢弃已累积页后重新查询
 }
 
 message OpticalStatus {
   OpticalStatusCode code = 1;
   string message = 2;
+}
+message OpticalLibraryHandoffReply {
+  OpticalStatus status = 1;
+  OpticalLibraryHandoffRecord record = 2;
+  bytes data = 3;
+  uint64 received_bytes = 4; // QUERY(path) 的持久连续前缀；完整但哈希错误返回 0，允许重传
+}
+
+// MDS 使用的只读归档清单接口。只报告本地已完成介质记录，不触发归档、
+// 刻录、MDS 提交或源清理；也不以本地完成代替权威位置/版本校验。
+message ArchiveImageInfo {
+  string disk_id = 1;
+  string image_id = 2;
+  uint64 image_offset = 3;         // 真实后端：镜像在盘文件内的偏移，字节
+  uint64 image_length = 4;         // 真实镜像长度或模型编码占用，字节
+  string sha256 = 5;              // 已有索引记录值；查询不重新计算/验证业务载荷
+}
+
+message ListArchiveImagesRequest {
+  string node_id = 1;             // CMS 给出的实际目标节点，不能只用服务地址
+  uint64 instance_generation = 2; // 必须非零，防止查询替换后的其他实例
+  uint32 offset = 3;
+  uint32 limit = 4;               // 0 使用 128，最大 1024
+  string snapshot_token = 5;      // 第一页为空，后续传上一页值；变化返回 CONFLICT
+}
+
+message ListArchiveImagesReply {
+  OpticalStatus status = 1;
+  string node_id = 2;
+  uint64 instance_generation = 3;
+  bool modeled = 4;               // true 是逻辑介质，不能用于删除真实源副本
+  string snapshot_token = 5;
+  repeated ArchiveImageInfo images = 6;
+  bool has_more = 7;
+  uint32 next_offset = 8;
+}
+
+message ArchiveImageFile {
+  uint64 inode_id = 1;
+  uint64 size = 2;                // 文件逻辑大小，字节
+  bool has_file_version = 3;      // 真实卷格式没有版本时必须为 false，不猜测版本
+  uint64 file_version = 4;
+  string payload_sha256 = 5; // 显式请求时，流式读取/解压实际载荷得到；不是索引摘要
+}
+
+message GetArchiveImageFilesRequest {
+  string node_id = 1;
+  uint64 instance_generation = 2;
+  string image_id = 3;
+  uint32 offset = 4;
+  uint32 limit = 5;               // 0 使用 128，最大 1024
+  string snapshot_token = 6;      // 同一镜像的文件清单令牌，分页变化时重新查询
+  string disk_id = 7;             // 与 image_id 联合定位，避免盘内编号被误当全局编号
+  uint64 digest_inode_id = 8;     // 0 不读载荷；非零仅为该文件计算摘要（用于真实交接核验）
+}
+
+message GetArchiveImageFilesReply {
+  OpticalStatus status = 1;
+  string node_id = 2;
+  uint64 instance_generation = 3;
+  bool modeled = 4;
+  string snapshot_token = 5;
+  ArchiveImageInfo image = 6;
+  repeated ArchiveImageFile files = 7;
+  bool has_more = 8;
+  uint32 next_offset = 9;
+}
+
+// 任务观察与介质完成分离：真实引擎 WRITE/FINISH 只是压缩阶段结束，
+// 不表示整文件刻录或 MDS 提交；完成事实仍由介质清单与权威事务核对。
+message ArchiveTaskInfo {
+  string task_id = 1;
+  string operation_id = 2;         // 模型归档幂等标识；真实旧任务未记录时为空
+  uint64 inode_id = 3;            // 盘级任务没有单个 inode，返回 0
+  string phase = 4;
+  bool terminal = 5;              // 此任务终态，不等于文件归档完成
+  bool failed = 6;
+  string error = 7;
+  string disk_id = 8;
+  repeated string image_ids = 9;
+  uint64 state_changed_at_ms = 10;
+  bool has_file_version = 11;
+  uint64 file_version = 12;
+  uint64 size = 13;
+  bool local_media_complete = 14;  // 仅模型明确有持久逻辑文件时为 true
+}
+message ListArchiveTasksRequest {
+  string node_id = 1;
+  uint64 instance_generation = 2;
+  uint32 offset = 3;
+  uint32 limit = 4;
+  string snapshot_token = 5;
+}
+message ListArchiveTasksReply {
+  OpticalStatus status = 1;
+  string node_id = 2;
+  uint64 instance_generation = 3;
+  bool modeled = 4;
+  string snapshot_token = 5;
+  repeated ArchiveTaskInfo tasks = 6;
+  bool has_more = 7;
+  uint32 next_offset = 8;
 }
 
 // 客户端建立准备完成通知通道：RPC 上附带一个 brpc Stream（传输层对象，非 proto 字段），
@@ -188,6 +301,13 @@ message ReadObjectByInodeIdReply {
 
 // 光盘库节点对外提供的服务：归档入口（MDS 下发文件信息）+ 数据面读 + 读取通知订阅。
 service OpticalNodeService {
+  // Scheduler 管理交接；真实节点执行，仿真节点不接受真实介质导入。
+  rpc ManageLibraryHandoff(OpticalLibraryHandoffRequest) returns (OpticalLibraryHandoffReply);
+  rpc ListArchiveTasks(ListArchiveTasksRequest) returns (ListArchiveTasksReply);
+  // MDS 拉取已完成的盘片/镜像清单，并从其卷元数据查询文件映射。
+  // 重启后从现有持久索引重建；受理归档成功不保证立即出现在清单中。
+  rpc ListArchiveImages(ListArchiveImagesRequest) returns (ListArchiveImagesReply);
+  rpc GetArchiveImageFiles(GetArchiveImageFilesRequest) returns (GetArchiveImageFilesReply);
   rpc SendArchiveMetadata(SendArchiveMetadataRequest) returns (ArchiveReply);
 
   rpc SubscribeReadEvents(SubscribeReadEventsRequest)

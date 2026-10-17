@@ -31,6 +31,8 @@
 #include "../storage/RocksMetaStore.h"
 #include "mds.pb.h"
 #include "common/metrics/NodeMetricsCollector.h"
+#include "common/rpc/FiberSharedMutex.h"
+#include <bthread/mutex.h>
 
 namespace zb::mds {
 
@@ -53,9 +55,15 @@ public:
                    FileArchiveCandidateQueue* candidate_queue = nullptr,
                    ArchiveLeaseManager* lease_manager = nullptr);
     ~MdsServiceImpl() override;
+    void CommitPhysicalOpticalArchive(google::protobuf::RpcController*, const zb::rpc::ModelOpticalArchiveRequest*,
+                                      zb::rpc::ModelOpticalArchiveReply*, google::protobuf::Closure*) override;
+    // 整库权威交接：目标持久重建完成后切换；查询用于源释放门禁。
+    void CommitOpticalLibraryHandoff(google::protobuf::RpcController*,
+        const zb::rpc::CommitOpticalLibraryHandoffRequest*, zb::rpc::CommitOpticalLibraryHandoffReply*,
+        google::protobuf::Closure*) override;
 
     zb::metrics::NodeMetricsCollector* MetricsCollector() { return &metrics_; }
-    std::shared_mutex* PlacementTransactionMutex() { return &placement_transaction_mu_; }
+    zb::rpc_support::FiberSharedMutex* PlacementTransactionMutex() { return &placement_transaction_mu_; }
 
     void Lookup(google::protobuf::RpcController* cntl_base,
                 const zb::rpc::LookupRequest* request,
@@ -118,6 +126,11 @@ public:
                              const zb::rpc::ModelOpticalArchiveRequest* request,
                              zb::rpc::ModelOpticalArchiveReply* response,
                              google::protobuf::Closure* done) override;
+    // Scheduler 模型光盘排空的最小位置 CAS 适配，不执行真实光盘业务。
+    void CommitModelOpticalMigration(google::protobuf::RpcController*,
+                                    const zb::rpc::CommitModelOpticalMigrationRequest*,
+                                    zb::rpc::CommitModelOpticalMigrationReply*,
+                                    google::protobuf::Closure*) override;
     void CommitCmsNodeCatalog(google::protobuf::RpcController* cntl_base,
                               const zb::rpc::CommitCmsNodeCatalogRequest* request,
                               zb::rpc::CommitCmsNodeCatalogReply* response,
@@ -201,6 +214,11 @@ public:
                                    google::protobuf::Closure* done) override;
 
 private:
+    void HandleOpticalArchive(const zb::rpc::ModelOpticalArchiveRequest*, zb::rpc::ModelOpticalArchiveReply*, bool physical);
+    bool VerifyPhysicalArchive(const zb::rpc::ModelOpticalArchiveRequest&, std::string*) const;
+    bool ResolveOpticalHandoff(zb::rpc::OpticalFileLocation*, std::string*) const;
+    void ResolvePackedOpticalNode(zb::rpc::OpticalFileLocation*) const;
+    bool CountColdNodeReferences(const std::string&, uint64_t*, uint64_t*, std::string*) const;
     struct MasstreeImportJob {
         enum class Kind {
             kGenerateTemplate,
@@ -348,10 +366,10 @@ private:
     uint64_t masstree_import_next_job_id_{1};
     bool stop_masstree_import_worker_{false};
     mutable std::mutex channel_mu_;
-    mutable std::mutex file_migration_mu_;
+    mutable bthread::Mutex file_migration_mu_;
     // Shared by Create and exclusively held by catalog admission changes and
     // retirement verification. This closes the allocation-vs-retire race.
-    mutable std::shared_mutex placement_transaction_mu_;
+    mutable zb::rpc_support::FiberSharedMutex placement_transaction_mu_;
     std::unordered_map<std::string, std::unique_ptr<brpc::Channel>> channels_;
 };
 

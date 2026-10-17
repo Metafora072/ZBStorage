@@ -1,4 +1,5 @@
 #include <brpc/channel.h>
+#include <brpc/errno.pb.h>
 #include <brpc/server.h>
 #include <gflags/gflags.h>
 
@@ -11,6 +12,8 @@
 #include <memory>
 #include <thread>
 #include <utility>
+#include <limits>
+#include <google/protobuf/util/message_differencer.h>
 
 #include "../config/OpticalNodeConfig.h"
 #include "../service/BrpcOpticalNodeService.h"
@@ -40,6 +43,14 @@ struct HeartbeatInventoryConfig {
     uint64_t drive_write_bytes_per_sec{0};   // 单光驱写带宽
 };
 
+uint64_t InventoryBytes(uint64_t count, uint64_t unit, bool* valid) {
+    if (unit != 0 && count > std::numeric_limits<uint64_t>::max() / unit) {
+        *valid = false;
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return count * unit;
+}
+
 // 一次性注册光盘库受管节点身份。启动阶段同步执行，带有限次重试；成功后进程内不再发送
 // 注册请求（重复发送也会被服务端 ALREADY_EXISTS 幂等吸收）。
 // 与心跳上报分离：注册只在生命周期入口执行一次，心跳是周期性运行态上报。
@@ -55,6 +66,7 @@ public:
     // 同步注册：返回是否已确认（SCHED_OK / SCHED_ALREADY_EXISTS）。
     // 传输层失败重试至多 kMaxAttempts 次；服务端明确拒绝则立即停止并回填 *error。
     bool Register(std::string* error) {
+        reporting_only_peer_ = false;
         for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
             if (!EnsureChannel()) {
                 if (attempt < kMaxAttempts) {
@@ -68,6 +80,10 @@ public:
                 return true;
             }
             if (error) *error = attempt_error;
+            if (outcome == RegisterOutcome::kUnsupported) {
+                reporting_only_peer_ = true;
+                return false;
+            }
             if (outcome == RegisterOutcome::kRejected) {
                 return false;
             }
@@ -81,9 +97,12 @@ public:
         return false;
     }
 
+    // 旧联调观察端可能只有心跳 RPC；观测可继续，但绝不视作受管注册成功。
+    bool reporting_only_peer() const { return reporting_only_peer_; }
+
 private:
     // 单次注册尝试的结果：已注册（含 ALREADY_EXISTS）/ 服务端明确拒绝 / 传输层失败可重试。
-    enum class RegisterOutcome { kRegistered, kRejected, kTransient };
+    enum class RegisterOutcome { kRegistered, kRejected, kTransient, kUnsupported };
 
     // 出站 channel 懒初始化；失败返回 false，由调用方按间隔重试。
     bool EnsureChannel() {
@@ -117,50 +136,55 @@ private:
         brpc::Controller cntl;
         stub.RegisterManagedNode(&cntl, &request, &response, nullptr);
         if (cntl.Failed()) {
-            if (error) *error = cntl.ErrorText();
+            const std::string detail = cntl.ErrorText();
+            if (error) *error = detail;
+            if (cntl.ErrorCode() == brpc::ENOMETHOD || cntl.ErrorCode() == brpc::ENOSERVICE ||
+                detail.find("Method RegisterManagedNode() not implemented") != std::string::npos)
+                return RegisterOutcome::kUnsupported;
             return RegisterOutcome::kTransient;
         }
         if (response.status().code() == zb::rpc::SCHED_OK ||
             response.status().code() == zb::rpc::SCHED_ALREADY_EXISTS) {
-            WarnIfProfileMismatch(request.spec(), response);
+            if (!CheckProfile(request.spec(), response, error)) return RegisterOutcome::kRejected;
             return RegisterOutcome::kRegistered;
         }
         if (error) *error = response.status().message();
         return RegisterOutcome::kRejected;
     }
 
-    // 校验服务端最终采纳的 profile 是否等于我们发送的 spec，防止被静默覆盖：
-    //   - SCHED_OK 下应完全一致；
-    //   - SCHED_ALREADY_EXISTS 下若命中“之前由心跳自动注册的默认模板”，就会不一致。
-    // 不一致只告警、不回退：注册本身已确认成功，但节点属性可能非预期。
-    void WarnIfProfileMismatch(const zb::rpc::ManagedNodeSpec& intended,
-                               const zb::rpc::ManagedNodeReply& reply) {
+    // 重复注册只表示 ID 已存在；必须读回并核对，不覆盖 CMS 的既有代际或 tombstone。
+    bool CheckProfile(const zb::rpc::ManagedNodeSpec& intended,
+                      const zb::rpc::ManagedNodeReply& reply, std::string* error) {
+        zb::rpc::ManagedNodeReply current = reply;
         if (!reply.has_node()) {
-            std::cerr << "Scheduler registration reply has no node view; cannot verify profile"
-                      << std::endl;
-            return;
+            zb::rpc::GetManagedNodeRequest request;
+            request.set_node_id(intended.node_id());
+            zb::rpc::SchedulerService_Stub stub(channel_.get());
+            brpc::Controller cntl;
+            stub.GetManagedNode(&cntl, &request, &current, nullptr);
+            if (cntl.Failed() || current.status().code() != zb::rpc::SCHED_OK || !current.has_node()) {
+                if (error) *error = "cannot read registered optical profile";
+                return false;
+            }
         }
-        const zb::rpc::ManagedNodeSpec& actual = reply.node().spec();
-        if (intended.SerializeAsString() == actual.SerializeAsString()) {
-            return;
+        if (current.node().lifecycle() == zb::rpc::MANAGED_LIFECYCLE_RETIRED) {
+            if (error) *error = "optical identity has a retired tombstone";
+            return false;
         }
-        std::cerr << "Scheduler registration profile mismatch (node=" << actual.node_id()
-                  << "): device_groups expected=" << intended.device_groups_size()
-                  << " actual=" << actual.device_groups_size()
-                  << ", logical_node_count actual=" << actual.logical_node_count()
-                  << ", participates_in_placement actual=" << actual.participates_in_placement()
-                  << ", peak_milliwatts actual="
-                  << (actual.has_power() ? actual.power().peak_milliwatts() : 0)
-                  << "; the node may be running with a different profile than configured"
-                  << std::endl;
+        if (!google::protobuf::util::MessageDifferencer::Equivalent(intended, current.node().spec())) {
+            if (error) *error = "registered optical profile differs from configuration; operator reconciliation required";
+            return false;
+        }
+        return true;
     }
 
     std::string scheduler_addr_;
     zb::rpc::RegisterManagedNodeRequest register_request_;
     uint32_t interval_ms_{2000};
     std::unique_ptr<brpc::Channel> channel_;
+    bool reporting_only_peer_{false};
 
-    // 注册尝试上限（每次间隔 interval_ms_）；用尽后由心跳的隐式自动注册兜底。
+    // 单轮注册尝试上限；未确认时保留完整请求，下一轮重试，不降级为默认模板。
     static constexpr int kMaxAttempts = 5;
 };
 
@@ -177,6 +201,7 @@ public:
                                uint32_t virtual_node_count,
                                uint32_t interval_ms,
                                HeartbeatInventoryConfig inventory_config,
+                               zb::rpc::RegisterManagedNodeRequest registration,
                                zb::optical_node::OpticalStorageServiceImpl* service)
         : scheduler_addr_(std::move(scheduler_addr)),
           node_id_(std::move(node_id)),
@@ -189,6 +214,7 @@ public:
           virtual_node_count_(virtual_node_count == 0 ? 1 : virtual_node_count),
           interval_ms_(interval_ms == 0 ? 2000 : interval_ms),
           inventory_config_(inventory_config),
+          registration_(std::move(registration)),
           service_(service) {}
 
     bool Start() {
@@ -231,8 +257,11 @@ private:
     // 上报光盘库专属状态：盘片分类（blank/recording/recorded/defective）、暂存区、后台任务、忙光驱。
     // 口径：local = 光盘数量；recording = cd_manager 正在执行的刻录任务数；recorded = 已用光盘数；
     // defective 恒 0；blank = local − recording − recorded − defective；total_slots = 光盘架槽位数。
-    void ReportLibraryStatus(zb::rpc::SchedulerService_Stub& stub) {
-        const auto inv = service_->GetLibraryInventory();
+    void ReportLibraryStatus(zb::rpc::SchedulerService_Stub& stub,
+                             const optical_node_manager::OpticalLibraryInventory& inv) {
+        bool valid = inv.inventory_valid && inv.disc_count <= 0xFFFFFFFFull &&
+                     inv.slot_count <= 0xFFFFFFFFull;
+        InventoryBytes(inv.disc_count, inventory_config_.disc_capacity_bytes, &valid);
         const uint32_t disc_count =
             static_cast<uint32_t>(std::min<uint64_t>(inv.disc_count, 0xFFFFFFFFull));
         const uint32_t total_slots = static_cast<uint32_t>(
@@ -241,16 +270,20 @@ private:
             static_cast<uint32_t>(std::min<uint64_t>(inv.disc_used, disc_count));
         const uint32_t recording =
             static_cast<uint32_t>(std::min<uint64_t>(inv.disc_burning, disc_count - recorded));
-        const uint64_t staging_capacity =
-            inv.staging_capacity_images * inventory_config_.volume_size_bytes;
-        const uint64_t staging_used =
-            std::min(inv.staging_used_images, inv.staging_capacity_images) *
-            inventory_config_.volume_size_bytes;
+        const uint64_t staging_capacity = InventoryBytes(
+            inv.staging_capacity_images, inventory_config_.volume_size_bytes, &valid);
+        const uint64_t staging_used = InventoryBytes(
+            inv.staging_used_images, inventory_config_.volume_size_bytes, &valid);
+        const uint64_t read_reserved = InventoryBytes(
+            inv.staging_read_images, inventory_config_.volume_size_bytes, &valid);
+        const uint64_t write_reserved = InventoryBytes(
+            inv.staging_write_images, inventory_config_.volume_size_bytes, &valid);
 
         zb::rpc::ReportOpticalLibraryStatusRequest request;
         request.set_node_id(node_id_);
+        request.set_instance_generation(registration_.spec().instance_generation());
         auto* status = request.mutable_status();
-        status->set_observed(true);
+        status->set_observed(valid);
         status->set_total_slots(total_slots);
         status->set_local_disc_count(disc_count);
         status->set_blank_disc_count(disc_count - recorded - recording);
@@ -264,7 +297,26 @@ private:
         status->set_pending_read_tasks(
             static_cast<uint32_t>(std::min<uint64_t>(inv.pending_read_tasks, 0xFFFFFFFFull)));
         status->set_busy_drives(inv.drive_busy);
-        status->set_observed_at_ms(NowMs());
+        status->set_observed_at_ms(inv.observed_at_ms);
+        status->set_telemetry_version(1);
+        status->set_inventory_valid(valid);
+        status->set_staging_valid(inv.staging_valid && valid);
+        status->set_background_valid(inv.background_valid &&
+            inv.pending_write_tasks <= 0xFFFFFFFFull && inv.pending_read_tasks <= 0xFFFFFFFFull);
+        status->set_physical_health_observed(false); // 当前没有 SMART/光驱/坏盘硬件探测源。
+        status->set_observation_source("cd_manager_sim; staging=image_reservations; health=software/model");
+        status->set_collection_error(inv.collection_error + (valid ? "" : "inventory unverified; "));
+        status->set_pending_archive_batches(inv.pending_archive_batches);
+        status->set_background_tasks(inv.background_tasks);
+        status->set_staging_read_reserved_bytes(read_reserved);
+        status->set_staging_write_reserved_bytes(write_reserved);
+        for (const auto& group : registration_.spec().device_groups())
+            if (group.kind() == zb::rpc::MANAGED_DEVICE_DISC)
+                status->set_configured_disc_count(group.device_count());
+        status->set_valid_until_ms(inv.observed_at_ms + std::max<uint64_t>(10000, 5ull * interval_ms_));
+        status->set_accepts_archive_writes(valid && inv.staging_valid && inv.background_valid &&
+                                          inv.metadata_ready && disc_count > recorded + recording &&
+                                          !service_->IsHandoffSuspended());
 
         zb::rpc::ManagedNodeReply response;
         brpc::Controller cntl;
@@ -279,44 +331,65 @@ private:
 
     void Run() {
         std::unique_ptr<brpc::Channel> channel;
+        OpticalNodeSchedulerRegistrar registrar(scheduler_addr_, registration_, interval_ms_);
+        bool registered = false;
         while (!stop_.load()) {
+            if (!registered) {
+                std::string error;
+                registered = registrar.Register(&error);
+                if (!registered) {
+                    std::cerr << "Scheduler optical registration unconfirmed: " << error << std::endl;
+                    if (!registrar.reporting_only_peer()) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_));
+                        continue;
+                    }
+                }
+            }
             if (!EnsureChannel(&channel)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_));
                 continue;
             }
 
             zb::rpc::SchedulerService_Stub stub(channel.get());
+            const auto inv = service_->GetLibraryInventory();
+            // 同一轮采样先上报库状态，再心跳；不把不同时间的两份库存当成一个快照。
+            ReportLibraryStatus(stub, inv);
             zb::rpc::HeartbeatRequest request;
             request.set_node_id(node_id_);
             request.set_node_type(zb::rpc::NODE_OPTICAL);
             request.set_address(node_address_);
             request.set_weight(node_weight_);
             request.set_virtual_node_count(virtual_node_count_);
-            request.set_report_ts_ms(NowMs());
+            request.set_report_ts_ms(inv.observed_at_ms);
             request.set_group_id(group_id_);
             request.set_role(configured_role_);
             request.set_peer_node_id(peer_node_id_);
             request.set_peer_address(peer_address_);
             request.set_applied_lsn(service_->GetReplicationStatus().applied_lsn);
+            request.set_instance_generation(registration_.spec().instance_generation());
+            request.set_require_registered(true);
+            request.set_inventory_unavailable(!inv.inventory_valid || !inv.staging_valid);
             request.set_readiness_reported(true);
             request.set_initialization_complete(service_->IsArchiveEngineReady());
-            request.set_metadata_ready(service_->IsArchiveEngineReady());
+            request.set_metadata_ready(inv.metadata_ready);
             request.set_readiness_message(
-                "archive engine running; library inventory attached");
+                inv.collection_error.empty() ? "software inventory ready; physical health unobserved"
+                                             : inv.collection_error);
 
             // 设备清单：与 profile 三组对齐——hdd-cache ×1、disc ×1（盘片容量聚合）、
             // optical-drive 逐光驱 drive_total 条。inventory 只参与容量/空闲/健康/带宽求和。
-            const auto inv = service_->GetLibraryInventory();
+            bool bytes_valid = true;
             {
                 zb::rpc::DiskHeartbeat* cache = request.add_disks();
                 cache->set_disk_id("hdd-cache");
                 cache->set_device_kind(zb::rpc::MANAGED_DEVICE_HDD);
                 const uint64_t capacity_images = inv.staging_capacity_images;
                 const uint64_t used_images = std::min(inv.staging_used_images, capacity_images);
-                cache->set_capacity_bytes(capacity_images * inventory_config_.volume_size_bytes);
+                cache->set_capacity_bytes(InventoryBytes(capacity_images, inventory_config_.volume_size_bytes, &bytes_valid));
                 cache->set_free_bytes(
-                    (capacity_images - used_images) * inventory_config_.volume_size_bytes);
-                cache->set_is_healthy(true);
+                    InventoryBytes(capacity_images - used_images, inventory_config_.volume_size_bytes, &bytes_valid));
+                cache->set_is_healthy(inv.cache_healthy);
+                cache->set_health_source(inv.cache_healthy ? "software" : "unknown");
                 cache->set_read_bandwidth_bytes_per_sec(inventory_config_.cache_read_bytes_per_sec);
                 cache->set_write_bandwidth_bytes_per_sec(inventory_config_.cache_write_bytes_per_sec);
                 // 累计写入字节不随心跳上报（与 real_node 口径一致），统一由 ReportNodeMetrics 的
@@ -327,10 +400,13 @@ private:
                 disc->set_disk_id("disc");
                 disc->set_device_kind(zb::rpc::MANAGED_DEVICE_DISC);
                 const uint64_t used_discs = std::min(inv.disc_used, inv.disc_count);
-                disc->set_capacity_bytes(inventory_config_.disc_capacity_bytes * inv.disc_count);
+                const uint64_t reserved_discs = std::min(inv.disc_burning, inv.disc_count - used_discs);
+                disc->set_capacity_bytes(InventoryBytes(inv.disc_count, inventory_config_.disc_capacity_bytes, &bytes_valid));
                 disc->set_free_bytes(
-                    inventory_config_.disc_capacity_bytes * (inv.disc_count - used_discs));
-                disc->set_is_healthy(true);
+                    InventoryBytes(inv.disc_count - used_discs - reserved_discs,
+                                   inventory_config_.disc_capacity_bytes, &bytes_valid));
+                disc->set_is_healthy(inv.inventory_valid);
+                disc->set_health_source(inv.inventory_valid ? "model" : "unknown");
                 // 盘片介质本身无读写带宽（与 profile 的 disc 组一致）；带宽由光驱条目承载。
             }
             for (uint32_t i = 0; i < inv.drive_total; ++i) {
@@ -339,10 +415,12 @@ private:
                 drive->set_device_kind(zb::rpc::MANAGED_DEVICE_OPTICAL_DRIVE);
                 drive->set_capacity_bytes(0);
                 drive->set_free_bytes(0);
-                drive->set_is_healthy(true);
+                drive->set_is_healthy(inv.inventory_valid);
+                drive->set_health_source(inv.inventory_valid ? "model" : "unknown");
                 drive->set_read_bandwidth_bytes_per_sec(inventory_config_.drive_read_bytes_per_sec);
                 drive->set_write_bandwidth_bytes_per_sec(inventory_config_.drive_write_bytes_per_sec);
             }
+            if (!bytes_valid) request.set_inventory_unavailable(true);
 
             zb::rpc::HeartbeatReply response;
             brpc::Controller cntl;
@@ -351,7 +429,7 @@ private:
                 std::cerr << "Scheduler heartbeat failed: " << cntl.ErrorText() << std::endl;
                 channel.reset();
             } else {
-                if (response.status().code() == zb::rpc::SCHED_OK) {
+                if (response.status().code() == zb::rpc::SCHED_OK && registered) {
                     bool is_primary = response.assigned_role() == zb::rpc::NODE_ROLE_PRIMARY;
                     configured_role_ = response.assigned_role();
                     service_->ApplySchedulerAssignment(is_primary,
@@ -362,8 +440,17 @@ private:
                                                        response.secondary_node_id(),
                                                        response.secondary_address());
                 }
-                // 同一通道、同一节拍上报光盘库专属状态；失败只记日志，不影响心跳循环。
-                ReportLibraryStatus(stub);
+                else if (response.status().code() != zb::rpc::SCHED_OK) {
+                    std::cerr << "Scheduler optical heartbeat rejected: " << response.status().message() << std::endl;
+                    registered = false;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_));
+                    continue;
+                }
+                // 仅心跳观察端不提供受管权威，不消费其角色分配，也不确认指标窗口。
+                if (!registered) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_));
+                    continue;
+                }
 
                 // 数据面 I/O 指标窗口：按访问路径分两个采集器（cache-hit / disc-miss）。
                 // 无活动时 helper 内部直接跳过；成功后确认本地窗口避免重复计数。
@@ -373,7 +460,7 @@ private:
                                                          service_->metrics_cache_hit(),
                                                          zb::rpc::MANAGED_ACCESS_OPTICAL_CACHE_HIT,
                                                          NowMs(),
-                                                         &metrics_error)) {
+                                                         &metrics_error, registration_.spec().instance_generation())) {
                     std::cerr << "Scheduler cache-hit metrics report failed: " << metrics_error << std::endl;
                 }
                 if (!zb::metrics::ReportCollectedMetrics(channel.get(),
@@ -381,8 +468,13 @@ private:
                                                          service_->metrics_disc(),
                                                          zb::rpc::MANAGED_ACCESS_OPTICAL_DISC,
                                                          NowMs(),
-                                                         &metrics_error)) {
+                                                         &metrics_error, registration_.spec().instance_generation())) {
                     std::cerr << "Scheduler disc metrics report failed: " << metrics_error << std::endl;
+                }
+                if (!zb::metrics::ReportCollectedMetrics(channel.get(), node_id_,
+                        service_->metrics_migration(), zb::rpc::MANAGED_ACCESS_MIGRATION,
+                        NowMs(), &metrics_error, registration_.spec().instance_generation())) {
+                    std::cerr << "Scheduler library migration metrics report failed: " << metrics_error << std::endl;
                 }
             }
 
@@ -401,6 +493,7 @@ private:
     uint32_t virtual_node_count_{1};
     uint32_t interval_ms_{2000};
     HeartbeatInventoryConfig inventory_config_;
+    zb::rpc::RegisterManagedNodeRequest registration_;
     zb::optical_node::OpticalStorageServiceImpl* service_{};
     std::atomic<bool> stop_{false};
     std::thread thread_;
@@ -512,7 +605,7 @@ int main(int argc, char* argv[]) {
     }
 
     zb::optical_node::OpticalStorageServiceImpl storage_service(cfg);
-    if (!storage_service.IsArchiveEngineReady()) {
+    if (!storage_service.IsArchiveEngineReady() && !storage_service.IsHandoffSuspended()) {
         std::cerr << "Failed to start archive engine: "
                   << storage_service.GetArchiveStatusDetail() << std::endl;
         return 1;
@@ -553,6 +646,7 @@ int main(int argc, char* argv[]) {
                                         cfg.virtual_node_count,
                                         cfg.heartbeat_interval_ms,
                                         BuildHeartbeatInventoryConfig(cfg),
+                                        BuildRegisterRequest(cfg, node_id),
                                         &storage_service);
     if (server.Start(FLAGS_port, &options) != 0) {
         std::cerr << "Failed to start brpc server on port " << FLAGS_port << std::endl;
@@ -560,16 +654,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (!cfg.scheduler_addr.empty()) {
-        // 启动阶段一次性注册（同步、带有限重试）；成功后才开始周期心跳。
-        // 未确认时仍继续心跳，由心跳的隐式自动注册兜底（profile 退化为默认模板）。
-        OpticalNodeSchedulerRegistrar registrar(cfg.scheduler_addr,
-                                                BuildRegisterRequest(cfg, node_id),
-                                                cfg.heartbeat_interval_ms);
-        std::string register_error;
-        if (!registrar.Register(&register_error)) {
-            std::cerr << "Scheduler managed-node registration not confirmed: " << register_error
-                      << "; heartbeat will rely on implicit auto-registration" << std::endl;
-        }
+        // 注册与周期采集均在 reporter 中；断线恢复保留完整属性，不修改归档引擎。
         reporter.Start();
     }
 

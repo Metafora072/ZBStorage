@@ -20,6 +20,8 @@
 #include "../storage/UnifiedInodeLocation.h"
 #include "../storage/UnifiedInodeRecord.h"
 #include "real_node.pb.h"
+#include "optical_node.pb.h"
+#include "common/rpc/HandoffFiles.h"
 
 namespace zb::mds {
 
@@ -1235,7 +1237,7 @@ void MdsServiceImpl::Create(google::protobuf::RpcController* cntl_base,
     // A CMS catalog commit that closes node admission, and the final
     // zero-reference scan, take this lock exclusively. Thus no Create can
     // select an old node and publish its inode across the retirement barrier.
-    std::shared_lock<std::shared_mutex> placement_guard(placement_transaction_mu_);
+    std::shared_lock<zb::rpc_support::FiberSharedMutex> placement_guard(placement_transaction_mu_);
 
     std::string error;
     uint64_t parent_inode = 0;
@@ -1856,13 +1858,13 @@ void MdsServiceImpl::CommitFileMigration(
 
     // Migration changes an inode reference and therefore participates in the
     // same transaction boundary as allocation and the final retirement scan.
-    std::shared_lock<std::shared_mutex> placement_guard(placement_transaction_mu_);
+    std::shared_lock<zb::rpc_support::FiberSharedMutex> placement_guard(placement_transaction_mu_);
     if (!node_registry_ || !node_registry_->IsWriteAdmitted(request->target().node_id())) {
         FillStatus(response->mutable_status(), zb::rpc::MDS_STALE_EPOCH,
                    "migration target is no longer admitted by CMS");
         return;
     }
-    std::lock_guard<std::mutex> lock(file_migration_mu_);
+    std::lock_guard<bthread::Mutex> lock(file_migration_mu_);
     std::string expected_inode_payload;
     std::string error;
     if (!store_->Get(InodeKey(request->inode_id()), &expected_inode_payload, &error)) {
@@ -1955,6 +1957,18 @@ void MdsServiceImpl::ModelOpticalArchive(
     google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
     (void)cntl_base;
+    HandleOpticalArchive(request, response, false);
+}
+
+void MdsServiceImpl::CommitPhysicalOpticalArchive(google::protobuf::RpcController*,
+    const zb::rpc::ModelOpticalArchiveRequest* request, zb::rpc::ModelOpticalArchiveReply* response,
+    google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    HandleOpticalArchive(request, response, true);
+}
+
+void MdsServiceImpl::HandleOpticalArchive(const zb::rpc::ModelOpticalArchiveRequest* request,
+    zb::rpc::ModelOpticalArchiveReply* response, bool physical) {
     if (!response) return;
     if (!store_ || !node_registry_ || !lease_manager_ || !request ||
         request->operation_id().empty() || request->operation_id().size() > 256 ||
@@ -1968,8 +1982,8 @@ void MdsServiceImpl::ModelOpticalArchive(
                    "incomplete modeled optical archive manifest");
         return;
     }
-    std::shared_lock<std::shared_mutex> placement_guard(placement_transaction_mu_);
-    std::lock_guard<std::mutex> migration_guard(file_migration_mu_);
+    std::shared_lock<zb::rpc_support::FiberSharedMutex> placement_guard(placement_transaction_mu_);
+    std::lock_guard<bthread::Mutex> migration_guard(file_migration_mu_);
     const std::string op_key = ModelOpticalArchiveCommitKey(request->operation_id());
     std::string committed_payload;
     std::string error;
@@ -2005,16 +2019,16 @@ void MdsServiceImpl::ModelOpticalArchive(
                                           &source_entry) ||
         source_entry.managed_view().spec().kind() != zb::rpc::MANAGED_KIND_STORAGE ||
         source_entry.managed_view().spec().execution_mode() !=
-            zb::rpc::MANAGED_EXECUTION_VIRTUAL) {
+            (physical ? zb::rpc::MANAGED_EXECUTION_PHYSICAL : zb::rpc::MANAGED_EXECUTION_VIRTUAL)) {
         FillStatus(response->mutable_status(), zb::rpc::MDS_INVALID_ARGUMENT,
-                   "modeled optical archive requires a virtual disk source");
+                   "optical archive source backend differs from requested protocol");
         return;
     }
     if (!node_registry_->GetCommittedNode(request->target().node_id(), &target_entry) ||
         target_entry.managed_view().spec().kind() !=
             zb::rpc::MANAGED_KIND_OPTICAL_LIBRARY ||
         target_entry.managed_view().spec().execution_mode() !=
-            zb::rpc::MANAGED_EXECUTION_VIRTUAL ||
+            (physical ? zb::rpc::MANAGED_EXECUTION_PHYSICAL : zb::rpc::MANAGED_EXECUTION_VIRTUAL) ||
         target_entry.managed_view().lifecycle() != zb::rpc::MANAGED_LIFECYCLE_WORKING ||
         !target_entry.managed_view().has_readiness() ||
         !target_entry.managed_view().readiness().metadata_ready() ||
@@ -2053,6 +2067,12 @@ void MdsServiceImpl::ModelOpticalArchive(
         FillStatus(response->mutable_status(), zb::rpc::MDS_STALE_EPOCH, error);
         return;
     }
+    if (physical && (!VerifyPhysicalArchive(*request, &error) ||
+        request->expected_source().instance_generation() != source_entry.managed_view().spec().instance_generation() ||
+        request->expected_source().node_address() != source_entry.managed_view().service_address())) {
+        FillStatus(response->mutable_status(), zb::rpc::MDS_STALE_EPOCH,
+                   error.empty() ? "physical source identity changed" : error); return;
+    }
     if (!request->commit()) {
         FillStatus(response->mutable_status(), zb::rpc::MDS_OK, "validated");
         return;
@@ -2085,6 +2105,95 @@ void MdsServiceImpl::ModelOpticalArchive(
                matched ? "committed" : "inode changed during optical commit");
 }
 
+void MdsServiceImpl::CommitModelOpticalMigration(
+    google::protobuf::RpcController*,
+    const zb::rpc::CommitModelOpticalMigrationRequest* request,
+    zb::rpc::CommitModelOpticalMigrationReply* response,
+    google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    if (!response) return;
+    auto fail = [&](zb::rpc::MdsStatusCode code, const std::string& error) {
+        FillStatus(response->mutable_status(), code, error);
+    };
+    if (!store_ || !node_registry_ || !request || request->inode_id() == 0 ||
+        request->expected_version() == 0 || request->operation_id().empty() ||
+        request->operation_id().size() > 256 ||
+        !request->has_expected_source() || !request->has_target()) {
+        fail(zb::rpc::MDS_INVALID_ARGUMENT, "incomplete modeled optical migration");
+        return;
+    }
+    std::shared_lock<zb::rpc_support::FiberSharedMutex> placement_guard(placement_transaction_mu_);
+    std::lock_guard<bthread::Mutex> migration_guard(file_migration_mu_);
+    const std::string operation_key = "MOM/" + request->operation_id();
+    std::string previous, error;
+    if (store_->Get(operation_key, &previous, &error)) {
+        if (previous != request->SerializeAsString()) {
+            fail(zb::rpc::MDS_STALE_EPOCH, "migration operation ID reused");
+            return;
+        }
+        response->set_already_committed(true);
+        fail(zb::rpc::MDS_OK, "already committed");
+        return;
+    }
+    if (!error.empty()) { fail(zb::rpc::MDS_INTERNAL_ERROR, error); return; }
+    const auto& source = request->expected_source();
+    const auto& target = request->target();
+    if (source.node_id() == target.node_id() || source.image_id().empty() ||
+        target.image_id().empty() || source.disk_id().empty() || target.disk_id().empty()) {
+        fail(zb::rpc::MDS_INVALID_ARGUMENT, "invalid modeled optical endpoints");
+        return;
+    }
+    for (const auto* location : {&source, &target}) {
+        zb::rpc::CmsNodeCatalogEntry node;
+        if (!node_registry_->GetCommittedNode(location->node_id(), &node) ||
+            node.managed_view().spec().kind() != zb::rpc::MANAGED_KIND_OPTICAL_LIBRARY ||
+            node.managed_view().spec().execution_mode() != zb::rpc::MANAGED_EXECUTION_VIRTUAL ||
+            location->instance_generation() == 0 ||
+            location->instance_generation() != node.managed_view().spec().instance_generation() ||
+            (location == &target &&
+             (node.managed_view().lifecycle() != zb::rpc::MANAGED_LIFECYCLE_WORKING ||
+              node.managed_view().health() != zb::rpc::MANAGED_HEALTH_HEALTHY ||
+              node.managed_view().administrative_state() != zb::rpc::MANAGED_ADMIN_ENABLED ||
+              !node.managed_view().readiness().observed() ||
+              !node.managed_view().readiness().initialization_complete() ||
+              !node.managed_view().readiness().inventory_ready() ||
+              !node.managed_view().readiness().metadata_ready() ||
+              location->node_address() != node.managed_view().service_address()))) {
+            fail(zb::rpc::MDS_STALE_EPOCH, "model optical endpoint not CMS admitted at this generation");
+            return;
+        }
+    }
+    // 这是已完成持久接收的提交，不是新增容量分配。封盘后库可能刚好满盘并
+    // 变为 ReadOnly，不能再用“有空闲容量的新写准入”阻塞已有 outbox 完成。
+    std::string expected_inode;
+    zb::rpc::InodeAttr attr;
+    zb::rpc::OpticalFileLocation current;
+    if (!store_->Get(InodeKey(request->inode_id()), &expected_inode, &error) ||
+        !MetaCodec::DecodeUnifiedInodeAttr(expected_inode, &attr, &error) ||
+        !LoadOpticalFileLocation(request->inode_id(), &current, &error)) {
+        fail(zb::rpc::MDS_NOT_FOUND, error.empty() ? "optical inode not found" : error);
+        return;
+    }
+    if (attr.version() != request->expected_version() || attr.size() != request->size() ||
+        current.node_id() != source.node_id() || current.disk_id() != source.disk_id() ||
+        current.image_id() != source.image_id() ||
+        current.instance_generation() != source.instance_generation()) {
+        fail(zb::rpc::MDS_STALE_EPOCH, "optical source version or position changed");
+        return;
+    }
+    rocksdb::WriteBatch batch;
+    bool matched = false;
+    batch.Put(operation_key, request->SerializeAsString());
+    if (!SaveOpticalFileLocation(request->inode_id(), target, &batch) ||
+        !store_->WriteBatchIfValueEquals(InodeKey(request->inode_id()), expected_inode,
+                                         &batch, &matched, &error)) {
+        fail(zb::rpc::MDS_INTERNAL_ERROR, error.empty() ? "optical migration persistence failed" : error);
+        return;
+    }
+    fail(matched ? zb::rpc::MDS_OK : zb::rpc::MDS_STALE_EPOCH,
+         matched ? "committed" : "optical inode changed during commit");
+}
+
 void MdsServiceImpl::CommitCmsNodeCatalog(
     google::protobuf::RpcController* cntl_base,
     const zb::rpc::CommitCmsNodeCatalogRequest* request,
@@ -2104,7 +2213,7 @@ void MdsServiceImpl::CommitCmsNodeCatalog(
     uint64_t cms_generation = 0;
     std::vector<zb::rpc::CmsNodeCompactIdAssignment> assignments;
     std::string error;
-    std::unique_lock<std::shared_mutex> placement_guard(placement_transaction_mu_);
+    std::unique_lock<zb::rpc_support::FiberSharedMutex> placement_guard(placement_transaction_mu_);
     if (!node_registry_->Commit(request->scheduler_generation(), proposed,
                                 &cms_generation, &assignments, &error)) {
         FillStatus(response->mutable_status(), zb::rpc::MDS_STALE_EPOCH,
@@ -2152,7 +2261,7 @@ void MdsServiceImpl::VerifyNodeReferences(
     }
     uint64_t disk_references = 0;
     uint64_t optical_references = 0;
-    std::unique_lock<std::shared_mutex> placement_guard(placement_transaction_mu_);
+    std::unique_lock<zb::rpc_support::FiberSharedMutex> placement_guard(placement_transaction_mu_);
     std::unique_ptr<rocksdb::Iterator> it(store_->db()->NewIterator(rocksdb::ReadOptions()));
     const std::string prefix = "I/";
     for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
@@ -2194,6 +2303,10 @@ void MdsServiceImpl::VerifyNodeReferences(
         FillStatus(response->mutable_status(), zb::rpc::MDS_INTERNAL_ERROR,
                    "failed to scan CMS inode references: " + it->status().ToString());
         return;
+    }
+    std::string cold_error;
+    if (!CountColdNodeReferences(request->node_id(), &disk_references, &optical_references, &cold_error)) {
+        FillStatus(response->mutable_status(), zb::rpc::MDS_INTERNAL_ERROR, cold_error); return;
     }
     response->set_disk_inode_references(disk_references);
     response->set_optical_inode_references(optical_references);
@@ -3528,6 +3641,8 @@ bool MdsServiceImpl::LoadOpticalFileLocation(uint64_t inode_id,
                     location->set_disk_id(resolved_disk_id);
                 }
             }
+            if (!has_full_location) ResolvePackedOpticalNode(location);
+            if (!ResolveOpticalHandoff(location, error)) return false;
             std::string node_address;
             std::string resolve_error;
             if (ResolveNodeAddress(location->node_id(), &node_address, &resolve_error) && !node_address.empty()) {
@@ -3572,6 +3687,8 @@ bool MdsServiceImpl::BuildOpticalFileLocationFromAttr(const zb::rpc::InodeAttr& 
         }
         return false;
     }
+    ResolvePackedOpticalNode(location);
+    if (!ResolveOpticalHandoff(location, error)) return false;
     std::string node_address;
     std::string resolve_error;
     if (ResolveNodeAddress(location->node_id(), &node_address, &resolve_error) && !node_address.empty()) {
@@ -3615,6 +3732,8 @@ bool MdsServiceImpl::LoadMasstreeOpticalFileLocation(uint64_t inode_id,
         zb::rpc::OpticalFileLocation candidate;
         std::string local_error;
         if (masstree_meta_store_.GetOpticalFileLocation(route, inode_id, &candidate, &local_error)) {
+            ResolvePackedOpticalNode(&candidate);
+            if (!ResolveOpticalHandoff(&candidate, error)) return false;
             if (!candidate.node_id().empty()) {
                 std::string node_address;
                 std::string resolve_error;
@@ -3653,6 +3772,13 @@ bool MdsServiceImpl::SaveOpticalFileLocation(uint64_t inode_id,
         UnifiedInodeRecord record;
         if (MetaCodec::DecodeUnifiedInodeRecord(inode_payload, &record, nullptr)) {
             ApplyOpticalLocationToUnifiedRecord(location, &record);
+            zb::rpc::CmsNodeCatalogEntry entry;
+            if (node_registry_ && node_registry_->GetCommittedNode(location.node_id(), &entry)) {
+                // packed 字段必须使用 CMS compact ID，不能把任意节点名称尾号
+                // 或无法解析的 0 带入后续冷目录导出。完整位置仍保留原业务标识。
+                record.optical_node_id = entry.managed_view().compact_id();
+                record.storage_loc0 = record.optical_node_id;
+            }
             record.file_archive_state = static_cast<uint32_t>(zb::rpc::INODE_ARCHIVE_ARCHIVED);
             std::string encoded;
             std::string full_location;

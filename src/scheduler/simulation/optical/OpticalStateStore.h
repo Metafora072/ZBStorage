@@ -45,6 +45,7 @@ enum class OpticalArchivePhase : uint8_t {
 struct OpticalArchiveRecord {
     std::string operation_id;
     std::string source_lease_id;
+    std::string admission_lease_id; // 原始受理租约；恢复换租后仍可识别原请求的幂等重试
     uint64_t inode_id{0};
     uint64_t version{0};
     uint64_t size{0};
@@ -55,6 +56,10 @@ struct OpticalArchiveRecord {
     OpticalArchivePhase phase{OpticalArchivePhase::kTransfer};
     uint64_t remaining_us{0};
     uint64_t media_bytes{0};
+    // 非空表示模型光盘迁移，保留源位置、代际及已编码大小；不重新压缩。
+    std::string source_image_id;
+    uint64_t source_generation{0};
+    uint64_t seal_remaining_us{0}; // 尾批封卷剩余时间，停机期间不推进
 };
 
 // Durable control inventory only: no payload, image, or disc bytes are stored.
@@ -80,6 +85,11 @@ public:
                             const std::vector<uint64_t>& task_ids,
                             std::string* error);
     bool PutArchive(const OpticalArchiveRecord& archive, std::string* error);
+    // 同一卷的阶段转换原子落盘；complete 同时发布全部逻辑文件。
+    bool PutArchiveGroup(const std::vector<OpticalArchiveRecord>& archives,
+                         bool complete, std::string* error);
+    bool CheckpointWork(const std::vector<OpticalArchiveRecord>& archives,
+                        const std::vector<OpticalTaskRecord>& tasks, std::string* error);
     bool CompleteArchive(const OpticalArchiveRecord& archive,
                          const OpticalFileRecord& file, std::string* error);
 

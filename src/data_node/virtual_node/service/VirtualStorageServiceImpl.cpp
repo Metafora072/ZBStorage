@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "real_node.pb.h"
+#include "common/rpc/ModelWait.h"
 
 namespace zb::virtual_node {
 
@@ -75,6 +76,8 @@ uint32_t StableJitterSeed(const std::string& node_id, uint32_t configured) {
 
 VirtualStorageServiceImpl::VirtualStorageServiceImpl(VirtualNodeConfig config)
     : config_(std::move(config)),
+      io_faults_(config_.io_failure_probability_ppm, config_.io_timeout_probability_ppm,
+                 config_.jitter_seed, config_.node_id),
       rng_(StableJitterSeed(config_.node_id, config_.jitter_seed)) {
     for (const auto& disk_id : config_.disk_ids) {
         if (!disk_id.empty()) {
@@ -196,11 +199,23 @@ zb::msg::Status VirtualStorageServiceImpl::ExportModelFile(
     return zb::msg::Status::Ok();
 }
 
-zb::msg::Status VirtualStorageServiceImpl::ImportModelFile(const zb::msg::FileMeta& meta) {
+zb::msg::Status VirtualStorageServiceImpl::ImportModelFile(const zb::msg::FileMeta& meta, const std::string& disk_id) {
     if (meta.inode_id == 0 || meta.object_unit_size == 0 || meta.version == 0)
         return zb::msg::Status::InvalidArgument("invalid migrated file metadata");
     std::lock_guard<std::mutex> lock(object_mu_);
     if (!model_state_store_) return zb::msg::Status::IoError("model state is not durable");
+    const uint64_t count = meta.file_size == 0 ? 0 : 1 + (meta.file_size - 1) / meta.object_unit_size;
+    if (count > UINT32_MAX) return zb::msg::Status::InvalidArgument("migrated file object count exceeds limit");
+    for (uint64_t index = 0; index < count; ++index) {
+        const auto object_id = BuildStableObjectId(meta.inode_id, static_cast<uint32_t>(index));
+        const auto home = object_home_disk_.find(object_id);
+        if (home == object_home_disk_.end() || (!disk_id.empty() && home->second != disk_id))
+            return zb::msg::Status::IoError("migrated file object missing or disk mismatch");
+        const auto object = object_sizes_.find(BuildObjectKey(home->second, object_id));
+        const uint64_t expected = std::min<uint64_t>(meta.object_unit_size, meta.file_size - index * meta.object_unit_size);
+        if (object == object_sizes_.end() || object->second != expected)
+            return zb::msg::Status::IoError("migrated file object size mismatch");
+    }
     const auto existing = file_meta_by_inode_.find(meta.inode_id);
     if (existing != file_meta_by_inode_.end()) {
         const auto& old = existing->second;
@@ -1448,9 +1463,11 @@ zb::msg::Status VirtualStorageServiceImpl::SimulateIo(uint64_t bytes, bool is_re
         return zb::msg::Status::IoError("MODEL_IO_DURATION_LIMIT");
     }
     const auto transfer = std::chrono::microseconds(static_cast<int64_t>(transfer_us));
+    const auto fault = io_faults_.Next();
     const auto latency = std::chrono::milliseconds(
         static_cast<uint64_t>(is_read ? config_.read_base_latency_ms
-                                      : config_.write_base_latency_ms) + RandomJitterMs());
+                                      : config_.write_base_latency_ms) + RandomJitterMs() +
+        (fault == zb::model::IoFault::kTimeout ? config_.io_timeout_ms : 0));
     Clock::time_point finish;
     {
         std::lock_guard<std::mutex> lock(io_mu_);
@@ -1474,11 +1491,13 @@ zb::msg::Status VirtualStorageServiceImpl::SimulateIo(uint64_t bytes, bool is_re
         *slot = finish;
         ++io_outstanding_;
     }
-    std::this_thread::sleep_until(finish);
+    zb::rpc_route::WaitModelUntil(finish);
     {
         std::lock_guard<std::mutex> lock(io_mu_);
         --io_outstanding_;
     }
+    if (fault == zb::model::IoFault::kFailure) return zb::msg::Status::IoError("MODEL_IO_INJECTED_FAILURE");
+    if (fault == zb::model::IoFault::kTimeout) return zb::msg::Status::IoError("MODEL_IO_INJECTED_TIMEOUT");
     return zb::msg::Status::Ok();
 }
 

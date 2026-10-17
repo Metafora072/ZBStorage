@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <mutex>
+#include "common/rpc/HandoffFiles.h"
 
 #include <butil/iobuf.h>
 
@@ -60,24 +61,35 @@ cd_manager_sim::CDManagerConfig BuildCDManagerConfig(const OpticalNodeConfig& cf
 
 }  // namespace
 
-OpticalStorageServiceImpl::OpticalStorageServiceImpl(const OpticalNodeConfig& config)
-    : optical_node_manager_(config.volume_size_bytes,
-                            config.size_threshold,
-                            config.archive_root,
-                            config.capacity_in_images,
-                            config.available_id_count,
-                            config.disc_capacity_bytes,
-                            config.standard_images_per_disc,
-                            config.disc_block_size_bytes,
-                            config.max_write_images,
-                            config.scheduler_addr,
-                            BuildCDManagerConfig(config)) {
-    // 在 Run() 拉起后台线程之前注册完成回调：任何准备任务 READY 都能通知到客户端。
-    optical_node_manager_.SetPreparedFileReadyCallback(
+void OpticalStorageServiceImpl::ResetHandoffEngine() {
+    const auto& config = engine_config_;
+    // 与进程重启一致地创建新引擎，再走既有 Run 重建。不能在已 Shutdown
+    // 的旧引擎上直接 Run：其消费者队列已 Close，会静默丢弃新准备任务。
+    optical_node_manager_ = std::make_unique<optical_node_manager::OpticalNodeManager>(
+        config.volume_size_bytes, config.size_threshold, config.archive_root,
+        config.capacity_in_images, config.available_id_count, config.disc_capacity_bytes,
+        config.standard_images_per_disc, config.disc_block_size_bytes, config.max_write_images,
+        config.scheduler_addr, BuildCDManagerConfig(config));
+    optical_node_manager_->SetPreparedFileReadyCallback(
         [this](const optical_node_manager::PreparedFileReadyEvent& ev) { SendReadReady(ev); });
-    // 在 Run() 启动后台线程之前注入指标采集器：缓存命中区间读走 cache_hit，归档写与光盘回读走 disc。
-    optical_node_manager_.SetMetricsCollectors(&metrics_cache_hit_, &metrics_disc_);
-    optical_node_manager_.Run();
+    optical_node_manager_->SetMetricsCollectors(&metrics_cache_hit_, &metrics_disc_);
+}
+
+OpticalStorageServiceImpl::OpticalStorageServiceImpl(const OpticalNodeConfig& config)
+    : engine_config_(config),
+      archive_root_(std::filesystem::path(config.archive_root).lexically_normal().string()),
+      mds_address_(config.mds_address),
+      format_signature_(std::to_string(config.volume_size_bytes) + ":" +
+          std::to_string(config.disc_capacity_bytes) + ":" +
+          std::to_string(config.disc_block_size_bytes) + ":" +
+          std::to_string(config.total_disc_count) + ":" +
+          std::to_string(config.capacity_in_images) + ":" +
+          std::to_string(config.standard_images_per_disc)),
+      instance_generation_(config.instance_generation) {
+    ResetHandoffEngine();
+    LoadHandoff();
+    if (handoff_.phase().empty() || handoff_.phase() == "ACTIVE" || handoff_.phase() == "FREEZING")
+        optical_node_manager_->Run();
 }
 
 void OpticalStorageServiceImpl::ConfigureReplication(const std::string& node_id,
@@ -135,11 +147,15 @@ ReplicationStatusSnapshot OpticalStorageServiceImpl::GetReplicationStatus() cons
 
 volumemanager::ErrorCode OpticalStorageServiceImpl::SendArchiveMetadata(
     const optical_node_manager::SendArchiveMetadataRequest& request) {
-    return optical_node_manager_.SendArchiveMetadata(request);
+    std::shared_lock<zb::rpc_support::FiberSharedMutex> gate(handoff_mu_);
+    if (HandoffBlocksAdmission()) return volumemanager::ErrorCode::MANAGER_NOT_READY;
+    return optical_node_manager_->SendArchiveMetadata(request);
 }
 
 volumemanager::ErrorCode OpticalStorageServiceImpl::PrepareRead(const PrepareReadParams& params,
                                                                 uint64_t* task_id) {
+    std::shared_lock<zb::rpc_support::FiberSharedMutex> gate(handoff_mu_);
+    if (HandoffBlocksAdmission()) return volumemanager::ErrorCode::MANAGER_NOT_READY;
     // 上层 disk_id / image_id 带前缀，manager 只用尾部 <seq>。
     std::string volume_id;
     if (!ExtractTrailingSeq(params.image_id, &volume_id)) {
@@ -159,22 +175,25 @@ volumemanager::ErrorCode OpticalStorageServiceImpl::PrepareRead(const PrepareRea
     manager_params.expected_file_size = params.file_size;
     manager_params.has_file_version = params.has_file_version;
     manager_params.file_version = params.file_version;
-    return optical_node_manager_.SubmitPrepareTask(manager_params, task_id);
+    return optical_node_manager_->SubmitPrepareTask(manager_params, task_id);
 }
 
 volumemanager::ErrorCode OpticalStorageServiceImpl::AcquireReadSession(
         uint64_t task_id, optical_node_manager::AcquireReadSessionResult* out) {
-    return optical_node_manager_.AcquireReadSession(task_id, out);
+    std::shared_lock<zb::rpc_support::FiberSharedMutex> gate(handoff_mu_);
+    if (HandoffBlocksAdmission()) return volumemanager::ErrorCode::MANAGER_NOT_READY;
+    return optical_node_manager_->AcquireReadSession(task_id, out);
 }
 
 volumemanager::ErrorCode OpticalStorageServiceImpl::ReadPreparedFile(
         uint64_t read_handle, uint64_t offset, uint64_t size, std::string* out,
         optical_node_manager::ReadPreparedFileResult* result) {
+    std::shared_lock<zb::rpc_support::FiberSharedMutex> gate(handoff_mu_);
     // 缓存命中路径记账：区间读由本地 image/ 镜像（HDD 缓存）提供，成功时累计实际返回字节。
     // 需要回读光盘时的镜像加载另行计入 disc 采集器（见 OnCDReadComplete）。
     auto operation = metrics_cache_hit_.Start(zb::metrics::OperationKind::kRead);
     const volumemanager::ErrorCode ret =
-        optical_node_manager_.ReadPreparedFile(read_handle, offset, size, out, result);
+        optical_node_manager_->ReadPreparedFile(read_handle, offset, size, out, result);
     if (ret == volumemanager::ErrorCode::SUCCESS && result != nullptr) {
         operation.SetBytes(result->bytes_read);
     }
@@ -182,11 +201,13 @@ volumemanager::ErrorCode OpticalStorageServiceImpl::ReadPreparedFile(
 }
 
 volumemanager::ErrorCode OpticalStorageServiceImpl::ReleaseReadSession(uint64_t read_handle) {
-    return optical_node_manager_.ReleaseReadSession(read_handle);
+    std::shared_lock<zb::rpc_support::FiberSharedMutex> gate(handoff_mu_);
+    return optical_node_manager_->ReleaseReadSession(read_handle);
 }
 
 volumemanager::ErrorCode OpticalStorageServiceImpl::ReleasePreparedRead(uint64_t task_id) {
-    return optical_node_manager_.ReleasePreparedRead(task_id);
+    std::shared_lock<zb::rpc_support::FiberSharedMutex> gate(handoff_mu_);
+    return optical_node_manager_->ReleasePreparedRead(task_id);
 }
 
 uint64_t OpticalStorageServiceImpl::SubscribeReadEvents(const std::string& client_id,
@@ -218,21 +239,36 @@ void OpticalStorageServiceImpl::SendReadReady(
 }
 
 bool OpticalStorageServiceImpl::IsArchiveEngineReady() const {
-    return optical_node_manager_.IsReady();
+    std::shared_lock<zb::rpc_support::FiberSharedMutex> gate(handoff_mu_);
+    return optical_node_manager_->IsReady();
+}
+bool OpticalStorageServiceImpl::IsHandoffSuspended() const {
+    std::shared_lock<zb::rpc_support::FiberSharedMutex> gate(handoff_mu_);
+    return HandoffBlocksAdmission() && handoff_.phase() != "CORRUPT";
 }
 
 bool OpticalStorageServiceImpl::Shutdown() {
     // 先关闭通知会话，停止向客户端推送后再停归档引擎。
     read_event_sessions_.CloseAll();
-    return optical_node_manager_.Shutdown();
+    return optical_node_manager_->Shutdown();
 }
 
 std::string OpticalStorageServiceImpl::GetArchiveStatusDetail() const {
-    return optical_node_manager_.GetStatusDetail();
+    return optical_node_manager_->GetStatusDetail();
 }
 
 optical_node_manager::OpticalLibraryInventory OpticalStorageServiceImpl::GetLibraryInventory() const {
-    return optical_node_manager_.GetInventory();
+    std::shared_lock<zb::rpc_support::FiberSharedMutex> gate(handoff_mu_);
+    if (handoff_.phase() == "RELEASED") {
+        // 这是已提交并隔离全部本地产物的退役收据，不是通过配置 0 伪造空盘。
+        optical_node_manager::OpticalLibraryInventory result;
+        result.observed_at_ms = WR_task::NowMs();
+        result.inventory_valid = result.staging_valid = result.background_valid = true;
+        result.metadata_ready = true;
+        result.collection_error = "library handoff RELEASED; archive admission permanently closed";
+        return result;
+    }
+    return optical_node_manager_->GetInventory();
 }
 
 } // namespace zb::optical_node

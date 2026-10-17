@@ -20,6 +20,8 @@
 #include <optical_node_manager_classes.h>
 #include <space_manager/sha256.h>
 #include <volume_manager/serializer.h>
+#include <openssl/sha.h>
+#include <zlib.h>
 
 #include <brpc/channel.h>
 #include "common/metrics/NodeMetricsCollector.h"
@@ -572,6 +574,12 @@ namespace optical_node_manager {
 
     OpticalLibraryInventory OpticalNodeManager::GetInventory() const {
         OpticalLibraryInventory inv;
+        inv.observed_at_ms = WR_task::NowMs();
+        inv.metadata_ready = telemetry_metadata_ready_.load();
+        if (!IsReady()) {
+            inv.collection_error = "archive engine is not running";
+            return inv;
+        }
         // 静态硬件属性（光驱总数、盘片槽位）以配置为准——与注册使用同一来源，
         // 避免组件侧归一导致“注册值 ≠ 库存值”的双真源。
         inv.drive_total = static_cast<uint32_t>(std::max(1, cd_manager_config_.num_drives));
@@ -579,10 +587,15 @@ namespace optical_node_manager {
         inv.slot_count = cd_manager_config_.slot_count;
         // 运行时属性以 cd_manager 为准：忙光驱、已用盘数、正在执行的刻录任务数。
         if (cd_manager_ != nullptr) {
+            inv.disc_count = cd_manager_->TotalDiscCount();
             inv.drive_busy = static_cast<uint32_t>(cd_manager_->BusyDriveCount());
             inv.disc_used = cd_manager_->UsedDiscCount();
             inv.disc_burning = static_cast<uint64_t>(cd_manager_->ActiveBurnTaskCount());
+            inv.inventory_valid = inv.disc_used <= inv.disc_count &&
+                                  inv.disc_burning <= inv.disc_count - inv.disc_used &&
+                                  inv.disc_count <= inv.slot_count;
         }
+        if (!inv.inventory_valid) inv.collection_error += "disc model inventory unavailable or inconsistent; ";
         // 暂存区：image_dir 的容量/占用（单位为镜像数）。
         // 容量以 SpaceManager 运行态为唯一真源；尚未就绪时回退到构造配置，保证对外上报的容量始终有效。
         inv.staging_capacity_images = capacity_in_images_;
@@ -593,20 +606,30 @@ namespace optical_node_manager {
                 inv.staging_used_images = stats.used_images;
                 inv.staging_write_images = stats.write_images;
                 inv.staging_read_images = stats.read_images;
+                inv.staging_valid = stats.used_images <= stats.capacity_images &&
+                                    stats.read_images <= stats.used_images &&
+                                    stats.write_images == stats.used_images - stats.read_images;
+                inv.cache_healthy = inv.staging_valid;
             }
         }
+        if (!inv.staging_valid) inv.collection_error += "staging reservation statistics unavailable; ";
         // 后台任务：按类型统计非终态读/写任务（刻录任务数已由 cd_manager 提供）。
         if (task_map_ != nullptr) {
+            inv.background_valid = archive_task_queue_ != nullptr && cd_manager_ != nullptr;
+            inv.pending_archive_batches = telemetry_archive_batches_.load();
             for (const WR_task::WRTask& task : task_map_->SnapshotAll()) {
                 if (task.isTaskTerminal()) {
                     continue;
                 }
+                ++inv.background_tasks;
                 switch (task.type) {
                     case WR_task::WRTaskType::READ:
                     case WR_task::WRTaskType::CD_READ:
                         ++inv.pending_read_tasks;
                         break;
                     case WR_task::WRTaskType::WRITE:
+                    case WR_task::WRTaskType::CD_BURN:
+                    case WR_task::WRTaskType::DISC_BURN:
                         ++inv.pending_write_tasks;
                         break;
                     default:
@@ -614,6 +637,8 @@ namespace optical_node_manager {
                 }
             }
         }
+        if (!inv.background_valid) inv.collection_error += "background task statistics unavailable; ";
+        if (!inv.metadata_ready) inv.collection_error += "runtime metadata recovery incomplete; ";
         return inv;
     }
 
@@ -648,6 +673,7 @@ namespace optical_node_manager {
             return false;
         }
         SetStatus(manager_status::kInitializing, "Run() entered");
+        telemetry_metadata_ready_.store(false);
 
         if (!InitializeDir()) {
             // InitializeDir 已写子阶段到 last_failure_reason_buf_，这里拼顶层 phase。
@@ -670,12 +696,16 @@ namespace optical_node_manager {
         // 两步都不阻塞启动（快照缺失 / 损坏时退化为无快照，原因记入 sidecar）。
         LoadPendingDiscMeta();
         const RuntimeStateLoadResult load_result = LoadRuntimeState();
+        telemetry_metadata_ready_.store(load_result != RuntimeStateLoadResult::kLoadFailed);
         // 恢复后的一致性校验与幂等补齐：补提未刻完的光盘、补登记已落地光盘的索引、
         // 清理半截物化产物。必须在起线程之前（单线程、且镜像管理表已就绪）。
         ReconcileAndReplay();
         // 清理 read/ 中无任务认领的孤儿读产物（单线程重建阶段，与恢复结果一致）。
         CleanupOrphanReadArtifacts();
 
+        telemetry_archive_batches_.store(
+            (archive_task_queue_ ? archive_task_queue_->Size() : 0) +
+            (pending_archive_request_.has_value() ? 1 : 0));
         if (!StartBackgroundWorkers()) {
             // StartBackgroundWorkers 已写完整结构化 KV，直接转发给 SetStatus。
             SetStatus(manager_status::kStartFailed, last_failure_reason_buf_);
@@ -1058,6 +1088,7 @@ namespace optical_node_manager {
     }
 
     void OpticalNodeManager::RebuildDiscImageIndex() {
+        telemetry_archive_index_ready_.store(false);
         {
             std::lock_guard<std::mutex> lock(disc_image_index_mutex_);
             disc_image_index_.clear();
@@ -1067,9 +1098,11 @@ namespace optical_node_manager {
         struct stat st {};
         if (::stat(path.c_str(), &st) != 0) {
             // 首次启动尚无该文件：空索引即为正确状态。
+            telemetry_archive_index_ready_.store(errno == ENOENT);
             return;
         }
         if (st.st_size <= 0) {
+            telemetry_archive_index_ready_.store(st.st_size == 0);
             return;
         }
 
@@ -1165,10 +1198,169 @@ namespace optical_node_manager {
 
         std::lock_guard<std::mutex> lock(disc_image_index_mutex_);
         disc_image_index_ = std::move(rebuilt);
+        telemetry_archive_index_ready_.store(complete);
     }
 // #endregion
 
 // #region 4. 运行期状态持久化与恢复（含已刻录光盘索引）
+
+    std::vector<WR_task::WRTask> OpticalNodeManager::ListArchiveTasks() {
+        std::vector<WR_task::WRTask> result;
+        if (task_map_) for (const auto& task : task_map_->SnapshotAll()) {
+            if (task.type == WR_task::WRTaskType::WRITE || task.type == WR_task::WRTaskType::CD_BURN ||
+                task.type == WR_task::WRTaskType::DISC_BURN) result.push_back(task);
+        }
+        std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.task_id < b.task_id; });
+        return result;
+    }
+
+    std::vector<OpticalNodeManager::ArchivedImage> OpticalNodeManager::ListArchivedImages() {
+        std::lock_guard<std::mutex> lock(disc_image_index_mutex_);
+        std::vector<ArchivedImage> result;
+        result.reserve(disc_image_index_.size());
+        for (const auto& item : disc_image_index_) result.push_back({item.first, item.second});
+        std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
+            return a.volume_id < b.volume_id;
+        });
+        return result;
+    }
+
+    bool OpticalNodeManager::ReadArchivedImageFiles(
+        const ArchivedImage& image, std::vector<volumemanager::FileMetadata>* files,
+        std::string* error) {
+        files->clear();
+        const auto fail = [files, error](const char* message) {
+            files->clear();
+            if (error) *error = message;
+            return false;
+        };
+        // 路径只来自重建后的内部索引，不接受调用方提供文件路径。
+        const std::string path = disc_sim_dir_ + "disc_" + image.location.disk_id + ".vdisc";
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0) return fail("indexed disc file unavailable");
+        const auto close_fd = [](int* value) { ::close(*value); delete value; };
+        std::unique_ptr<int, decltype(close_fd)> guard(new int(fd), close_fd);
+        struct stat st {};
+        const auto& location = image.location;
+        if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+            location.offset_in_disc > static_cast<uint64_t>(st.st_size) ||
+            location.image_size_bytes > static_cast<uint64_t>(st.st_size) - location.offset_in_disc)
+            return fail("indexed image exceeds disc file bounds");
+        const auto read_at = [fd, &location](uint64_t offset, uint8_t* bytes, size_t size) {
+            if (offset > location.image_size_bytes || size > location.image_size_bytes - offset)
+                return false;
+            size_t done = 0;
+            while (done < size) {
+                const ssize_t n = ::pread(fd, bytes + done, size - done,
+                                         location.offset_in_disc + offset + done);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) return false;
+                done += static_cast<size_t>(n);
+            }
+            return true;
+        };
+        std::vector<uint8_t> header(volumemanager::VOLUME_METADATA_SIZE);
+        volumemanager::VolumeMetadata volume;
+        if (!read_at(0, header.data(), header.size()) ||
+            volumemanager::Serializer::DeserializeVolumeMetadata(header, volume) !=
+                volumemanager::ErrorCode::SUCCESS ||
+            volume.magic_number != volumemanager::MAGIC_NUMBER ||
+            volume.version != volumemanager::CURRENT_VERSION || volume.volume_id != image.volume_id)
+            return fail("invalid or unsupported archived volume header");
+        const auto within = [&location](uint64_t offset, uint64_t size) {
+            return offset <= location.image_size_bytes && size <= location.image_size_bytes - offset;
+        };
+        // 只读取元数据，单次最多 64MiB；不读取、解压或校验业务载荷。
+        if (volume.metadata_offset < header.size() || volume.metadata_size > 64ULL * 1024 * 1024 ||
+            !within(volume.metadata_offset, volume.metadata_size) ||
+            !within(volume.directory_offset, volume.directory_size) ||
+            !within(volume.user_data_offset, volume.user_data_size) ||
+            volume.directory_offset < volume.metadata_offset + volume.metadata_size ||
+            volume.user_data_offset < volume.directory_offset + volume.directory_size ||
+            volume.file_count > volume.metadata_size / (volumemanager::FILE_METADATA_FIXED_SIZE + 8))
+            return fail("archived metadata exceeds query bounds or has invalid layout");
+        std::vector<uint8_t> metadata(static_cast<size_t>(volume.metadata_size));
+        if (!read_at(volume.metadata_offset, metadata.data(), metadata.size()))
+            return fail("archived metadata read failed");
+        size_t cursor = 0;
+        std::unordered_set<uint64_t> inodes;
+        for (uint32_t i = 0; i < volume.file_count; ++i) {
+            const size_t start = cursor;
+            if (cursor > metadata.size() ||
+                volumemanager::FILE_METADATA_FIXED_SIZE > metadata.size() - cursor)
+                return fail("truncated archived file metadata");
+            cursor += volumemanager::FILE_METADATA_FIXED_SIZE;
+            for (unsigned field = 0; field != 2; ++field) {
+                if (metadata.size() - cursor < sizeof(uint32_t))
+                    return fail("truncated archived metadata string");
+                uint32_t length = 0;
+                std::memcpy(&length, metadata.data() + cursor, sizeof(length));
+                cursor += sizeof(length);
+                if (length > 65536 || length > metadata.size() - cursor)
+                    return fail("invalid archived metadata string length");
+                cursor += length;
+            }
+            std::vector<uint8_t> record(metadata.begin() + start, metadata.begin() + cursor);
+            volumemanager::FileMetadata file;
+            if (volumemanager::Serializer::DeserializeFileMetadata(record, file) !=
+                    volumemanager::ErrorCode::SUCCESS || file.inode_id == 0 ||
+                file.volume_id != image.volume_id || !inodes.insert(file.inode_id).second ||
+                file.offset_in_volume < volume.user_data_offset ||
+                file.offset_in_volume - volume.user_data_offset > volume.user_data_size ||
+                file.compressed_size > volume.user_data_size - (file.offset_in_volume - volume.user_data_offset))
+                return fail("inconsistent archived file metadata");
+            files->push_back(std::move(file));
+        }
+        if (cursor != metadata.size()) return fail("unparsed archived metadata bytes");
+        std::sort(files->begin(), files->end(), [](const auto& a, const auto& b) {
+            return a.inode_id < b.inode_id;
+        });
+        if (error) error->clear();
+        return true;
+    }
+
+    // 流式核验实际文件载荷，不创建读缓存，不用卷索引摘要冒充文件摘要。
+    bool OpticalNodeManager::HashArchivedFile(const ArchivedImage& image,
+        const volumemanager::FileMetadata& file, std::string* sha, std::string* error) {
+        const auto fail = [&](const char* msg) { if (error) *error = msg; return false; };
+        if (file.volume_id != image.volume_id || file.offset_in_volume > image.location.image_size_bytes ||
+            file.compressed_size > image.location.image_size_bytes - file.offset_in_volume)
+            return fail("archived payload range invalid");
+        const int fd = ::open((disc_sim_dir_ + "disc_" + image.location.disk_id + ".vdisc").c_str(), O_RDONLY | O_NOFOLLOW);
+        if (fd < 0) return fail("cannot open archived payload");
+        SHA256_CTX hash; SHA256_Init(&hash);
+        z_stream stream{};
+        bool ok = !file.is_compressed || inflateInit(&stream) == Z_OK;
+        const bool initialized = file.is_compressed && ok;
+        uint64_t consumed = 0, produced = 0; int code = Z_OK;
+        unsigned char input[65536], output[65536];
+        while (ok && consumed < file.compressed_size) {
+            const size_t count = std::min<uint64_t>(sizeof(input), file.compressed_size - consumed);
+            const auto n = ::pread(fd, input, count, image.location.offset_in_disc + file.offset_in_volume + consumed);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { ok = false; break; }
+            consumed += n;
+            if (!file.is_compressed) { SHA256_Update(&hash, input, n); produced += n; continue; }
+            stream.next_in = input; stream.avail_in = n;
+            do {
+                stream.next_out = output; stream.avail_out = sizeof(output);
+                code = inflate(&stream, Z_NO_FLUSH);
+                const size_t size = sizeof(output) - stream.avail_out;
+                if (size > file.file_size - std::min(produced, file.file_size)) { ok = false; break; }
+                SHA256_Update(&hash, output, size); produced += size;
+                if (code == Z_STREAM_END) { ok = stream.avail_in == 0 && consumed == file.compressed_size; break; }
+                if (code != Z_OK || (size == 0 && stream.avail_in != 0 && stream.avail_out != 0)) { ok = false; break; }
+            } while (stream.avail_in || stream.avail_out == 0);
+        }
+        if (initialized) inflateEnd(&stream);
+        ::close(fd);
+        if (!ok || produced != file.file_size || (file.is_compressed && file.file_size && code != Z_STREAM_END))
+            return fail("archived payload decompression/length validation failed");
+        unsigned char result[SHA256_DIGEST_LENGTH]; SHA256_Final(result, &hash);
+        static constexpr char hex[] = "0123456789abcdef"; sha->clear();
+        for (auto c : result) { *sha += hex[c >> 4]; *sha += hex[c & 15]; }
+        return true;
+    }
 
     // 把运行期内存态写入 log/runtime_state_snapshot：
     //   [RuntimeStateMetaHeader][kCounters][kAvailableIds][kTasks][kQueues]
@@ -2229,6 +2421,7 @@ namespace optical_node_manager {
             return volumemanager::ErrorCode::MANAGER_NOT_READY;
         }
 
+        telemetry_archive_batches_.fetch_add(1);
         archive_task_queue_->Push(request);
         last_failure_reason_buf_.clear();
         return volumemanager::ErrorCode::SUCCESS;
@@ -3314,6 +3507,7 @@ namespace optical_node_manager {
                 // 映射失败：丢弃当前批次，避免卡在同一批次上反复失败。
                 pending_archive_request_.reset();
                 pending_archive_file_index_ = 0;
+                telemetry_archive_batches_.fetch_sub(1);
                 continue;
             }
 
@@ -3344,6 +3538,10 @@ namespace optical_node_manager {
                 }
 
                 std::string relative_path;
+                // 仅观测下载/落盘调用的实际墙钟耗时，不改变下载流程。
+                auto write_op = metrics_disc_
+                    ? metrics_disc_->Start(zb::metrics::OperationKind::kWrite)
+                    : zb::metrics::NodeMetricsCollector::ScopedOperation{};
                 if (!DownloadArchiveFile(file, target_node_address, &relative_path)) {
                     ++pending_archive_file_index_;
                     continue;
@@ -3354,11 +3552,7 @@ namespace optical_node_manager {
 
                 // 写记账（I/O）：一次归档下载记为一次写操作，字节取文件原始大小，
                 // 表示由磁电节点到光盘节点的数据 I/O，计入 disc 路径（归档写盘侧）。
-                const uint64_t written_bytes = static_cast<uint64_t>(file.size);
-                if (metrics_disc_ != nullptr) {
-                    auto write_op = metrics_disc_->Start(zb::metrics::OperationKind::kWrite);
-                    write_op.SetBytes(written_bytes);
-                }
+                write_op.SetBytes(static_cast<uint64_t>(file.size));
 
                 if (!SubmitWriteTaskForArchive(file.inode_id, relative_path)) {
                     // 队列已关闭 / 正在停止：清理已下载文件，避免残留，并退出消费循环。
@@ -3377,6 +3571,7 @@ namespace optical_node_manager {
             // 当前 MDS 批次已下完：清空断点，回到外层取下一个批次（本轮配额跨批次累计）。
             pending_archive_request_.reset();
             pending_archive_file_index_ = 0;
+            telemetry_archive_batches_.fetch_sub(1);
         }
     }
 
@@ -3499,6 +3694,9 @@ namespace optical_node_manager {
                     disc_sim_dir_ + "volume_" + std::to_string(read_volume_id) + ".vimg";
 
                 // 2. 从 vdisc 复制出该镜像区间（vdisc 本身不再被搬移/删除）。
+                auto disc_op = metrics_disc_
+                    ? metrics_disc_->Start(zb::metrics::OperationKind::kRead)
+                    : zb::metrics::NodeMetricsCollector::ScopedOperation{};
                 if (!ExtractRangeFromDisc(disc_path, extracted_path, location.offset_in_disc,
                                           location.image_size_bytes)) {
                     (void)::unlink(extracted_path.c_str());
@@ -3511,10 +3709,7 @@ namespace optical_node_manager {
                 } else {
                     // 光盘读记账（I/O）：一次 DISC miss 的镜像回读，字节为从光盘读出的镜像大小，
                     // 计入 optical-disc 访问路径，与缓存命中的区间读分开统计。
-                    if (metrics_disc_ != nullptr) {
-                        auto disc_op = metrics_disc_->Start(zb::metrics::OperationKind::kRead);
-                        disc_op.SetBytes(location.image_size_bytes);
-                    }
+                    disc_op.SetBytes(location.image_size_bytes);
                     // 3. 校验提取内容与元数据记录的 SHA-256 一致（镜像级完整性校验）。
                     std::string extracted_sha256;
                     if (!space_manager::Sha256FileHex(extracted_path, &extracted_sha256) ||

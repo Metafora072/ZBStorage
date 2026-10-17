@@ -2,6 +2,7 @@
 """Exercise two non-default-generation disk models and one optical model with real MDS."""
 
 import argparse
+import json
 import os
 import pathlib
 import shutil
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 
 
 def free_port():
@@ -40,6 +42,21 @@ def stop(process):
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=5)
+
+
+def scheduler_rpc(port, method, **payload):
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/zb.rpc.SchedulerService/{method}",
+        json.dumps(payload).encode(), {"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=2) as reply:
+        result = json.load(reply)
+    if result.get("status", {}).get("code", 0) not in (0, "SCHED_OK"):
+        raise AssertionError(f"{method}: {result}")
+    return result
+
+
+def managed_node(port, node_id):
+    return scheduler_rpc(port, "GetManagedNode", node_id=node_id).get("node", {})
 
 
 def verify_fuse_read(root, client_path, ctl_path, mds_port, control_port):
@@ -112,13 +129,20 @@ def main():
             "CACHE_READ_BYTES_PER_SEC=1000000\nLOAD_LATENCY_MS=10\n"
             "SEEK_LATENCY_MS=1\nARCHIVE_TRANSFER_BYTES_PER_SEC=1000000\n"
             "ARCHIVE_PACK_BYTES_PER_SEC=1000000\n"
-            "ARCHIVE_BURN_BYTES_PER_SEC=1000000\nARCHIVE_BURN_FIXED_MS=5\n",
+            "ARCHIVE_BURN_BYTES_PER_SEC=1000000\nARCHIVE_BURN_FIXED_MS=5\nARCHIVE_SOURCE_LEASE_MS=1000\n",
             encoding="utf-8",
         )
+        (root / "optical-target.conf").write_text(
+            (root / "optical.conf").read_text().replace("NODE_ID=model-optical\n", "NODE_ID=model-optical-target\n")
+            .replace("INSTANCE_GENERATION=9", "INSTANCE_GENERATION=10")
+            .replace("STATE_DIR=optical-state", "STATE_DIR=optical-target-state")
+            .replace("DISC_COUNT=2", "DISC_COUNT=1")
+            .replace("DISC_CAPACITY_BYTES=1000", "DISC_CAPACITY_BYTES=80")
+            .replace("ARCHIVE_BURN_FIXED_MS=5", "ARCHIVE_BURN_FIXED_MS=1500"), encoding="utf-8")
         scheduler_config = root / "scheduler.conf"
         scheduler_config.write_text(
             "SIMULATION_DISK_CONFIGS=model-disk-a.conf,model-disk-b.conf\n"
-            "SIMULATION_OPTICAL_CONFIGS=optical.conf\n"
+            "SIMULATION_OPTICAL_CONFIGS=optical.conf,optical-target.conf\n"
             f"SIMULATION_DATA_PORT={data_port}\n"
             f"SIMULATION_DATA_ADDRESS=127.0.0.1:{data_port}\n"
             f"MDS_ADDRESS=127.0.0.1:{mds_port}\n"
@@ -167,8 +191,74 @@ def main():
                 if len(inode_rows) != 1:
                     raise AssertionError("probe did not report the committed inode")
                 inode = inode_rows[0].split("=", 1)[1]
+                scheduler_rpc(control_port, "StopNode", node_id="model-optical-target", force=True)
+                scheduler_rpc(control_port, "RemoveManagedNode", node_id="model-optical")
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    task = scheduler_rpc(control_port, "GetDrainMigration",
+                                         node_id="model-optical").get("task", {})
+                    if "no admitted model optical target" in task.get("last_error", ""):
+                        source_state = managed_node(control_port, "model-optical")
+                        if int(source_state.get("resident_data_bytes", 0)) == 0:
+                            raise AssertionError("source cleared without migration target")
+                        break
+                    time.sleep(0.05)
+                else:
+                    raise AssertionError("missing explicit no-target migration error")
+                scheduler_rpc(control_port, "StartNode", node_id="model-optical-target")
+                print("missing optical migration target blocks and preserves source inventory: PASS")
+                drained = subprocess.Popen(
+                    [args.probe, "--drain-optical", f"127.0.0.1:{mds_port}",
+                     f"127.0.0.1:{control_port}", f"127.0.0.1:{data_port}", inode,
+                     "model-optical", "model-optical-target"], stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True)
+                try:
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        state = managed_node(control_port, "model-optical-target")
+                        if int(state.get("optical_library", {}).get("pending_write_tasks", 0)):
+                            break
+                        if drained.poll() is not None:
+                            raise AssertionError("optical drain ended before crash injection")
+                        time.sleep(0.02)
+                    else:
+                        raise AssertionError("no observable in-flight optical migration")
+                    scheduler_rpc(control_port, "StopNode", node_id="model-optical-target", force=True)
+                    time.sleep(2)  # 大于模型刻录固定时延，关闭期间仍不得结束后台任务。
+                    stopped_state = managed_node(control_port, "model-optical-target")
+                    if (not int(stopped_state.get("optical_library", {}).get("pending_write_tasks", 0)) or
+                            stopped_state.get("power_level", "MANAGED_POWER_OFF") not in (0, "MANAGED_POWER_OFF")):
+                        raise AssertionError("stopped optical tasks advanced or power was raised")
+                    scheduler_rpc(control_port, "StartNode", node_id="model-optical-target")
+                    print("forced logical stop checkpoints tasks and freezes modeled progress: PASS")
+                    scheduler.kill()
+                    scheduler.wait(timeout=8)
+                    scheduler = subprocess.Popen(
+                        [args.scheduler, f"--config={scheduler_config}",
+                         f"--port={control_port}", "--bthread_concurrency=4"],
+                        stdout=scheduler_log, stderr=scheduler_log)
+                    wait_port(scheduler, control_port)
+                    wait_port(scheduler, data_port)
+                    scheduler_rpc(control_port, "StartNode", node_id="model-optical-target")
+                    stdout, stderr = drained.communicate(timeout=40)
+                    if drained.returncode != 0:
+                        raise AssertionError(stdout + stderr)
+                    print(stdout, end="")
+                    print("SIGKILL during optical transfer/burn, durable outbox recovery: PASS")
+                    started = time.monotonic()
+                    reboot = scheduler_rpc(control_port, "RebootNode", node_id="model-optical-target")
+                    reboot_operation = reboot["operation"]["operation_id"]
+                    if time.monotonic() - started < 0.95:
+                        raise AssertionError("configured 1000 ms logical reboot latency was skipped")
+                    rebooted_state = managed_node(control_port, "model-optical-target")
+                    if rebooted_state.get("administrative_state") not in (1, "MANAGED_ADMIN_ENABLED"):
+                        raise AssertionError(f"successful reboot left node disabled: {rebooted_state}")
+                    print("logical reboot duration and CMS re-admission: PASS")
+                finally:
+                    stop(drained)
                 stop(mds)
-                stop(scheduler)
+                scheduler.kill()  # 生命周期成功应答已持久化，立即强杀不能恢复成禁用中间态。
+                scheduler.wait(timeout=8)
                 mds = scheduler = None
                 scheduler = subprocess.Popen(
                     [args.scheduler, f"--config={scheduler_config}",
@@ -177,6 +267,9 @@ def main():
                 )
                 wait_port(scheduler, control_port)
                 wait_port(scheduler, data_port)
+                recovered_operation = scheduler_rpc(control_port, "GetOperationStatus", operation_id=reboot_operation)
+                if recovered_operation["operation"]["status"] not in (2, "NODE_OP_SUCCEEDED"):
+                    raise AssertionError(f"successful lifecycle operation was not restored: {recovered_operation}")
                 mds = subprocess.Popen(
                     [args.mds, f"--config={mds_config}", f"--port={mds_port}",
                      "--bthread_concurrency=4"],
@@ -186,13 +279,73 @@ def main():
                 restored = subprocess.run(
                     [args.probe, "--verify-restored", f"127.0.0.1:{mds_port}",
                      f"127.0.0.1:{control_port}", f"127.0.0.1:{data_port}",
-                     inode, "model-optical"],
+                     inode, "model-optical-target"],
                     capture_output=True, text=True, timeout=40,
                 )
                 if restored.returncode != 0:
                     raise AssertionError(restored.stdout + restored.stderr)
                 print(restored.stdout, end="")
+                print("full-disc read-only completion and lifecycle ACK followed by SIGKILL recovery: PASS")
+                for node_id, label in (("model-disk-b", "MANAGED_ACCESS_MIGRATION"),
+                                       ("model-optical-target", "MANAGED_ACCESS_MIGRATION"),
+                                       ("model-optical", "MANAGED_ACCESS_ARCHIVE")):
+                    streams = managed_node(control_port, node_id).get("metrics_streams", [])
+                    total = sum(int(stream.get("write_bytes", 0)) for stream in streams
+                                if stream.get("access_path") == label)
+                    if total < 40:
+                        raise AssertionError(f"missing classified workload counters: {node_id} {streams}")
+                subprocess.run(
+                    [args.probe, "--archive-inventory", f"127.0.0.1:{data_port}",
+                     "model-optical-target", "10", "model", inode], check=True, timeout=30)
+                extra_inode = next(row.split("=", 1)[1] for row in result.stdout.splitlines()
+                                   if row.startswith("EXTRA_INODE="))
+                subprocess.run(
+                    [args.probe, "--verify-restored", f"127.0.0.1:{mds_port}",
+                     f"127.0.0.1:{control_port}", f"127.0.0.1:{data_port}",
+                     extra_inode, "model-optical-target"], check=True, timeout=40)
                 verify_fuse_read(root, args.client, args.ctl, mds_port, control_port)
+                for mode in ("FAILURE", "TIMEOUT"):
+                    stop(scheduler)
+                    for filename in ("model-disk-a.conf", "model-disk-b.conf", "optical.conf", "optical-target.conf"):
+                        path = root / filename
+                        base = "\n".join(line for line in path.read_text().splitlines()
+                                         if not line.startswith(("IO_FAILURE_", "IO_TIMEOUT_")))
+                        path.write_text(base + "\nIO_TIMEOUT_MS=50\n" +
+                            f"IO_FAILURE_PROBABILITY_PPM={1000000 if mode == 'FAILURE' else 0}\n" +
+                            f"IO_TIMEOUT_PROBABILITY_PPM={1000000 if mode == 'TIMEOUT' else 0}\n")
+                    scheduler = subprocess.Popen(
+                        [args.scheduler, f"--config={scheduler_config}", f"--port={control_port}",
+                         "--bthread_concurrency=4"], stdout=scheduler_log, stderr=scheduler_log)
+                    wait_port(scheduler, control_port)
+                    wait_port(scheduler, data_port)
+                    subprocess.run([args.probe, "--model-faults", f"127.0.0.1:{mds_port}",
+                        f"127.0.0.1:{data_port}", "model-disk-b", "8", "model-optical-target", "10",
+                        inode, f"MODEL_IO_INJECTED_{mode}"], check=True, timeout=40)
+                (root / "hot.conf").write_text(
+                    "NODE_ID=hot-api-disk\nINSTANCE_GENERATION=11\nDISK_IDS=disk-01\n"
+                    "ARCHIVE_META_DIR=hot-api-state\nDISK_CAPACITY_BYTES=100000\nREPLICATION_ENABLED=false\n"
+                    "READ_BYTES_PER_SEC=6\nIO_QUEUE_LIMIT=4\n")
+                scheduler_config.write_text(scheduler_config.read_text().replace(
+                    "SIMULATION_DISK_CONFIGS=model-disk-a.conf,model-disk-b.conf",
+                    "SIMULATION_DISK_CONFIGS=model-disk-a.conf,model-disk-b.conf,hot.conf"))
+                reload = scheduler_rpc(control_port, "ReloadModelConfigs")
+                if not reload.get("accepted"):
+                    raise AssertionError(f"model reload was not accepted: {reload}")
+                subprocess.run([args.probe, "--hot-model-check", f"127.0.0.1:{data_port}",
+                                "hot-api-disk", "11", "write", f"127.0.0.1:{control_port}"], check=True, timeout=40)
+                stop(scheduler)
+                scheduler = subprocess.Popen([args.scheduler, f"--config={scheduler_config}",
+                    f"--port={control_port}", "--bthread_concurrency=4"], stdout=scheduler_log, stderr=scheduler_log)
+                wait_port(scheduler, control_port)
+                wait_port(scheduler, data_port)
+                subprocess.run([args.probe, "--hot-model-check", f"127.0.0.1:{data_port}",
+                                "hot-api-disk", "11", "read-drain", f"127.0.0.1:{control_port}"], check=True, timeout=40)
+                deadline = time.monotonic() + 15
+                while managed_node(control_port, "hot-api-disk").get("lifecycle") not in (5, "MANAGED_LIFECYCLE_RETIRED"):
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("hot-added model did not finish CMS-confirmed retirement")
+                    time.sleep(0.1)
+                print("hot-add RPC, bounded concurrent IO/management isolation, recovery and final retirement: PASS")
         except BaseException:
             for filename in ("scheduler.log", "mds.log"):
                 path = root / filename

@@ -2,7 +2,11 @@
 
 #include <cstdint>
 #include <mutex>
+#include <memory>
 #include <string>
+#include <shared_mutex>
+#include "optical_node.pb.h"
+#include "common/rpc/FiberSharedMutex.h"
 
 #include <optical_node_manager.h>
 
@@ -98,10 +102,14 @@ public:
 
     // 归档引擎是否已成功启动（状态为 RUNNING）。
     bool IsArchiveEngineReady() const;
+    bool IsHandoffSuspended() const;
 
     // 正常关机：停止归档引擎并把运行期状态落盘（转发给 OpticalNodeManager::Shutdown）。
     // 幂等；须在 brpc server 停止接收请求之后调用。
     bool Shutdown();
+    // 整库真实产物交接，持久阶段控制准入、断点恢复与 MDS 提交后的源隔离。
+    void ManageLibraryHandoff(const zb::rpc::OpticalLibraryHandoffRequest&,
+                              zb::rpc::OpticalLibraryHandoffReply*);
 
     // 归档引擎当前状态 + 最近一次失败原因，仅用于排障 / 日志。
     std::string GetArchiveStatusDetail() const;
@@ -109,13 +117,49 @@ public:
     // 采集一次光盘库库存快照（光驱忙闲 / 盘片 / 暂存区 / 后台任务），
     // 转发给 OpticalNodeManager；供对外上报（心跳设备清单 / 光盘库状态）读取。
     optical_node_manager::OpticalLibraryInventory GetLibraryInventory() const;
+    // MDS 只读对接：使用现有重建索引，绝不触发复制、刻录或位置提交。
+    uint64_t instance_generation() const { return instance_generation_; }
+    bool ArchiveIndexReady() const {
+        std::shared_lock<zb::rpc_support::FiberSharedMutex> gate(handoff_mu_);
+        return optical_node_manager_->ArchiveIndexReady();
+    }
+    std::vector<WR_task::WRTask> ListArchiveTasks() {
+        std::shared_lock<zb::rpc_support::FiberSharedMutex> gate(handoff_mu_);
+        return optical_node_manager_->ListArchiveTasks();
+    }
+    std::vector<optical_node_manager::OpticalNodeManager::ArchivedImage> ListArchivedImages() {
+        std::shared_lock<zb::rpc_support::FiberSharedMutex> gate(handoff_mu_);
+        return optical_node_manager_->ListArchivedImages();
+    }
+    bool ReadArchivedImageFiles(const optical_node_manager::OpticalNodeManager::ArchivedImage& image,
+                               std::vector<volumemanager::FileMetadata>* files, std::string* error) {
+        std::shared_lock<zb::rpc_support::FiberSharedMutex> gate(handoff_mu_);
+        return optical_node_manager_->ReadArchivedImageFiles(image, files, error);
+    }
+    bool HashArchivedFile(const optical_node_manager::OpticalNodeManager::ArchivedImage& image,
+                          const volumemanager::FileMetadata& file, std::string* sha, std::string* error) {
+        std::shared_lock<zb::rpc_support::FiberSharedMutex> gate(handoff_mu_);
+        return optical_node_manager_->HashArchivedFile(image, file, sha, error);
+    }
 
     // 数据面 I/O 指标采集器（供心跳线程 ReportCollectedMetrics 读取并上报）。
     // cache_hit：客户端缓存命中的区间读；disc：归档下载写 + 从光盘回读镜像的 I/O。
     zb::metrics::NodeMetricsCollector* metrics_cache_hit() { return &metrics_cache_hit_; }
     zb::metrics::NodeMetricsCollector* metrics_disc() { return &metrics_disc_; }
+    zb::metrics::NodeMetricsCollector* metrics_migration() { return &metrics_migration_; }
 
 private:
+    void ResetHandoffEngine();
+    bool LoadHandoff();
+    bool SaveHandoff();
+    bool HandoffBlocksAdmission() const;
+    mutable zb::rpc_support::FiberSharedMutex handoff_mu_;
+    zb::rpc::OpticalLibraryHandoffRecord handoff_;
+    const OpticalNodeConfig engine_config_;
+    const std::string archive_root_;
+    const std::string mds_address_;
+    const std::string format_signature_;
+    const uint64_t instance_generation_;
     // 准备任务 READY 后（后台线程回调）把 ReadReady 序列化并写入对应通知 Stream；
     // 会话已关闭或写入失败时仅记录，本阶段不重试。
     void SendReadReady(const optical_node_manager::PreparedFileReadyEvent& ev);
@@ -132,10 +176,12 @@ private:
     // 归档下载写与光盘回读镜像计入 disc；心跳线程分别上报。线程安全由各自内部 mutex 保证。
     zb::metrics::NodeMetricsCollector metrics_cache_hit_;
     zb::metrics::NodeMetricsCollector metrics_disc_;
+    // 真实交接实际读/写字节，独立于前台缓存命中和普通归档路径。
+    zb::metrics::NodeMetricsCollector metrics_migration_;
 
     // 本节点的归档引擎：接收 MDS 下发的归档文件、驱动镜像封装与刻录，
     // 并承载数据面读链路（PrepareRead / AcquireReadSession / ReadPreparedFile）。
-    optical_node_manager::OpticalNodeManager optical_node_manager_;
+    std::unique_ptr<optical_node_manager::OpticalNodeManager> optical_node_manager_;
 };
 
 } // namespace zb::optical_node

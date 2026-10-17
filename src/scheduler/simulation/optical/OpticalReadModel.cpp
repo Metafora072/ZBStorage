@@ -1,10 +1,12 @@
 #include "OpticalReadModel.h"
+#include "common/rpc/ModelWait.h"
 
 #include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <utility>
 
 namespace zb::scheduler {
@@ -110,11 +112,24 @@ OpticalReadConfig OpticalReadConfig::LoadFromFile(const std::string& path,
             if (error) *error = "invalid " + key + " at line " + std::to_string(line_number);
             return {};
         }
-        if (key == "DRIVE_COUNT" && number <= UINT32_MAX)
+        if (key == "ARCHIVE_SOURCE_LEASE_MS" && number >= 1000 && number <= 3600000)
+            config.archive_source_lease_ms = static_cast<uint32_t>(number);
+        else if (key == "IO_FAILURE_PROBABILITY_PPM" && number <= 1000000)
+            config.io_failure_probability_ppm = static_cast<uint32_t>(number);
+        else if (key == "IO_TIMEOUT_PROBABILITY_PPM" && number <= 1000000)
+            config.io_timeout_probability_ppm = static_cast<uint32_t>(number);
+        else if (key == "IO_TIMEOUT_MS" && number > 0 && number <= 3600000)
+            config.io_timeout_ms = static_cast<uint32_t>(number);
+        else if (key == "IO_FAULT_SEED" && number <= UINT32_MAX)
+            config.io_fault_seed = static_cast<uint32_t>(number);
+        else if (key == "DRIVE_COUNT" && number <= UINT32_MAX)
             config.drive_count = static_cast<uint32_t>(number);
         else if (key == "DISC_COUNT" && number <= UINT32_MAX)
             config.disc_count = static_cast<uint32_t>(number);
         else if (key == "DISC_CAPACITY_BYTES") config.disc_capacity_bytes = number;
+        else if (key == "IMAGE_CAPACITY_BYTES") config.image_capacity_bytes = number;
+        else if (key == "ARCHIVE_TAIL_WAIT_MS" && number <= 3600000)
+            config.archive_tail_wait_ms = static_cast<uint32_t>(number);
         else if (key == "DISC_READ_BYTES_PER_SEC") config.read_bytes_per_sec = number;
         else if (key == "CACHE_CAPACITY_BYTES") config.cache_capacity_bytes = number;
         else if (key == "CACHE_READ_BYTES_PER_SEC") config.cache_read_bytes_per_sec = number;
@@ -126,6 +141,8 @@ OpticalReadConfig OpticalReadConfig::LoadFromFile(const std::string& path,
             config.seek_latency_ms = static_cast<uint32_t>(number);
         else if (key == "WAKE_LATENCY_MS" && number <= 3600000)
             config.wake_latency_ms = static_cast<uint32_t>(number);
+        else if (key == "REBOOT_LATENCY_MS" && number <= 3600000)
+            config.reboot_latency_ms = static_cast<uint32_t>(number);
         else if (key == "MAX_READ_TASKS" && number <= UINT32_MAX)
             config.max_read_tasks = static_cast<uint32_t>(number);
         else if (key == "TASK_RETENTION_MS" && number <= UINT32_MAX)
@@ -150,10 +167,16 @@ OpticalReadConfig OpticalReadConfig::LoadFromFile(const std::string& path,
             return {};
         }
     }
+    if (static_cast<uint64_t>(config.io_failure_probability_ppm) + config.io_timeout_probability_ppm > 1000000) {
+        if (error) *error = "optical IO failure and timeout probabilities must sum to <= 1000000 ppm";
+        return {};
+    }
     return config;
 }
 
-OpticalReadModel::OpticalReadModel(OpticalReadConfig config) : config_(std::move(config)) {
+OpticalReadModel::OpticalReadModel(OpticalReadConfig config) : config_(std::move(config)),
+    io_faults_(config_.io_failure_probability_ppm, config_.io_timeout_probability_ppm,
+               config_.io_fault_seed, config_.node_id) {
     const auto now = Clock::now();
     drive_available_.resize(std::max<uint32_t>(1, config_.drive_count), now);
     cache_available_ = now;
@@ -224,6 +247,8 @@ bool OpticalReadModel::InitStateStore(std::string* error) {
     std::fill(drive_available_.begin(), drive_available_.end(), latest_pending);
     cache_available_ = latest_pending;
     uint32_t recovered_pending_archives = 0;
+    std::unordered_map<std::string, Clock::time_point> recovered_burns;
+    std::unordered_map<std::string, std::string> recovered_images;
     for (const auto& record : loaded_archives) {
         if (ArchivePending(record.phase) &&
             ++recovered_pending_archives > config_.max_archive_tasks) {
@@ -232,10 +257,14 @@ bool OpticalReadModel::InitStateStore(std::string* error) {
         }
         ArchiveJob job;
         job.record = record;
+        job.seal_deadline = now + std::chrono::microseconds(record.seal_remaining_us);
         if (ArchiveActive(record.phase)) {
+            auto [image, inserted] = recovered_images.emplace(record.disc_id, record.image_id);
+            if (!inserted && image->second != record.image_id) {
+                if (error) *error = "conflicting recovered images on the same model disc";
+                return false;
+            }
             if (files_.count(record.inode_id) != 0 ||
-                disc_used_.count(record.disc_id) != 0 ||
-                disc_reserved_.count(record.disc_id) != 0 ||
                 record.size > config_.cache_capacity_bytes - staging_used_bytes_ ||
                 record.media_bytes > config_.disc_capacity_bytes) {
                 if (error) *error = "recovered optical archive reservations conflict";
@@ -248,7 +277,7 @@ bool OpticalReadModel::InitStateStore(std::string* error) {
                     return false;
                 }
             }
-            const uint64_t used = disc_used_[record.disc_id];
+            const uint64_t used = disc_used_.count(record.disc_id) ? disc_used_.at(record.disc_id) : 0;
             const uint64_t reserved = disc_reserved_[record.disc_id];
             if (used > config_.disc_capacity_bytes ||
                 reserved > config_.disc_capacity_bytes - used ||
@@ -264,10 +293,15 @@ bool OpticalReadModel::InitStateStore(std::string* error) {
             if (record.phase == OpticalArchivePhase::kPack)
                 available = &archive_pack_available_;
             if (record.phase == OpticalArchivePhase::kBurn) {
-                auto slot = std::min_element(drive_available_.begin(), drive_available_.end());
-                job.ready_at = std::max(*slot, now) +
-                    std::chrono::microseconds(record.remaining_us);
-                *slot = job.ready_at;
+                const auto group = recovered_burns.find(record.disc_id);
+                if (group == recovered_burns.end()) {
+                    auto slot = std::min_element(drive_available_.begin(), drive_available_.end());
+                    job.ready_at = std::max(*slot, now) + std::chrono::microseconds(record.remaining_us);
+                    *slot = job.ready_at;
+                    recovered_burns.emplace(record.disc_id, job.ready_at);
+                } else {
+                    job.ready_at = group->second;
+                }
             } else {
                 job.ready_at = std::max(*available, now) +
                     std::chrono::microseconds(record.remaining_us);
@@ -344,6 +378,9 @@ OpticalModelResult OpticalReadModel::RemoveFile(uint64_t inode_id, uint64_t vers
     if (it->second.version != version || it->second.disc_id != disc_id ||
         it->second.image_id != image_id)
         return {OpticalModelCode::kInvalid, "optical removal version or location mismatch"};
+    for (const auto& [_, task] : tasks_)
+        if (task.inode_id == inode_id && !task.released)
+            return {OpticalModelCode::kBusy, "optical file still has active preparation/read references"};
     for (const auto& [_, archive] : archives_) {
         if (archive.record.inode_id == inode_id && ArchivePending(archive.record.phase))
             return {OpticalModelCode::kBusy, "optical archive has not been acknowledged"};
@@ -378,6 +415,7 @@ OpticalModelResult OpticalReadModel::RemoveFile(uint64_t inode_id, uint64_t vers
 }
 
 void OpticalReadModel::PruneLocked(Clock::time_point now) {
+    if (paused_) return;
     const auto retention = std::chrono::milliseconds(config_.retry_retention_ms);
     for (auto it = tasks_.begin(); it != tasks_.end();) {
         if (it->second.retained) { ++it; continue; }
@@ -406,7 +444,10 @@ OpticalModelResult OpticalReadModel::RequestRead(uint64_t inode_id,
                                                  const OpticalPreparedInfo* expected) {
     if (inode_id == 0 || disc_id.empty() || image_id.empty())
         return {OpticalModelCode::kInvalid, "missing optical read location"};
+    const auto injected = InjectIoFault();
+    if (injected.code != OpticalModelCode::kOk) return injected;
     std::lock_guard<std::mutex> lock(mu_);
+    if (paused_) return {OpticalModelCode::kNotReady, "optical model is paused"};
     const auto now = Clock::now();
     PruneLocked(now);
     const auto file = files_.find(inode_id);
@@ -500,6 +541,7 @@ void OpticalReadModel::CacheReadyLocked(uint64_t inode_id, const Task& task) {
 
 OpticalModelResult OpticalReadModel::ReadTaskLocked(uint64_t task_id, uint64_t offset,
                                                     uint64_t size, Clock::time_point now) {
+    if (paused_) return {OpticalModelCode::kNotReady, "optical model is paused"};
     const auto it = tasks_.find(task_id);
     if (it == tasks_.end()) return {OpticalModelCode::kNotFound, "optical task not found"};
     Task& task = it->second;
@@ -549,7 +591,7 @@ OpticalModelResult OpticalReadModel::InspectPrepared(uint64_t task_id, OpticalPr
     if (!output || it == tasks_.end() || !it->second.retained)
         return {OpticalModelCode::kNotFound, "prepared task not found"};
     const auto& task = it->second;
-    *output = {task.inode_id, task.version, task.size, Clock::now() >= task.ready_at};
+    *output = {task.inode_id, task.version, task.size, !paused_ && Clock::now() >= task.ready_at};
     if (output->ready) CacheReadyLocked(task.inode_id, task);
     return {};
 }
@@ -590,7 +632,10 @@ OpticalModelResult OpticalReadModel::SubmitVerifiedArchive(
         !valid_id(request.source_node_id) || !valid_id(request.source_disk_id) ||
         !valid_id(request.disc_id) || !valid_id(request.image_id))
         return {OpticalModelCode::kInvalid, "verified archive identity is incomplete"};
+    const auto injected = InjectIoFault();
+    if (injected.code != OpticalModelCode::kOk) return injected;
     std::lock_guard<std::mutex> lock(mu_);
+    if (paused_) return {OpticalModelCode::kNotReady, "optical model is paused"};
     if (!state_store_)
         return {OpticalModelCode::kIoError, "durable optical state is required for archive"};
     const auto existing = archives_.find(request.operation_id);
@@ -600,7 +645,9 @@ OpticalModelResult OpticalReadModel::SubmitVerifiedArchive(
             old.size == request.size && old.source_lease_id == request.source_lease_id &&
             old.source_node_id == request.source_node_id &&
             old.source_disk_id == request.source_disk_id &&
-            old.disc_id == request.disc_id && old.image_id == request.image_id) {
+            old.disc_id == request.disc_id && old.image_id == request.image_id &&
+            old.source_image_id == request.source_image_id &&
+            old.source_generation == request.source_generation) {
             if (old.phase == OpticalArchivePhase::kFailed)
                 return {OpticalModelCode::kNotReady,
                         "prior optical archive operation failed; use a new operation ID"};
@@ -623,10 +670,20 @@ OpticalModelResult OpticalReadModel::SubmitVerifiedArchive(
                            config_.archive_alignment_bytes, &media_bytes))
         return {OpticalModelCode::kInvalid,
                 "optical encoded size exceeds model limit"};
-    if (disc_used_.count(request.disc_id) != 0 ||
-        disc_reserved_.count(request.disc_id) != 0)
-        return {OpticalModelCode::kInvalid,
-                "archive requires a blank dedicated disc until batch packing is supported"};
+    if (!request.source_image_id.empty()) {
+        if (request.source_generation == 0 || (request.size != 0 && request.media_bytes == 0))
+            return {OpticalModelCode::kInvalid, "incomplete optical relocation manifest"};
+        media_bytes = request.media_bytes;
+    }
+    for (const auto& [_, job] : archives_) {
+        if (job.record.disc_id != request.disc_id || job.record.phase == OpticalArchivePhase::kFailed)
+            continue;
+        if (job.record.image_id != request.image_id ||
+            job.record.phase >= OpticalArchivePhase::kBurn)
+            return {OpticalModelCode::kInvalid, "optical disc is sealed or belongs to another image"};
+    }
+    if (disc_used_.count(request.disc_id))
+        return {OpticalModelCode::kInvalid, "cannot append to recorded optical media"};
     size_t occupied_discs = disc_used_.size();
     for (const auto& [id, _] : disc_reserved_)
         if (disc_used_.count(id) == 0) ++occupied_discs;
@@ -640,9 +697,10 @@ OpticalModelResult OpticalReadModel::SubmitVerifiedArchive(
         ? disc_used_.at(request.disc_id) : 0;
     const uint64_t reserved = disc_reserved_.count(request.disc_id)
         ? disc_reserved_.at(request.disc_id) : 0;
-    if (used > config_.disc_capacity_bytes ||
-        reserved > config_.disc_capacity_bytes - used ||
-        media_bytes > config_.disc_capacity_bytes - used - reserved)
+    const uint64_t image_capacity = config_.image_capacity_bytes == 0
+        ? config_.disc_capacity_bytes : config_.image_capacity_bytes;
+    if (used > image_capacity || reserved > image_capacity - used ||
+        media_bytes > image_capacity - used - reserved)
         return {OpticalModelCode::kNoSpace, "optical archive disc capacity exceeded"};
     uint64_t transfer_us = 0;
     if (!ArchiveDuration(request.size, config_.archive_transfer_bytes_per_sec,
@@ -659,6 +717,12 @@ OpticalModelResult OpticalReadModel::SubmitVerifiedArchive(
     record.media_bytes = media_bytes;
     record.phase = OpticalArchivePhase::kTransfer;
     record.remaining_us = static_cast<uint64_t>(remaining);
+    auto seal_deadline = now + std::chrono::milliseconds(config_.archive_tail_wait_ms);
+    for (const auto& [_, group] : archives_)
+        if (ArchiveActive(group.record.phase) && group.record.disc_id == record.disc_id)
+            seal_deadline = std::min(seal_deadline, group.seal_deadline);
+    record.seal_remaining_us = static_cast<uint64_t>(std::max<int64_t>(0,
+        std::chrono::duration_cast<std::chrono::microseconds>(seal_deadline - now).count()));
     std::string error;
     if (!state_store_->PutArchive(record, &error))
         return {OpticalModelCode::kIoError, "optical archive admission persistence failed: " + error};
@@ -674,12 +738,13 @@ OpticalModelResult OpticalReadModel::SubmitVerifiedArchive(
         cached_bytes_ -= victim->second.size;
         cache_.erase(victim);
     }
-    archives_.emplace(record.operation_id, ArchiveJob{record, ready_at});
+    archives_.emplace(record.operation_id, ArchiveJob{record, ready_at, seal_deadline});
     return {OpticalModelCode::kOk, "optical archive task durably accepted"};
 }
 
 OpticalModelResult OpticalReadModel::AdvanceArchives() {
     std::lock_guard<std::mutex> lock(mu_);
+    if (paused_) return {};
     if (!state_store_)
         return {OpticalModelCode::kIoError, "durable optical state is required for archive"};
     const auto now = Clock::now();
@@ -687,69 +752,150 @@ OpticalModelResult OpticalReadModel::AdvanceArchives() {
     operation_ids.reserve(archives_.size());
     for (const auto& [id, _] : archives_) operation_ids.push_back(id);
     std::sort(operation_ids.begin(), operation_ids.end());
+    std::map<std::pair<std::string, std::string>, std::vector<std::string>> groups;
+    const auto remaining_us = [&](Clock::time_point end) {
+        return static_cast<uint64_t>(std::max<int64_t>(0,
+            std::chrono::duration_cast<std::chrono::microseconds>(end - now).count()));
+    };
     for (const auto& id : operation_ids) {
         auto& job = archives_.at(id);
-        while (ArchiveActive(job.record.phase) && now >= job.ready_at) {
-            OpticalArchiveRecord next = job.record;
-            if (next.phase == OpticalArchivePhase::kBurn) {
-                if (files_.count(next.inode_id) != 0)
-                    return {OpticalModelCode::kInvalid,
-                            "optical archive target changed before local completion"};
-                next.phase = OpticalArchivePhase::kAwaitingMds;
-                next.remaining_us = 0;
-                std::string error;
-                if (!state_store_->CompleteArchive(
-                        next, {next.inode_id, next.version, next.size,
-                               next.disc_id, next.image_id, next.media_bytes}, &error))
-                    return {OpticalModelCode::kIoError,
-                            "optical archive local completion failed: " + error};
-                const uint64_t reserved = disc_reserved_.at(next.disc_id);
-                if (reserved == next.media_bytes) disc_reserved_.erase(next.disc_id);
-                else disc_reserved_[next.disc_id] = reserved - next.media_bytes;
-                staging_used_bytes_ -= next.size;
-                disc_used_[next.disc_id] += next.media_bytes;
-                stored_bytes_ += next.media_bytes;
-                files_.emplace(next.inode_id,
-                               File{next.version, next.size, next.disc_id, next.image_id,
-                                    next.media_bytes});
-                job.record = std::move(next);
-                break;
-            }
-            uint64_t duration_us = 0;
-            Clock::time_point next_ready;
-            Clock::time_point* available = nullptr;
-            if (next.phase == OpticalArchivePhase::kTransfer) {
-                next.phase = OpticalArchivePhase::kPack;
-                available = &archive_pack_available_;
-                if (!ArchiveDuration(next.size, config_.archive_pack_bytes_per_sec,
-                                     0, &duration_us))
-                    return {OpticalModelCode::kInvalid, "optical archive pack duration exceeds limit"};
-            } else {
-                next.phase = OpticalArchivePhase::kBurn;
-                auto slot = std::min_element(drive_available_.begin(), drive_available_.end());
-                available = &*slot;
-                if (!ArchiveDuration(next.media_bytes, config_.archive_burn_bytes_per_sec,
-                                     static_cast<uint64_t>(config_.archive_burn_fixed_ms) * 1000,
-                                     &duration_us))
-                    return {OpticalModelCode::kInvalid, "optical archive burn duration exceeds limit"};
-            }
-            next_ready = std::max(job.ready_at, *available) +
-                std::chrono::microseconds(duration_us);
-            const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
-                next_ready - now).count();
-            if (remaining > 365LL * 24 * 60 * 60 * 1000000)
-                return {OpticalModelCode::kBusy, "optical archive stage queue horizon exceeded"};
-            next.remaining_us = static_cast<uint64_t>(std::max<int64_t>(0, remaining));
+        if (!ArchiveActive(job.record.phase)) continue;
+        if (job.record.phase == OpticalArchivePhase::kTransfer && now >= job.ready_at) {
+            uint64_t duration = 0;
+            if (!ArchiveDuration(job.record.size, config_.archive_pack_bytes_per_sec, 0, &duration))
+                return {OpticalModelCode::kInvalid, "optical pack duration exceeds limit"};
+            const auto ready = std::max(job.ready_at, archive_pack_available_) +
+                std::chrono::microseconds(duration);
+            if (remaining_us(ready) > 365ULL * 24 * 60 * 60 * 1000000)
+                return {OpticalModelCode::kBusy, "optical pack horizon exceeded"};
+            auto next = job.record;
+            next.phase = OpticalArchivePhase::kPack;
+            next.remaining_us = remaining_us(ready);
+            next.seal_remaining_us = remaining_us(job.seal_deadline);
             std::string error;
-            if (!state_store_->PutArchive(next, &error))
-                return {OpticalModelCode::kIoError,
-                        "optical archive stage persistence failed: " + error};
-            *available = next_ready;
+            if (!state_store_->PutArchive(next, &error)) return {OpticalModelCode::kIoError, error};
+            archive_pack_available_ = ready;
             job.record = std::move(next);
-            job.ready_at = next_ready;
+            job.ready_at = ready;
         }
+        groups[{job.record.disc_id, job.record.image_id}].push_back(id);
+    }
+    for (const auto& [key, ids] : groups) {
+        bool pack_ready = true, burn_ready = true;
+        uint64_t media = 0;
+        auto ready = Clock::time_point{};
+        auto seal = Clock::time_point::max();
+        for (const auto& id : ids) {
+            const auto& job = archives_.at(id);
+            pack_ready &= job.record.phase == OpticalArchivePhase::kPack && job.ready_at <= now;
+            burn_ready &= job.record.phase == OpticalArchivePhase::kBurn && job.ready_at <= now;
+            ready = std::max(ready, job.ready_at);
+            seal = std::min(seal, job.seal_deadline);
+            media += job.record.media_bytes; // admission already bounded by one disc
+        }
+        const uint64_t capacity = config_.image_capacity_bytes == 0
+            ? config_.disc_capacity_bytes : config_.image_capacity_bytes;
+        if (pack_ready && (media >= capacity || now >= seal)) {
+            auto slot = std::min_element(drive_available_.begin(), drive_available_.end());
+            uint64_t duration = 0;
+            if (!ArchiveDuration(media, config_.archive_burn_bytes_per_sec,
+                    static_cast<uint64_t>(config_.archive_burn_fixed_ms) * 1000, &duration))
+                return {OpticalModelCode::kInvalid, "optical burn duration exceeds limit"};
+            // 同卷仅占一个光驱、支付一次固定封盘开销；尾批有界等待后封盘。
+            if (media < capacity) ready = std::max(ready, seal);
+            ready = std::max(ready, *slot) + std::chrono::microseconds(duration);
+            if (remaining_us(ready) > 365ULL * 24 * 60 * 60 * 1000000)
+                return {OpticalModelCode::kBusy, "optical burn horizon exceeded"};
+            std::vector<OpticalArchiveRecord> updates;
+            for (const auto& id : ids) {
+                auto next = archives_.at(id).record;
+                next.phase = OpticalArchivePhase::kBurn;
+                next.remaining_us = remaining_us(ready);
+                next.seal_remaining_us = 0;
+                updates.push_back(std::move(next));
+            }
+            std::string error;
+            if (!state_store_->PutArchiveGroup(updates, false, &error))
+                return {OpticalModelCode::kIoError, error};
+            *slot = ready;
+            for (const auto& next : updates) {
+                auto& job = archives_.at(next.operation_id);
+                job.record = next;
+                job.ready_at = ready;
+            }
+            burn_ready = ready <= now;
+        }
+        if (!burn_ready) continue;
+        std::vector<OpticalArchiveRecord> completed;
+        for (const auto& id : ids) {
+            auto next = archives_.at(id).record;
+            if (files_.count(next.inode_id))
+                return {OpticalModelCode::kInvalid, "optical target changed before completion"};
+            next.phase = OpticalArchivePhase::kAwaitingMds;
+            next.remaining_us = 0;
+            next.seal_remaining_us = 0;
+            completed.push_back(std::move(next));
+        }
+        std::string error;
+        if (!state_store_->PutArchiveGroup(completed, true, &error))
+            return {OpticalModelCode::kIoError, error};
+        for (const auto& next : completed) {
+            disc_reserved_[next.disc_id] -= next.media_bytes;
+            staging_used_bytes_ -= next.size;
+            disc_used_[next.disc_id] += next.media_bytes;
+            stored_bytes_ += next.media_bytes;
+            files_.emplace(next.inode_id, File{next.version, next.size, next.disc_id,
+                                               next.image_id, next.media_bytes});
+            archives_.at(next.operation_id).record = next;
+        }
+        disc_reserved_.erase(key.first);
     }
     return {};
+}
+
+bool OpticalReadModel::SetPaused(bool paused, std::string* error) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (paused == paused_) return true;
+    const auto now = Clock::now();
+    if (!paused) {
+        const auto stopped = now - paused_at_;
+        for (auto& [_, job] : archives_) {
+            if (!ArchiveActive(job.record.phase)) continue;
+            job.ready_at += stopped;
+            job.seal_deadline += stopped;
+        }
+        for (auto& [_, task] : tasks_)
+            if (!task.released) task.ready_at += stopped;
+        for (auto& ready : drive_available_) ready += stopped;
+        archive_transfer_available_ += stopped;
+        archive_pack_available_ += stopped;
+        cache_available_ += stopped;
+        paused_ = false;
+        return true;
+    }
+    if (!state_store_) { if (error) *error = "optical control store unavailable"; return false; }
+    const auto remaining = [&](Clock::time_point deadline) {
+        return static_cast<uint64_t>(std::max<int64_t>(0,
+            std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count()));
+    };
+    std::vector<OpticalArchiveRecord> archives;
+    std::vector<OpticalTaskRecord> tasks;
+    for (const auto& [_, job] : archives_) {
+        if (!ArchiveActive(job.record.phase)) continue;
+        auto record = job.record;
+        record.remaining_us = remaining(job.ready_at);
+        record.seal_remaining_us = remaining(job.seal_deadline);
+        archives.push_back(std::move(record));
+    }
+    for (const auto& [id, task] : tasks_) {
+        if (task.released) continue;
+        tasks.push_back({id, task.inode_id, task.version, task.size,
+                         remaining(task.ready_at), 0, false, task.cache_hit});
+    }
+    if (!state_store_->CheckpointWork(archives, tasks, error)) return false;
+    paused_ = true;
+    paused_at_ = now;
+    return true;
 }
 
 OpticalModelResult OpticalReadModel::AcknowledgeArchive(
@@ -796,6 +942,25 @@ OpticalModelResult OpticalReadModel::FailArchive(
     return {};
 }
 
+OpticalModelResult OpticalReadModel::ReplaceArchiveLease(const std::string& operation_id,
+    const std::string& expected_lease, const std::string& next_lease) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = archives_.find(operation_id);
+    if (it == archives_.end() || it->second.record.source_lease_id != expected_lease ||
+        next_lease.empty() || !it->second.record.source_image_id.empty() ||
+        it->second.record.phase == OpticalArchivePhase::kCommitted ||
+        it->second.record.phase == OpticalArchivePhase::kFailed)
+        return {OpticalModelCode::kInvalid, "archive lease changed or archive is terminal"};
+    auto next = it->second.record;
+    if (next.admission_lease_id.empty()) next.admission_lease_id = next.source_lease_id;
+    next.source_lease_id = next_lease;
+    std::string error;
+    if (!state_store_ || !state_store_->PutArchive(next, &error))
+        return {OpticalModelCode::kIoError, "cannot persist recovered archive lease: " + error};
+    it->second.record = std::move(next);
+    return {};
+}
+
 bool OpticalReadModel::GetArchive(const std::string& operation_id,
                                   OpticalArchiveRecord* output) const {
     if (!output) return false;
@@ -804,6 +969,14 @@ bool OpticalReadModel::GetArchive(const std::string& operation_id,
     if (found == archives_.end()) return false;
     *output = found->second.record;
     return true;
+}
+
+std::vector<OpticalArchiveRecord> OpticalReadModel::ListArchives() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::vector<OpticalArchiveRecord> result;
+    for (const auto& item : archives_) result.push_back(item.second.record);
+    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.operation_id < b.operation_id; });
+    return result;
 }
 
 std::vector<OpticalArchiveRecord> OpticalReadModel::PendingArchives() const {
@@ -815,6 +988,29 @@ std::vector<OpticalArchiveRecord> OpticalReadModel::PendingArchives() const {
         return a.operation_id < b.operation_id;
     });
     return out;
+}
+
+OpticalModelResult OpticalReadModel::InjectIoFault() {
+    const auto fault = io_faults_.Next();
+    if (fault == zb::model::IoFault::kFailure)
+        return {OpticalModelCode::kIoError, "MODEL_IO_INJECTED_FAILURE"};
+    if (fault == zb::model::IoFault::kTimeout) {
+        zb::rpc_route::WaitModelUntil(Clock::now() + std::chrono::milliseconds(config_.io_timeout_ms));
+        return {OpticalModelCode::kNotReady, "MODEL_IO_INJECTED_TIMEOUT"};
+    }
+    return {};
+}
+
+std::vector<OpticalFileRecord> OpticalReadModel::ListFiles() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::vector<OpticalFileRecord> files;
+    for (const auto& [inode, file] : files_)
+        files.push_back({inode, file.version, file.size, file.disc_id,
+                         file.image_id, file.media_bytes});
+    std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) {
+        return a.inode_id < b.inode_id;
+    });
+    return files;
 }
 
 OpticalModelStats OpticalReadModel::Stats() const {

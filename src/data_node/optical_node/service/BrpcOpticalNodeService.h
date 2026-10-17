@@ -10,6 +10,16 @@ namespace zb::optical_node {
 class BrpcOpticalNodeService : public zb::rpc::OpticalNodeService {
 public:
     explicit BrpcOpticalNodeService(OpticalStorageServiceImpl* service);
+    void ManageLibraryHandoff(google::protobuf::RpcController*, const zb::rpc::OpticalLibraryHandoffRequest*,
+                              zb::rpc::OpticalLibraryHandoffReply*, google::protobuf::Closure*) override;
+    void ListArchiveTasks(google::protobuf::RpcController*, const zb::rpc::ListArchiveTasksRequest*,
+                          zb::rpc::ListArchiveTasksReply*, google::protobuf::Closure*) override;
+
+    // 仅暴露已完成介质的索引与文件清单；MDS 负责权威版本和位置提交。
+    void ListArchiveImages(google::protobuf::RpcController*, const zb::rpc::ListArchiveImagesRequest*,
+                           zb::rpc::ListArchiveImagesReply*, google::protobuf::Closure*) override;
+    void GetArchiveImageFiles(google::protobuf::RpcController*, const zb::rpc::GetArchiveImageFilesRequest*,
+                              zb::rpc::GetArchiveImageFilesReply*, google::protobuf::Closure*) override;
 
     void SendArchiveMetadata(google::protobuf::RpcController* cntl_base,
                              const zb::rpc::SendArchiveMetadataRequest* request,

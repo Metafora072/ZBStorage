@@ -77,6 +77,7 @@ bool SchedulerClient::Call(const char* name, const Request& request, Reply* resp
     }
 
 ZB_DEFINE_SCHEDULER_CALL(ReportHeartbeat, HeartbeatRequest, HeartbeatReply)
+ZB_DEFINE_SCHEDULER_CALL(ReloadModelConfigs, ReloadModelConfigsRequest, ReloadModelConfigsReply)
 ZB_DEFINE_SCHEDULER_CALL(GetClusterView, GetClusterViewRequest, GetClusterViewReply)
 ZB_DEFINE_SCHEDULER_CALL(SetNodeAdminState, SetNodeAdminStateRequest, SetNodeAdminStateReply)
 ZB_DEFINE_SCHEDULER_CALL(StartNode, StartNodeRequest, NodeOperationReply)

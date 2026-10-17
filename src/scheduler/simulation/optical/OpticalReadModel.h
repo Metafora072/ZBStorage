@@ -9,11 +9,11 @@
 #include <vector>
 
 #include "OpticalStateStore.h"
+#include "common/rpc/ModelIoFaults.h"
 
 namespace zb::scheduler {
 
-// Optical inventory/read core. Files may only be installed after a verified
-// commit; the current public protocol does not yet provide that commit.
+// 无载荷光盘模型：归档/迁移接收、共卷刻录与读任务；MDS 仍是位置权威。
 struct OpticalReadConfig {
     std::string node_id;
     uint64_t instance_generation{1};
@@ -28,6 +28,7 @@ struct OpticalReadConfig {
     uint32_t load_latency_ms{60000};
     uint32_t seek_latency_ms{500};
     uint32_t wake_latency_ms{0};
+    uint32_t reboot_latency_ms{1000};
     uint32_t max_read_tasks{128};
     uint32_t retry_retention_ms{30000};
     uint32_t max_archive_tasks{128};
@@ -35,10 +36,18 @@ struct OpticalReadConfig {
     uint64_t archive_pack_bytes_per_sec{1000000000};
     uint64_t archive_burn_bytes_per_sec{10000000};
     uint32_t archive_burn_fixed_ms{500};
+    uint32_t archive_tail_wait_ms{1000};
+    // 0 使用盘容量；一张模型盘封入一个卷，可容纳多个文件。
+    uint64_t image_capacity_bytes{0};
     // Encoded media size = ceil(logical bytes * ratio / 1000), then rounded up
     // to ARCHIVE_ALIGNMENT_BYTES. This is a model parameter, not compression.
     uint32_t archive_compression_permille{1000};
     uint32_t archive_alignment_bytes{1};
+    uint32_t io_failure_probability_ppm{0};
+    uint32_t io_timeout_probability_ppm{0};
+    uint32_t io_timeout_ms{1000};
+    uint32_t io_fault_seed{0};
+    uint32_t archive_source_lease_ms{300000};
     static OpticalReadConfig LoadFromFile(const std::string& path, std::string* error);
 };
 
@@ -100,12 +109,20 @@ public:
     OpticalModelResult ReadLatest(uint64_t inode_id, uint64_t offset, uint64_t size);
     OpticalModelResult SubmitVerifiedArchive(const OpticalArchiveRecord& request);
     OpticalModelResult AdvanceArchives();
+    // 停机/节点故障冻结任务时间线；原子检查点保存剩余工作，不推进停机时间。
+    bool SetPaused(bool paused, std::string* error);
     OpticalModelResult AcknowledgeArchive(const std::string& operation_id,
                                           const std::string& source_lease_id);
     OpticalModelResult FailArchive(const std::string& operation_id,
                                    const std::string& source_lease_id);
     bool GetArchive(const std::string& operation_id, OpticalArchiveRecord* output) const;
+    OpticalModelResult ReplaceArchiveLease(const std::string& operation_id,
+                                            const std::string& expected_lease,
+                                            const std::string& next_lease);
     std::vector<OpticalArchiveRecord> PendingArchives() const;
+    std::vector<OpticalArchiveRecord> ListArchives() const;
+    // 只读导出逻辑文件清单，供排空迁移核对权威位置，不生成业务数据。
+    std::vector<OpticalFileRecord> ListFiles() const;
     OpticalModelStats Stats() const;
 
 private:
@@ -140,6 +157,8 @@ private:
                                       uint64_t size, Clock::time_point now);
 
     OpticalReadConfig config_;
+    zb::model::IoFaultPolicy io_faults_;
+    OpticalModelResult InjectIoFault();
     mutable std::mutex mu_;
     std::unordered_map<uint64_t, File> files_;
     std::unordered_map<std::string, uint64_t> disc_used_;
@@ -149,6 +168,7 @@ private:
     struct ArchiveJob {
         OpticalArchiveRecord record;
         Clock::time_point ready_at;
+        Clock::time_point seal_deadline;
     };
     std::unordered_map<std::string, ArchiveJob> archives_;
     std::unordered_map<std::string, uint64_t> disc_reserved_;
@@ -162,6 +182,8 @@ private:
     uint64_t next_task_id_{1};
     uint64_t lru_clock_{0};
     std::unique_ptr<OpticalStateStore> state_store_;
+    bool paused_{false};
+    Clock::time_point paused_at_{};
 };
 
 } // namespace zb::scheduler

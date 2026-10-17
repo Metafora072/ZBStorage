@@ -96,6 +96,9 @@ public:
                          const std::string& message,
                          std::string* error);
     bool GetOperation(const std::string& operation_id, NodeOperationState* out) const;
+    void SnapshotOperations(std::vector<zb::rpc::NodeOperation>* operations, uint64_t* next_id) const;
+    bool RestoreOperations(const google::protobuf::RepeatedPtrField<zb::rpc::NodeOperation>& operations,
+                           uint64_t next_id, uint64_t restore_time_ms, std::string* error);
 
 private:
     static NodeState BuildNodeState(const ManagedNodeRuntime& node);

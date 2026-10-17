@@ -68,7 +68,7 @@ bool BrpcObjectMigrationBackend::ListObjects(const std::string& source_address,
     if (!objects) return false;
     objects->clear();
     if (source_address.rfind("model://", 0) == 0) {
-        auto* source = models_ ? models_->GetStorage(source_address.substr(8)) : nullptr;
+        auto source = models_ ? models_->BorrowStorage(source_address.substr(8), false, error) : nullptr;
         if (!source) { if (error) *error = "model source unavailable"; return false; }
         std::vector<zb::real_node::ArchiveObjectMeta> inventory;
         const auto status = source->ListTrackedObjects(&inventory);
@@ -173,8 +173,8 @@ bool BrpcObjectMigrationBackend::CopyAndVerify(const std::string& source_address
                                                const MigrationTarget& target,
                                                std::string* error) {
     if (source_address.rfind("model://", 0) == 0) {
-        auto* source = models_ ? models_->GetStorage(source_address.substr(8)) : nullptr;
-        auto* destination = models_ ? models_->GetStorage(target.node_id) : nullptr;
+        auto source = models_ ? models_->BorrowStorage(source_address.substr(8), false, error) : nullptr;
+        auto destination = models_ ? models_->BorrowStorage(target.node_id, true, error) : nullptr;
         if (!source || !destination) {
             if (error) *error = "model source or target unavailable";
             return false;
@@ -192,9 +192,21 @@ bool BrpcObjectMigrationBackend::CopyAndVerify(const std::string& source_address
         const auto resident = source->ExportResidentModelObject(
             object.disk_id, object.object_id, object.size_bytes);
         if (!resident.ok()) { if (error) *error = resident.message; return false; }
+        auto* source_metrics = models_->GetBackgroundMetrics(source_address.substr(8));
+        auto* target_metrics = models_->GetBackgroundMetrics(target.node_id);
+        auto read_metric = source_metrics ? source_metrics->Start(zb::metrics::OperationKind::kRead)
+                                         : zb::metrics::NodeMetricsCollector::ScopedOperation{};
+        auto write_metric = target_metrics ? target_metrics->Start(zb::metrics::OperationKind::kWrite)
+                                           : zb::metrics::NodeMetricsCollector::ScopedOperation{};
+        const auto read_time = source->SimulateModelTransfer(object.size_bytes, true);
+        if (!read_time.ok()) { if (error) *error = read_time.message; return false; }
+        read_metric.SetBytes(object.size_bytes);
+        const auto write_time = destination->SimulateModelTransfer(object.size_bytes, false);
+        if (!write_time.ok()) { if (error) *error = write_time.message; return false; }
         const auto imported = destination->ImportModelObject(
             target.disk_id, object.object_id, object.size_bytes);
         if (!imported.ok()) { if (error) *error = imported.message; return false; }
+        write_metric.SetBytes(object.size_bytes);
         std::vector<zb::real_node::ArchiveObjectMeta> verified;
         const auto checked = destination->ListTrackedObjects(&verified);
         if (!checked.ok()) { if (error) *error = checked.message; return false; }
@@ -276,8 +288,8 @@ bool BrpcObjectMigrationBackend::CommitFileLocation(const std::string& migration
     zb::msg::FileMeta model_file;
     const bool model_source = source_address.rfind("model://", 0) == 0;
     if (model_source) {
-        auto* source = models_ ? models_->GetStorage(source_node_id) : nullptr;
-        auto* destination = models_ ? models_->GetStorage(target.node_id) : nullptr;
+        auto source = models_ ? models_->BorrowStorage(source_node_id, false, error) : nullptr;
+        auto destination = models_ ? models_->BorrowStorage(target.node_id, true, error) : nullptr;
         if (!source || !destination) {
             if (error) *error = "model source or target unavailable at commit";
             return false;
@@ -402,7 +414,7 @@ bool BrpcObjectMigrationBackend::DeleteSourceObject(const std::string& source_ad
                                                     const MigrationObject& object,
                                                     std::string* error) {
     if (source_address.rfind("model://", 0) == 0) {
-        auto* source = models_ ? models_->GetStorage(source_address.substr(8)) : nullptr;
+        auto source = models_ ? models_->BorrowStorage(source_address.substr(8), false, error) : nullptr;
         if (!source) { if (error) *error = "model source unavailable for cleanup"; return false; }
         zb::msg::DeleteFileMetaRequest request;
         request.inode_id = object.inode_id;

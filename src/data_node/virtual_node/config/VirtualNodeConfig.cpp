@@ -266,6 +266,11 @@ VirtualNodeConfig VirtualNodeConfig::LoadFromFile(const std::string& path, std::
                                     std::to_string(line_no);
                 return {};
             }
+        } else if (key == "REBOOT_LATENCY_MS") {
+            if (!ParseUint32(value, &cfg.reboot_latency_ms) || cfg.reboot_latency_ms > 3600000) {
+                if (error) *error = "Invalid REBOOT_LATENCY_MS at line " + std::to_string(line_no);
+                return {};
+            }
         } else if (key == "JITTER_MS") {
             if (!ParseUint32(value, &cfg.jitter_ms)) {
                 if (error) {
@@ -276,6 +281,19 @@ VirtualNodeConfig VirtualNodeConfig::LoadFromFile(const std::string& path, std::
         } else if (key == "JITTER_SEED") {
             if (!ParseUint32(value, &cfg.jitter_seed)) {
                 if (error) *error = "Invalid JITTER_SEED at line " + std::to_string(line_no);
+                return {};
+            }
+        } else if (key == "IO_FAILURE_PROBABILITY_PPM" || key == "IO_TIMEOUT_PROBABILITY_PPM") {
+            uint32_t probability = 0;
+            if (!ParseUint32(value, &probability) || probability > 1000000) {
+                if (error) *error = "Invalid " + key + " at line " + std::to_string(line_no);
+                return {};
+            }
+            if (key == "IO_FAILURE_PROBABILITY_PPM") cfg.io_failure_probability_ppm = probability;
+            else cfg.io_timeout_probability_ppm = probability;
+        } else if (key == "IO_TIMEOUT_MS") {
+            if (!ParseUint32(value, &cfg.io_timeout_ms) || cfg.io_timeout_ms == 0 || cfg.io_timeout_ms > 3600000) {
+                if (error) *error = "Invalid IO_TIMEOUT_MS at line " + std::to_string(line_no);
                 return {};
             }
         } else if (key == "MAX_CONCURRENT_IO") {
@@ -301,6 +319,10 @@ VirtualNodeConfig VirtualNodeConfig::LoadFromFile(const std::string& path, std::
         }
     }
 
+    if (static_cast<uint64_t>(cfg.io_failure_probability_ppm) + cfg.io_timeout_probability_ppm > 1000000) {
+        if (error) *error = "IO failure and timeout probabilities must sum to <= 1000000 ppm";
+        return {};
+    }
     if (cfg.disk_ids.empty()) {
         cfg.disk_ids.push_back("disk-01");
     }

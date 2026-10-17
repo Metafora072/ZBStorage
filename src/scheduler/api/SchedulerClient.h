@@ -30,6 +30,8 @@ public:
     bool Connect(std::string* error);
     // 返回构造时指定的 Scheduler 服务地址。
     const std::string& address() const { return address_; }
+    // 触发服务器主循环热加载已部署的模型配置；仅受理，须再查询节点/CMS 是否就绪。
+    bool ReloadModelConfigs(const rpc::ReloadModelConfigsRequest&, rpc::ReloadModelConfigsReply*, std::string* error);
 
     // 上报节点心跳、服务地址、设备状态和就绪信息，维持节点存活视图。
     bool ReportHeartbeat(const rpc::HeartbeatRequest&, rpc::HeartbeatReply*, std::string* error);

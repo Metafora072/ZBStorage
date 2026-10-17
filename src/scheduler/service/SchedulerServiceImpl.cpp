@@ -17,6 +17,20 @@ SchedulerServiceImpl::SchedulerServiceImpl(ClusterState* state,
                                            DrainMigrationCoordinator* migration)
     : state_(state), lifecycle_(lifecycle), node_manager_(node_manager), migration_(migration) {}
 
+void SchedulerServiceImpl::ReloadModelConfigs(google::protobuf::RpcController*,
+    const zb::rpc::ReloadModelConfigsRequest*, zb::rpc::ReloadModelConfigsReply* reply,
+    google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    if (!reply) return;
+    if (!model_reload_request_) {
+        FillStatus(reply->mutable_status(), zb::rpc::SCHED_INTERNAL_ERROR, "model reload is not configured");
+        return;
+    }
+    model_reload_request_();
+    reply->set_accepted(true);
+    FillStatus(reply->mutable_status(), zb::rpc::SCHED_OK, "reload queued; query node and CMS readiness");
+}
+
 void SchedulerServiceImpl::ReportHeartbeat(google::protobuf::RpcController* cntl_base,
                                            const zb::rpc::HeartbeatRequest* request,
                                            zb::rpc::HeartbeatReply* response,
@@ -89,6 +103,7 @@ void SchedulerServiceImpl::SetNodeAdminState(google::protobuf::RpcController* cn
         return;
     }
     response->set_generation(generation);
+    if (!CommitManagedState(response->mutable_status())) return;
     FillStatus(response->mutable_status(), zb::rpc::SCHED_OK, "OK");
 }
 
@@ -110,8 +125,7 @@ void SchedulerServiceImpl::StartNode(google::protobuf::RpcController* cntl_base,
         FillStatus(response->mutable_status(), zb::rpc::SCHED_INTERNAL_ERROR, error);
         return;
     }
-    FillOperation(op, response->mutable_operation());
-    FillStatus(response->mutable_status(), zb::rpc::SCHED_OK, "OK");
+    FinishLifecycleOperation(op, response);
 }
 
 void SchedulerServiceImpl::StopNode(google::protobuf::RpcController* cntl_base,
@@ -132,8 +146,7 @@ void SchedulerServiceImpl::StopNode(google::protobuf::RpcController* cntl_base,
         FillStatus(response->mutable_status(), zb::rpc::SCHED_INTERNAL_ERROR, error);
         return;
     }
-    FillOperation(op, response->mutable_operation());
-    FillStatus(response->mutable_status(), zb::rpc::SCHED_OK, "OK");
+    FinishLifecycleOperation(op, response);
 }
 
 void SchedulerServiceImpl::RebootNode(google::protobuf::RpcController* cntl_base,
@@ -154,8 +167,22 @@ void SchedulerServiceImpl::RebootNode(google::protobuf::RpcController* cntl_base
         FillStatus(response->mutable_status(), zb::rpc::SCHED_INTERNAL_ERROR, error);
         return;
     }
+    FinishLifecycleOperation(op, response);
+}
+
+void SchedulerServiceImpl::FinishLifecycleOperation(const NodeOperationState& op,
+                                                     zb::rpc::NodeOperationReply* response) {
     FillOperation(op, response->mutable_operation());
+    if (!CommitManagedState(response->mutable_status())) return;
     FillStatus(response->mutable_status(), zb::rpc::SCHED_OK, "OK");
+}
+
+bool SchedulerServiceImpl::CommitManagedState(zb::rpc::SchedulerStatus* status) {
+    std::string error;
+    if (!durable_state_commit_ || durable_state_commit_(&error)) return true;
+    FillStatus(status, zb::rpc::SCHED_INTERNAL_ERROR,
+               "state applied but persistence failed; query before retry: " + error);
+    return false;
 }
 
 void SchedulerServiceImpl::GetOperationStatus(google::protobuf::RpcController* cntl_base,
@@ -212,8 +239,13 @@ void SchedulerServiceImpl::RegisterManagedNode(
                                       lifetime_seed, &error);
     if (!registered) {
         ManagedNodeRuntime existing;
+        const bool exists = node_manager_->GetNode(profile.node_id, &existing);
+        if (exists) {
+            response->set_generation(node_manager_->generation());
+            FillManagedNodeView(existing, response->mutable_node());
+        }
         FillStatus(response->mutable_status(),
-                   node_manager_->GetNode(profile.node_id, &existing)
+                   exists
                        ? zb::rpc::SCHED_ALREADY_EXISTS
                        : zb::rpc::SCHED_INVALID_ARGUMENT,
                    error);
@@ -260,6 +292,19 @@ void SchedulerServiceImpl::RemoveManagedNode(
     }
 
     const uint64_t now_ms = request->request_ts_ms() == 0 ? NowMs() : request->request_ts_ms();
+    if (request->finalize() && node.profile.execution_mode != ExecutionMode::kSimulated) {
+        // 生产/进程内数据节点只能由协调器在源核验及 CMS 零引用确认后退役。
+        // 对外 force 不能把“上报剩余量为零”升级为权威引用已经清空。
+        if (node.lifecycle != LifecycleState::kRetired) {
+            FillStatus(response->mutable_status(), zb::rpc::SCHED_INVALID_ARGUMENT,
+                       "retirement must complete through drain coordinator; force cannot bypass CMS verification");
+            return;
+        }
+        FillManagedNodeView(node, response->mutable_node());
+        response->set_generation(node_manager_->generation());
+        FillStatus(response->mutable_status(), zb::rpc::SCHED_OK, "already retired");
+        return;
+    }
     std::string error;
     const bool ok = request->finalize()
                         ? node_manager_->FinalizeRemoveNode(request->node_id(), now_ms, request->force(), &error)
@@ -292,6 +337,7 @@ void SchedulerServiceImpl::RemoveManagedNode(
     FillManagedNodeView(node, response->mutable_node());
     FillStatus(response->mutable_status(), zb::rpc::SCHED_OK,
                request->finalize() ? "node retired" : "node draining");
+    CommitManagedState(response->mutable_status());
 }
 
 void SchedulerServiceImpl::ReportNodeMetrics(
@@ -322,6 +368,11 @@ void SchedulerServiceImpl::ReportNodeMetrics(
     metrics.busy_time_ms = request->busy_time_ms();
     metrics.last_access_ms = request->last_access_ms();
     metrics.access_path = AccessPathFromProto(request->access_path());
+    metrics.instance_generation = request->instance_generation();
+    if (!zb::rpc::ManagedAccessPath_IsValid(request->access_path())) {
+        FillStatus(response->mutable_status(), zb::rpc::SCHED_INVALID_ARGUMENT, "invalid access path");
+        return;
+    }
 
     std::string error;
     if (!node_manager_->ReportMetrics(request->node_id(), metrics, &error)) {
@@ -333,6 +384,7 @@ void SchedulerServiceImpl::ReportNodeMetrics(
                    error);
         return;
     }
+    if (!CommitManagedState(response->mutable_status())) return;
     ManagedNodeRuntime node;
     node_manager_->GetNode(request->node_id(), &node);
     response->set_generation(node_manager_->generation());
@@ -434,7 +486,8 @@ void SchedulerServiceImpl::ReportOpticalLibraryStatus(
     OpticalLibraryStatus status;
     std::string error;
     if (!OpticalLibraryStatusFromProto(request->status(), &status, &error) ||
-        !node_manager_->ReportOpticalLibraryStatus(request->node_id(), status, &error)) {
+        !node_manager_->ReportOpticalLibraryStatus(request->node_id(), status, &error,
+                                                   request->instance_generation())) {
         ManagedNodeRuntime ignored;
         FillStatus(response->mutable_status(),
                    node_manager_->GetNode(request->node_id(), &ignored)
@@ -505,7 +558,8 @@ void SchedulerServiceImpl::ReportManagedNodeReadiness(
                                    ? NowMs() : request->readiness().observed_at_ms();
     readiness.message = request->readiness().message();
     std::string error;
-    if (!node_manager_->ReportReadiness(request->node_id(), readiness, &error)) {
+    if (!node_manager_->ReportReadiness(request->node_id(), readiness, &error,
+                                         request->instance_generation())) {
         FillStatus(response->mutable_status(), zb::rpc::SCHED_INVALID_ARGUMENT, error);
         return;
     }

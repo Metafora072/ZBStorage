@@ -38,8 +38,12 @@ struct VirtualNodeConfig {
     // In-process Scheduler model: wall-clock delay before a sleeping logical
     // node can serve an access. The standalone virtual node may ignore it.
     uint32_t wake_latency_ms{0};
+    uint32_t reboot_latency_ms{1000};
     uint32_t jitter_ms{0};
     uint32_t jitter_seed{0}; // Zero derives a stable seed from NODE_ID.
+    uint32_t io_failure_probability_ppm{0};
+    uint32_t io_timeout_probability_ppm{0};
+    uint32_t io_timeout_ms{1000};
     // Shared node I/O budget. At most max_concurrent_io requests may be in
     // service; io_queue_limit bounds additional waiting requests.
     uint32_t max_concurrent_io{5};

@@ -30,6 +30,16 @@ namespace optical_node_manager {
 // 纯只读聚合，不改变任何运行态。镜像数量单位为「镜像个数」——字节数由调用方结合
 // 单卷镜像大小（VOLUME_SIZE_BYTES）自行换算，避免在此层引入容量单位约定。
 struct OpticalLibraryInventory {
+    // 只读上报质量；当前盘片/光驱来自 cd_manager_sim，不等于硬件探测。
+    bool inventory_valid{false};
+    bool staging_valid{false};
+    bool background_valid{false};
+    bool metadata_ready{false};
+    bool cache_healthy{false};
+    uint64_t observed_at_ms{0};
+    uint64_t pending_archive_batches{0};
+    uint64_t background_tasks{0};
+    std::string collection_error;
     uint32_t drive_total{0};              // 光驱总数
     uint32_t drive_busy{0};               // 忙光驱数（被活动任务占用）
     uint64_t disc_count{0};               // 库内光盘数量（cd_manager 总光盘数，= local_disc_count）

@@ -2,6 +2,8 @@
 
 本文说明 `src/storage_model` 中的公共数据结构、字段单位、结构关系，以及它们在 ZBStorage 工作流中的产生方和消费方。
 
+指标流的兼容尾部扩展：`AccessPath` 新增 `kArchive / kMigration`，`NodeMetricsStreamState` 新增该路径/报告者 epoch 的累计读写操作数和字节数。Scheduler 的 `GetManagedNode.metrics_streams` 暴露这些字段并随管理快照保存；默认、缓存命中和光盘读取原枚举值不变。模型后台完成量不等同于实际网络传输或原内容校验，MDS 不据此直接清理真实源副本。
+
 模型以《ZBStorage 设计方案报告 2026-08-16》和本文的最新修订为设计基线，同时保留当前代码已经具备的能力：字符串节点 ID、虚拟/模拟节点、对象切片、心跳实际磁盘清单、四级功率、累计能耗、排空迁移、光盘镜像 extent、CRC32、批量归档和批量读取。
 
 ## 1. 定位与边界
@@ -175,7 +177,7 @@ energy_microjoules += power_milliwatts × elapsed_milliseconds
 | `kind` | 设备类型 |
 | `capacity_bytes`、`free_bytes` | 心跳容量和剩余容量 |
 | `DeviceUsedBytes(device)` | 单设备已用空间，按 `max(capacity_bytes-free_bytes, 0)` 实时派生 |
-| `is_healthy` | 实际健康状态 |
+| `is_healthy`、`health_source` | 可用性及来源；新光盘区分 software/model/unknown，不把模型可用性当作硬件探测；空来源兼容旧节点 |
 | 读写带宽 | 实测或配置带宽 |
 | `accumulated_write_bytes` | 寿命与成本统计 |
 | `last_update_ms` | 最近一次设备观测时间 |
@@ -189,6 +191,10 @@ energy_microjoules += power_milliwatts × elapsed_milliseconds
 ### 4.6 `NodeRecord`
 
 `OpticalLibraryStatus` 是节点管理所需的光盘库聚合状态：是否已观测、槽位总数、本地光盘总数、Blank/Recording/Recorded/Defective分类计数、暂存区容量/用量、待处理写任务数、待完成读任务数、忙碌光驱数及观测时间。详细 DiscID→Slot 映射仍属于 `OpticalModel.h`。Scheduler使用聚合状态判断只读降级、安全退役和后台任务期间的休眠保护；CMS在暂存区使用率达到80%时停止向该库分配新归档。
+
+光盘上报 v1 在此结构尾部追加分项采集有效性、来源与错误、有效期限、在途归档批次、全部非终态任务、读写镜像保留额度、配置盘数和独立归档能力。逐字段定义及数据流见 [光盘上报契约](../scheduler/api/README.md#光盘上报-v1)。`telemetry_version=0` 保留旧协议，v1 的未知值不得转换成观测到的零；物理健康目前没有采集源。
+
+`NodeMetricsStreamState` 按 `access_path + reporter_epoch` 保存 `report_sequence/window_end_ms/utilization/queue_depth/retired`。`NodeRecord.metrics_streams` 是缓存/光盘两路独立的去重与负载水位，由 `ReportNodeMetrics` 更新，供能耗策略、管理查询和持久化使用；报告者重启后旧水位仅确认已接收窗口的重试，原有节点级水位保留以兼容旧快照。
 
 `NodeRecord` 是 Scheduler 当前唯一的完整管理记录：
 

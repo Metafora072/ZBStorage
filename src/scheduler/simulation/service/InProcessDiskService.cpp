@@ -1,4 +1,5 @@
 #include "InProcessDiskService.h"
+#include "common/rpc/ModelWait.h"
 
 #include <brpc/controller.h>
 #include <algorithm>
@@ -14,6 +15,7 @@ namespace zb::scheduler {
 InProcessDiskService::Slot::Slot(zb::virtual_node::VirtualNodeConfig config)
     : generation(config.instance_generation), node_id(config.node_id),
       wake_latency_ms(config.wake_latency_ms),
+      reboot_latency_ms(config.reboot_latency_ms),
       storage(std::move(config)), service(&storage, &metrics) {}
 
 bool InProcessDiskService::AddNode(zb::virtual_node::VirtualNodeConfig config,
@@ -75,6 +77,56 @@ bool InProcessDiskService::AddNode(zb::virtual_node::VirtualNodeConfig config,
     }
     known_node_ids_.insert(config.node_id);
     nodes_.emplace(config.node_id, std::move(slot));
+    return true;
+}
+
+uint32_t InProcessDiskService::RebootLatencyMs(const std::string& id) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto it = nodes_.find(id);
+    return it == nodes_.end() ? 0 : it->second->reboot_latency_ms;
+}
+
+std::shared_ptr<zb::virtual_node::VirtualStorageServiceImpl>
+InProcessDiskService::BorrowStorage(const std::string& id, bool new_write, std::string* error) const {
+    std::shared_ptr<Slot> slot;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        const auto it = nodes_.find(id);
+        if (it != nodes_.end()) slot = it->second;
+    }
+    if (!slot) { if (error) *error = "model disk instance unavailable: " + id; return {}; }
+    struct Reference {
+        std::shared_ptr<Slot> slot;
+        std::shared_lock<zb::rpc_route::ModelSharedMutex> admission;
+        explicit Reference(std::shared_ptr<Slot> value) : slot(std::move(value)), admission(slot->write_mu) {}
+    };
+    auto reference = std::make_shared<Reference>(slot);
+    ManagedNodeRuntime node;
+    if (!node_manager_ || !node_manager_->GetNode(id, &node) ||
+        !slot->catalog_confirmed.load() || !node.readiness.Ready() ||
+        node.health != ManagedHealthState::kHealthy ||
+        node.administrative_state == zb::storage_model::AdministrativeState::kDisabled ||
+        node.lifecycle == LifecycleState::kRetired || node.lifecycle == LifecycleState::kJoining ||
+        (new_write && (slot->drain_closed || node.lifecycle != LifecycleState::kWorking ||
+         node.service_mode != NodeServiceMode::kReadWrite))) {
+        if (error) *error = "model disk internal operation not admitted: " + id;
+        return {};
+    }
+    return {reference, &slot->storage};
+}
+
+bool InProcessDiskService::QuiesceNode(const std::string& id, std::string* error) {
+    std::shared_ptr<Slot> slot;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        const auto it = nodes_.find(id);
+        if (it != nodes_.end()) slot = it->second;
+    }
+    if (!slot || !node_manager_) { if (error) *error = "model disk unavailable"; return false; }
+    std::unique_lock<zb::rpc_route::ModelSharedMutex> admission(slot->write_mu);
+    if (!node_manager_->SetAdministrativeState(id, zb::storage_model::AdministrativeState::kDisabled, error))
+        return false;
+    slot->catalog_confirmed.store(false);
     return true;
 }
 
@@ -146,7 +198,7 @@ bool InProcessDiskService::VerifyEmpty(const std::string& node_id,
     }
     // Also protects automatic lifetime drains, which can already be Draining
     // before the coordinator starts its final verification.
-    std::unique_lock<std::shared_mutex> write_lock(slot->write_mu);
+    std::unique_lock<zb::rpc_route::ModelSharedMutex> write_lock(slot->write_mu);
     return VerifyEmptySlot(*slot, error);
 }
 
@@ -162,7 +214,7 @@ bool InProcessDiskService::BeginEmptyDrain(const std::string& node_id,
         if (error) *error = "logical disk instance is unavailable: " + node_id;
         return false;
     }
-    std::unique_lock<std::shared_mutex> lock(slot->write_mu);
+    std::unique_lock<zb::rpc_route::ModelSharedMutex> lock(slot->write_mu);
     const bool was_closed = slot->drain_closed;
     slot->drain_closed = true;
     if (!VerifyEmptySlot(*slot, error) ||
@@ -185,7 +237,7 @@ bool InProcessDiskService::BeginDataDrain(const std::string& node_id,
         if (error) *error = "logical disk instance is unavailable: " + node_id;
         return false;
     }
-    std::unique_lock<std::shared_mutex> lock(slot->write_mu);
+    std::unique_lock<zb::rpc_route::ModelSharedMutex> lock(slot->write_mu);
     const bool was_closed = slot->drain_closed;
     slot->drain_closed = true;
     if (!node_manager_->BeginRemoveNode(node_id, now_ms, error)) {
@@ -206,14 +258,16 @@ std::vector<std::string> InProcessDiskService::NodeIds() const {
 bool InProcessDiskService::ConfirmCatalog(const std::string& node_id) {
     ManagedNodeRuntime node;
     if (!node_manager_ || !node_manager_->GetNode(node_id, &node) ||
-        node.administrative_state != zb::storage_model::AdministrativeState::kEnabled ||
-        node.lifecycle != LifecycleState::kWorking ||
+        node.administrative_state == zb::storage_model::AdministrativeState::kDisabled ||
+        (node.lifecycle != LifecycleState::kWorking && node.lifecycle != LifecycleState::kDraining &&
+         node.lifecycle != LifecycleState::kExiting) ||
         !node.readiness.Ready() || node.health != ManagedHealthState::kHealthy)
         return false;
     std::lock_guard<std::mutex> lock(mu_);
     auto it = nodes_.find(node_id);
     if (it == nodes_.end()) return false;
     it->second->catalog_confirmed.store(true);
+    node_manager_->SetTransitionState(node_id, TransitionState::kStable, node.last_heartbeat_ms, nullptr);
     return true;
 }
 
@@ -236,6 +290,12 @@ uint64_t InProcessDiskService::GetInstanceGeneration(const std::string& node_id)
     std::lock_guard<std::mutex> lock(mu_);
     const auto it = nodes_.find(node_id);
     return it == nodes_.end() ? 0 : it->second->generation;
+}
+
+zb::metrics::NodeMetricsCollector* InProcessDiskService::GetBackgroundMetrics(const std::string& id) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = nodes_.find(id);
+    return it == nodes_.end() ? nullptr : &it->second->migration_metrics;
 }
 
 zb::metrics::NodeMetricsCollector* InProcessDiskService::GetMetrics(
@@ -330,7 +390,7 @@ std::shared_ptr<InProcessDiskService::Slot> InProcessDiskService::Resolve(
             ready_at = slot->wake_ready_at;
         }
         if (ready_at > std::chrono::steady_clock::now())
-            std::this_thread::sleep_until(ready_at);
+            zb::rpc_route::WaitModelUntil(ready_at);
         // A stop/failure can occur while this request is waking. Do not
         // dispatch an already admitted request into an offline node.
         ManagedNodeRuntime current;
@@ -361,9 +421,13 @@ std::shared_ptr<InProcessDiskService::Slot> InProcessDiskService::Resolve(
         auto slot = Resolve(controller, reply->mutable_status(),                       \
                             new_write, wake_on_access);                               \
         if (!slot) return;                                                              \
-        std::shared_lock<std::shared_mutex> write_lock;                                \
+        std::shared_lock<zb::rpc_route::ModelSharedMutex> write_lock(slot->write_mu);     \
+        if (!slot->catalog_confirmed.load()) {                                          \
+            reply->mutable_status()->set_code(zb::rpc::STATUS_IO_ERROR);                \
+            reply->mutable_status()->set_message("model node admission revoked");      \
+            return;                                                                    \
+        }                                                                              \
         if (new_write) {                                                                \
-            write_lock = std::shared_lock<std::shared_mutex>(slot->write_mu);           \
             ManagedNodeRuntime current;                                                 \
             if (slot->drain_closed || !node_manager_ ||                              \
                 !node_manager_->GetNode(slot->node_id, &current) ||                     \
@@ -392,5 +456,62 @@ ZB_DISK_FORWARD(ResolveFileRead, zb::rpc::ResolveFileReadRequest, zb::rpc::Resol
 ZB_DISK_FORWARD(AllocateFileWrite, zb::rpc::AllocateFileWriteRequest, zb::rpc::AllocateFileWriteReply, true, true)
 ZB_DISK_FORWARD(CommitFileWrite, zb::rpc::CommitFileWriteRequest, zb::rpc::CommitFileWriteReply, true, true)
 #undef ZB_DISK_FORWARD
+
+void InProcessDiskService::BeginNodeDrain(google::protobuf::RpcController* controller,
+    const zb::rpc::BeginNodeDrainRequest* request, zb::rpc::BeginNodeDrainReply* reply,
+    google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    if (!request || !reply) return;
+    auto slot = Resolve(controller, reply->mutable_status(), false, false);
+    if (!slot) return;
+    if (request->node_id() != slot->node_id) {
+        reply->mutable_status()->set_code(zb::rpc::STATUS_INVALID_ARGUMENT);
+        reply->mutable_status()->set_message("drain node_id differs from logical route");
+        return;
+    }
+    const uint64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::string error;
+    if (!BeginDataDrain(slot->node_id, now, &error) ||
+        (durable_state_commit_ && !durable_state_commit_(&error))) {
+        reply->mutable_status()->set_code(zb::rpc::STATUS_IO_ERROR);
+        reply->mutable_status()->set_message(error);
+        return;
+    }
+    reply->mutable_status()->set_code(zb::rpc::STATUS_OK);
+    reply->set_write_admission_closed(true);
+}
+
+void InProcessDiskService::InstallMigratedFile(google::protobuf::RpcController* controller,
+    const zb::rpc::InstallMigratedFileRequest* request, zb::rpc::InstallMigratedFileReply* reply,
+    google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    if (!request || !reply) return;
+    auto slot = Resolve(controller, reply->mutable_status(), true, true);
+    if (!slot) return;
+    if (request->node_id() != slot->node_id || request->migration_id().empty() ||
+        request->disk_id().empty() || !request->has_meta()) {
+        reply->mutable_status()->set_code(zb::rpc::STATUS_INVALID_ARGUMENT);
+        reply->mutable_status()->set_message("incomplete migrated file identity");
+        return;
+    }
+    std::string error;
+    auto storage = BorrowStorage(slot->node_id, true, &error);
+    if (!storage) {
+        reply->mutable_status()->set_code(zb::rpc::STATUS_IO_ERROR);
+        reply->mutable_status()->set_message(error);
+        return;
+    }
+    zb::msg::FileMeta meta;
+    meta.inode_id = request->meta().inode_id();
+    meta.file_size = request->meta().file_size();
+    meta.object_unit_size = request->meta().object_unit_size();
+    meta.version = request->meta().version();
+    meta.mtime_sec = request->meta().mtime_sec();
+    meta.update_ts_ms = request->meta().update_ts_ms();
+    const auto status = storage->ImportModelFile(meta, request->disk_id());
+    reply->mutable_status()->set_code(status.ok() ? zb::rpc::STATUS_OK : zb::rpc::STATUS_IO_ERROR);
+    reply->mutable_status()->set_message(status.message);
+}
 
 } // namespace zb::scheduler

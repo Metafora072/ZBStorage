@@ -20,6 +20,7 @@
 #include "../lifecycle/NodeActuator.h"
 #include "../migration/BrpcObjectMigrationBackend.h"
 #include "../migration/DrainMigrationCoordinator.h"
+#include "../migration/PhysicalOpticalDrain.h"
 #include "../model/ClusterState.h"
 #include "../power/NodePowerManager.h"
 #include "../power/PowerActuationController.h"
@@ -28,6 +29,7 @@
 #include "../simulation/service/InProcessDiskService.h"
 #include "../simulation/service/InProcessOpticalService.h"
 #include "data_node/virtual_node/config/VirtualNodeConfig.h"
+#include "common/rpc/ModelWait.h"
 
 DEFINE_string(config, "", "Path to Scheduler config file");
 DEFINE_int32(port, 9100, "Port for Scheduler brpc server");
@@ -69,6 +71,9 @@ public:
                     id, zb::storage_model::AdministrativeState::kDisabled, nullptr);
                 return {false, "logical node start failed: " + error};
             }
+            if (optical_ && optical_->OwnsNodeIdentity(id) &&
+                !optical_->PauseNode(id, false, &error))
+                return {false, "logical optical resume failed: " + error};
             // Disk route remains closed until the next fresh inventory and
             // successful CMS publication. No physical power command runs.
             return {true, "logical node started; catalog confirmation pending"};
@@ -81,13 +86,20 @@ public:
         if (IsInternal(id)) {
             if (IsRetired(id)) return {false, "retired logical node cannot stop"};
             std::string error;
+            if (simulation_ && simulation_->OwnsNodeIdentity(id) && !simulation_->QuiesceNode(id, &error))
+                return {false, "logical disk quiesce failed: " + error};
             if (!manager_->SetAdministrativeState(
                     id, zb::storage_model::AdministrativeState::kDisabled, &error))
                 return {false, "logical node stop failed: " + error};
+            if (optical_ && optical_->OwnsNodeIdentity(id) && !optical_->PauseNode(id, true, &error)) {
+                manager_->SetAdministrativeState(id, zb::storage_model::AdministrativeState::kEnabled, nullptr);
+                return {false, "logical optical checkpoint failed: " + error};
+            }
             if (!manager_->RequestPowerLevel(id, zb::scheduler::PowerLevel::kOff,
                                              NowMs(), force, &error)) {
                 manager_->SetAdministrativeState(
                     id, zb::storage_model::AdministrativeState::kEnabled, nullptr);
+                if (optical_ && optical_->OwnsNodeIdentity(id)) optical_->PauseNode(id, false, nullptr);
                 return {false, "logical node stop failed: " + error};
             }
             if (simulation_) simulation_->RevokeCatalog(id);
@@ -100,14 +112,27 @@ public:
                                              const std::string& address) override {
         if (IsInternal(id)) {
             if (IsRetired(id)) return {false, "retired logical node cannot reboot"};
+            std::string quiesce_error;
+            if (simulation_ && simulation_->OwnsNodeIdentity(id) && !simulation_->QuiesceNode(id, &quiesce_error))
+                return {false, "logical disk reboot quiesce failed: " + quiesce_error};
             if (simulation_) simulation_->RevokeCatalog(id);
             if (optical_) optical_->RevokeCatalog(id);
             std::string error;
+            if (!manager_->SetAdministrativeState(id, zb::storage_model::AdministrativeState::kDisabled, &error))
+                return {false, error};
+            if (optical_ && optical_->OwnsNodeIdentity(id) && !optical_->PauseNode(id, true, &error))
+                return {false, "logical reboot checkpoint failed: " + error};
             if (!manager_->RequestPowerLevel(id, zb::scheduler::PowerLevel::kOff,
-                                             NowMs(), true, &error) ||
-                !manager_->RequestPowerLevel(id, zb::scheduler::PowerLevel::kMedium,
                                              NowMs(), true, &error))
                 return {false, "logical node reboot failed: " + error};
+            const bool optical_model = optical_ && optical_->OwnsNodeIdentity(id);
+            const uint32_t latency = optical_model ? optical_->RebootLatencyMs(id) :
+                (simulation_ ? simulation_->RebootLatencyMs(id) : 0);
+            zb::rpc_route::WaitModelUntil(std::chrono::steady_clock::now() + std::chrono::milliseconds(latency));
+            if (!manager_->RequestPowerLevel(id, zb::scheduler::PowerLevel::kMedium, NowMs(), true, &error) ||
+                !manager_->SetAdministrativeState(id, zb::storage_model::AdministrativeState::kEnabled, &error))
+                return {false, "logical node reboot failed: " + error};
+            if (optical_model && !optical_->PauseNode(id, false, &error)) return {false, error};
             return {true, "logical node rebooted; catalog confirmation pending"};
         }
         return physical_->RebootNode(id, address);
@@ -245,7 +270,7 @@ int main(int argc, char* argv[]) {
     power_policy.history_max_samples = cfg.metrics_history_max_samples;
     zb::scheduler::NodePowerManager node_manager(power_policy);
     zb::scheduler::ClusterState state(detector, &node_manager);
-    zb::scheduler::ManagedNodeSnapshotStore managed_snapshot(cfg.managed_state_snapshot_path);
+    zb::scheduler::ManagedNodeSnapshotStore managed_snapshot(cfg.managed_state_snapshot_path, &state);
     bool managed_state_loaded = false;
     if (!managed_snapshot.Load(&node_manager, NowMs(), &managed_state_loaded, &error)) {
         std::cerr << "Failed to restore managed Scheduler state: " << error << std::endl;
@@ -508,11 +533,35 @@ int main(int argc, char* argv[]) {
         [&](const std::string& node_id, std::string* verify_error) {
             return simulation_disks.VerifyEmpty(node_id, verify_error);
         });
+    zb::scheduler::PhysicalOpticalDrain physical_optical_drain(
+        &node_manager, cfg.mds_address, cfg.migration_rpc_timeout_ms);
+    migration.SetPhysicalOpticalDrain(
+        [&](const std::string& id, uint64_t now, std::string* error) {
+            return physical_optical_drain.Begin(id, now, error);
+        },
+        [&](zb::scheduler::DrainMigrationTask* task, uint64_t now, std::string* error) {
+            return physical_optical_drain.Advance(task, now, error);
+        });
     migration.SetLogicalEmptyDrainBegin(
         [&](const std::string& node_id, uint64_t now_ms, std::string* begin_error) {
             return simulation_disks.BeginDataDrain(node_id, now_ms, begin_error);
         });
+    migration.SetLogicalOpticalDrain(
+        [&](const std::string& id, uint64_t now, std::string* error) {
+            return simulation_optical.BeginDataDrain(id, now, error);
+        },
+        [&](zb::scheduler::DrainMigrationTask* task, uint64_t now, std::string* error) {
+            return simulation_optical.AdvanceDataDrain(task, now, error);
+        });
     zb::scheduler::SchedulerServiceImpl service(&state, &lifecycle, &node_manager, &migration);
+    std::atomic<bool> rpc_reload_models_requested{false};
+    service.SetModelReloadRequest([&] { rpc_reload_models_requested.store(true); });
+    service.SetDurableStateCommit([&](std::string* error) {
+        return managed_snapshot.Save(node_manager, NowMs(), error);
+    });
+    simulation_disks.SetDurableStateCommit([&](std::string* error) {
+        return managed_snapshot.Save(node_manager, NowMs(), error);
+    });
     zb::scheduler::CmsNodeCatalogPublisher cms_publisher(
         cfg.mds_address, static_cast<uint32_t>(cfg.migration_rpc_timeout_ms));
     zb::scheduler::ShellManagedPowerActuator power_actuator(
@@ -522,6 +571,30 @@ int main(int argc, char* argv[]) {
         cfg.power_actuation_enabled, cfg.power_actuation_retry_ms);
 
     std::vector<std::string> freshly_reported_opticals;
+    auto report_background = [&](const std::string& id, uint64_t generation,
+                                 zb::metrics::NodeMetricsCollector* collector, zb::scheduler::AccessPath path) {
+        if (!collector) return;
+        const auto snapshot = collector->TakeForReport(NowMs());
+        if (snapshot.report_sequence == 0) return;
+        zb::scheduler::NodeAccessMetrics metrics;
+        metrics.instance_generation = generation;
+        metrics.reporter_epoch = snapshot.reporter_epoch;
+        metrics.report_sequence = snapshot.report_sequence;
+        metrics.access_path = path;
+        metrics.window_start_ms = snapshot.window_start_ms;
+        metrics.window_end_ms = snapshot.window_end_ms;
+        metrics.read_operations = snapshot.read_operations;
+        metrics.write_operations = snapshot.write_operations;
+        metrics.other_operations = snapshot.other_operations;
+        metrics.read_bytes = snapshot.read_bytes;
+        metrics.write_bytes = snapshot.write_bytes;
+        metrics.active_requests = snapshot.active_requests;
+        metrics.max_queue_depth = snapshot.max_queue_depth;
+        metrics.busy_time_ms = snapshot.busy_time_ms;
+        metrics.last_access_ms = snapshot.last_access_ms;
+        if (node_manager.ReportMetrics(id, metrics, &error)) collector->AcknowledgeReport(snapshot.report_sequence);
+        else std::cerr << "Background metrics rejected for " << id << ": " << error << '\n';
+    };
     auto report_simulated_disks = [&]() {
         std::vector<std::string> freshly_reported_disks;
         freshly_reported_opticals.clear();
@@ -535,6 +608,8 @@ int main(int argc, char* argv[]) {
             if (!storage || !collector) continue;
             zb::rpc::HeartbeatRequest heartbeat;
             heartbeat.set_node_id(disk_cfg.node_id);
+            heartbeat.set_instance_generation(disk_cfg.instance_generation);
+            heartbeat.set_require_registered(true);
             heartbeat.set_node_type(zb::rpc::NODE_VIRTUAL_POOL);
             heartbeat.set_address(cfg.simulation_data_address);
             heartbeat.set_virtual_node_count(1);
@@ -563,9 +638,12 @@ int main(int argc, char* argv[]) {
                 continue;
             }
             freshly_reported_disks.push_back(disk_cfg.node_id);
+            report_background(disk_cfg.node_id, disk_cfg.instance_generation,
+                              simulation_disks.GetBackgroundMetrics(disk_cfg.node_id), zb::scheduler::AccessPath::kMigration);
             const auto snapshot = collector->TakeForReport(NowMs());
             if (snapshot.report_sequence == 0) continue;
             zb::scheduler::NodeAccessMetrics metrics;
+            metrics.instance_generation = disk_cfg.instance_generation;
             metrics.reporter_epoch = snapshot.reporter_epoch;
             metrics.report_sequence = snapshot.report_sequence;
             metrics.window_start_ms = snapshot.window_start_ms;
@@ -593,6 +671,12 @@ int main(int argc, char* argv[]) {
                 continue;
             auto* optical_model = simulation_optical.GetModel(optical_cfg.node_id);
             if (!optical_model) continue;
+            if (!optical_model->SetPaused(
+                    managed.administrative_state == zb::storage_model::AdministrativeState::kDisabled ||
+                    managed.health != zb::scheduler::ManagedHealthState::kHealthy, &error)) {
+                std::cerr << "Simulation optical checkpoint failed: " << error << std::endl;
+                continue;
+            }
             const auto archive_progress = optical_model->AdvanceArchives();
             if (archive_progress.code != zb::scheduler::OpticalModelCode::kOk) {
                 std::cerr << "Simulation optical archive progress failed for "
@@ -618,6 +702,8 @@ int main(int argc, char* argv[]) {
             // stays Joining/excluded from placement.
             zb::rpc::HeartbeatRequest heartbeat;
             heartbeat.set_node_id(optical_cfg.node_id);
+            heartbeat.set_instance_generation(optical_cfg.instance_generation);
+            heartbeat.set_require_registered(true);
             heartbeat.set_node_type(zb::rpc::NODE_OPTICAL);
             heartbeat.set_address(cfg.simulation_data_address);
             heartbeat.set_report_ts_ms(report_time_ms);
@@ -649,12 +735,17 @@ int main(int argc, char* argv[]) {
                 continue;
             }
             if (!node_manager.ReportOpticalLibraryStatus(
-                    optical_cfg.node_id, model_state.library, &error)) {
+                    optical_cfg.node_id, model_state.library, &error,
+                    optical_cfg.instance_generation)) {
                 std::cerr << "Simulation optical library report failed for "
                           << optical_cfg.node_id << ": " << error << std::endl;
                 continue;
             }
             freshly_reported_opticals.push_back(optical_cfg.node_id);
+            report_background(optical_cfg.node_id, optical_cfg.instance_generation,
+                simulation_optical.GetBackgroundMetrics(optical_cfg.node_id, false), zb::scheduler::AccessPath::kArchive);
+            report_background(optical_cfg.node_id, optical_cfg.instance_generation,
+                simulation_optical.GetBackgroundMetrics(optical_cfg.node_id, true), zb::scheduler::AccessPath::kMigration);
             auto* collector = simulation_optical.GetMetrics(optical_cfg.node_id);
             zb::scheduler::ManagedNodeRuntime runtime;
             if (!collector || !node_manager.GetNode(optical_cfg.node_id, &runtime) ||
@@ -662,6 +753,7 @@ int main(int argc, char* argv[]) {
             const auto snapshot = collector->TakeForReport(NowMs());
             if (snapshot.report_sequence == 0) continue;
             zb::scheduler::NodeAccessMetrics metrics;
+            metrics.instance_generation = optical_cfg.instance_generation;
             metrics.reporter_epoch = snapshot.reporter_epoch;
             metrics.report_sequence = snapshot.report_sequence;
             metrics.window_start_ms = snapshot.window_start_ms;
@@ -688,12 +780,20 @@ int main(int argc, char* argv[]) {
     std::atomic<bool> stop{false};
     std::atomic<bool> simulation_ready{false};
     std::atomic<bool> startup_complete{false};
+    // 迁移复制/模型搬运独占有界后台执行线程，不拖住库存、健康、CMS 与功率推进。
+    std::thread migration_thread([&]() {
+        while (!stop.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                std::max<uint64_t>(1, cfg.tick_interval_ms)));
+            if (startup_complete.load()) migration.Tick(NowMs());
+        }
+    });
     std::thread tick_thread([&]() {
         uint64_t interval_ms = cfg.tick_interval_ms > 0 ? cfg.tick_interval_ms : 1000;
         while (!stop.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
             if (!startup_complete.load()) continue;
-            if (reload_models_requested != 0) {
+            if (rpc_reload_models_requested.exchange(false) || reload_models_requested != 0) {
                 reload_models_requested = 0;
                 reload_model_configs();
             }
@@ -713,7 +813,6 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
-            migration.Tick(now_ms);
             power_controller.Tick(now_ms);
             std::string cms_error;
             std::vector<std::string> committed_retired_ids;
@@ -778,6 +877,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Failed to add Scheduler service" << std::endl;
         stop.store(true);
         tick_thread.join();
+        migration_thread.join();
         if (snapshot_thread.joinable()) {
             snapshot_thread.join();
         }
@@ -790,6 +890,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Failed to start Scheduler server on port " << FLAGS_port << std::endl;
         stop.store(true);
         tick_thread.join();
+        migration_thread.join();
         if (snapshot_thread.joinable()) {
             snapshot_thread.join();
         }
@@ -809,6 +910,7 @@ int main(int argc, char* argv[]) {
             server.Join();
             stop.store(true);
             tick_thread.join();
+            migration_thread.join();
             if (snapshot_thread.joinable()) snapshot_thread.join();
             return 1;
         }
@@ -829,6 +931,7 @@ int main(int argc, char* argv[]) {
     }
     stop.store(true);
     tick_thread.join();
+    migration_thread.join();
     if (snapshot_thread.joinable()) {
         snapshot_thread.join();
     }

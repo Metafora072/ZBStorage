@@ -76,6 +76,19 @@ public:
     // 线程安全、纯只读；未初始化或组件缺失的项保持为 0。
     OpticalLibraryInventory GetInventory() const;
 
+    // 只读暴露已有持久盘片索引与卷内元数据，供 MDS 查询；不修改归档/刻录算法。
+    struct ArchivedImage {
+        uint64_t volume_id{0};
+        DiscImageLocation location;
+    };
+    std::vector<ArchivedImage> ListArchivedImages();
+    std::vector<WR_task::WRTask> ListArchiveTasks();
+    bool ArchiveIndexReady() const { return telemetry_archive_index_ready_.load(); }
+    bool ReadArchivedImageFiles(const ArchivedImage& image,
+                               std::vector<volumemanager::FileMetadata>* files,
+                               std::string* error);
+    bool HashArchivedFile(const ArchivedImage&, const volumemanager::FileMetadata&, std::string*, std::string*);
+
     // 注入数据面指标采集器（延迟绑定：须在 Run() 之前调用）。
     // cache_hit：客户端缓存命中的区间读；disc：归档下载写 + 从光盘回读镜像的 I/O。
     // 为空则对应路径不记账。
@@ -473,6 +486,11 @@ private:
     std::atomic<uint64_t> next_volume_id_{1};
     // 本地 disk_id（对应 MDS disc_id）单调递增计数器。
     std::atomic<uint64_t> next_disk_id_{1};
+    // 仅供 Scheduler 观测，不参与下载/压缩/刻录决策；覆盖队列与当前在途批次。
+    std::atomic<uint64_t> telemetry_archive_batches_{0};
+    std::atomic<bool> telemetry_metadata_ready_{false};
+    // 独立记录盘片索引是否完整重建；不可把“部分索引”作为完整空清单提供给 MDS。
+    std::atomic<bool> telemetry_archive_index_ready_{false};
 
     // 待打包 inode_id 集合：ZipTaskProcessor 在每次 AddFileToCollect 前登记本次 inode，
     // 封装触发后扫描 temp_dir_ 剩余 temp_*.compressed，diff 出本次被打包的 inode_id 并移除。

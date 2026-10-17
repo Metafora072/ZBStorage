@@ -8,6 +8,8 @@
 #include <string>
 #include <utility>
 
+#include "common/rpc/ArchiveInventoryPage.h"
+
 namespace zb::optical_node {
 
 namespace {
@@ -67,6 +69,143 @@ zb::rpc::OpticalStatusCode ToOpticalStatus(volumemanager::ErrorCode code) {
 
 BrpcOpticalNodeService::BrpcOpticalNodeService(OpticalStorageServiceImpl* service)
     : service_(service) {}
+
+void BrpcOpticalNodeService::ManageLibraryHandoff(google::protobuf::RpcController*,
+    const zb::rpc::OpticalLibraryHandoffRequest* request, zb::rpc::OpticalLibraryHandoffReply* response,
+    google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    if (!request || !response || !service_) return;
+    service_->ManageLibraryHandoff(*request, response);
+}
+
+namespace {
+zb::rpc::ArchiveImageInfo ImageInfo(const optical_node_manager::OpticalNodeManager::ArchivedImage& image) {
+    zb::rpc::ArchiveImageInfo result;
+    result.set_disk_id("optical-disk-" + image.location.disk_id);
+    result.set_image_id("img-" + std::to_string(image.volume_id));
+    result.set_image_offset(image.location.offset_in_disc);
+    result.set_image_length(image.location.image_size_bytes);
+    result.set_sha256(image.location.sha256_hex);
+    return result;
+}
+
+template <class Request, class Reply>
+bool ValidateInventory(OpticalStorageServiceImpl* service, const Request* request, Reply* reply) {
+    if (!reply) return false;
+    reply->Clear();
+    if (!request) {
+        reply->mutable_status()->set_code(zb::rpc::OPTICAL_INVALID_ARGUMENT);
+        return false;
+    }
+    if (!zb::archive_inventory::ValidatePage(*request, reply->mutable_status())) return false;
+    if (!service) {
+        reply->mutable_status()->set_code(zb::rpc::OPTICAL_INTERNAL_ERROR);
+        return false;
+    }
+    const auto identity = service->GetReplicationStatus();
+    if (request->node_id() != identity.node_id ||
+        request->instance_generation() != service->instance_generation()) {
+        reply->mutable_status()->set_code(zb::rpc::OPTICAL_STALE_GENERATION);
+        reply->mutable_status()->set_message("node identity changed; refresh CMS catalog");
+        return false;
+    }
+    reply->set_node_id(identity.node_id);
+    reply->set_instance_generation(service->instance_generation());
+    reply->set_modeled(false);
+    if (!service->IsArchiveEngineReady() || !service->ArchiveIndexReady() ||
+        !service->GetLibraryInventory().metadata_ready) {
+        reply->mutable_status()->set_code(zb::rpc::OPTICAL_NOT_READY);
+        reply->mutable_status()->set_message("archive metadata recovery not ready");
+        return false;
+    }
+    return true;
+}
+} // namespace
+
+void BrpcOpticalNodeService::ListArchiveTasks(google::protobuf::RpcController*,
+    const zb::rpc::ListArchiveTasksRequest* request, zb::rpc::ListArchiveTasksReply* reply,
+    google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    if (!ValidateInventory(service_, request, reply)) return;
+    std::vector<zb::rpc::ArchiveTaskInfo> tasks;
+    for (const auto& item : service_->ListArchiveTasks()) {
+        auto& task = tasks.emplace_back();
+        task.set_task_id(std::to_string(item.task_id));
+        task.set_inode_id(item.inode_id_num == WR_task::WRTask::INVALID_INODE_ID ? 0 : item.inode_id_num);
+        task.set_phase(std::string(WR_task::WRTaskTypeToString(item.type)) + "/" + WR_task::WRTaskStateToString(item.state));
+        task.set_terminal(item.state == WR_task::WRTaskState::FINISH || item.state == WR_task::WRTaskState::FAILED);
+        task.set_failed(item.state == WR_task::WRTaskState::FAILED);
+        task.set_error(item.last_error_detail);
+        task.set_state_changed_at_ms(item.state_changed_at_ms);
+        if (!item.disk_id.empty()) task.set_disk_id("optical-disk-" + item.disk_id);
+        if (!item.volume_id.empty()) task.add_image_ids("img-" + item.volume_id);
+        for (const auto& image : item.volume_ids) task.add_image_ids("img-" + image);
+    }
+    size_t end = 0;
+    if (!zb::archive_inventory::Page(*request, zb::archive_inventory::TaskToken(tasks), tasks.size(), reply, &end)) return;
+    for (size_t i = request->offset(); i < end; ++i) *reply->add_tasks() = tasks[i];
+}
+
+void BrpcOpticalNodeService::ListArchiveImages(google::protobuf::RpcController*,
+    const zb::rpc::ListArchiveImagesRequest* request, zb::rpc::ListArchiveImagesReply* reply,
+    google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    if (!ValidateInventory(service_, request, reply)) return;
+    std::vector<zb::rpc::ArchiveImageInfo> images;
+    for (const auto& image : service_->ListArchivedImages()) images.push_back(ImageInfo(image));
+    size_t end = 0;
+    if (!zb::archive_inventory::Page(*request, zb::archive_inventory::Token(images), images.size(), reply, &end)) return;
+    for (size_t i = request->offset(); i < end; ++i) *reply->add_images() = images[i];
+}
+
+void BrpcOpticalNodeService::GetArchiveImageFiles(google::protobuf::RpcController*,
+    const zb::rpc::GetArchiveImageFilesRequest* request, zb::rpc::GetArchiveImageFilesReply* reply,
+    google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    if (!ValidateInventory(service_, request, reply)) return;
+    if (request->image_id().empty() || request->disk_id().empty()) {
+        reply->mutable_status()->set_code(zb::rpc::OPTICAL_INVALID_ARGUMENT);
+        reply->mutable_status()->set_message("disk_id and image_id are required");
+        return;
+    }
+    for (const auto& image : service_->ListArchivedImages()) {
+        const auto info = ImageInfo(image);
+        if (request->image_id() != info.image_id() || request->disk_id() != info.disk_id()) continue;
+        std::vector<volumemanager::FileMetadata> metadata;
+        std::string error;
+        if (!service_->ReadArchivedImageFiles(image, &metadata, &error)) {
+            reply->mutable_status()->set_code(zb::rpc::OPTICAL_INTERNAL_ERROR);
+            reply->mutable_status()->set_message(error);
+            return;
+        }
+        std::vector<zb::rpc::ArchiveImageFile> files;
+        for (const auto& item : metadata) {
+            auto& file = files.emplace_back();
+            file.set_inode_id(item.inode_id);
+            file.set_size(item.file_size);
+            // 卷格式没有业务文件版本；不能用卷格式版本或默认值冒充。
+            file.set_has_file_version(false);
+        }
+        size_t end = 0;
+        if (!zb::archive_inventory::Page(*request, zb::archive_inventory::Token({info}, files),
+                                        files.size(), reply, &end)) return;
+        *reply->mutable_image() = info;
+        for (size_t i = request->offset(); i < end; ++i) {
+            auto* file = reply->add_files(); *file = files[i];
+            if (request->digest_inode_id() == file->inode_id()) {
+                std::string sha;
+                if (!service_->HashArchivedFile(image, metadata[i], &sha, &error)) {
+                    reply->mutable_status()->set_code(zb::rpc::OPTICAL_INTERNAL_ERROR);
+                    reply->mutable_status()->set_message(error); return;
+                }
+                file->set_payload_sha256(sha);
+            }
+        }
+        return;
+    }
+    reply->mutable_status()->set_code(zb::rpc::OPTICAL_NOT_FOUND);
+    reply->mutable_status()->set_message("image absent from completed local media index");
+}
 
 void BrpcOpticalNodeService::SendArchiveMetadata(google::protobuf::RpcController* cntl_base,
                                                  const zb::rpc::SendArchiveMetadataRequest* request,

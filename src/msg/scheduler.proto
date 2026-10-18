@@ -72,6 +72,7 @@ message DiskHeartbeat {
   uint64 read_bandwidth_bytes_per_sec = 6;
   uint64 write_bandwidth_bytes_per_sec = 7;
   uint64 accumulated_write_bytes = 8;
+  string health_source = 9; // software / model / unknown；不是硬件实测的健康结论
 }
 
 message HeartbeatRequest {
@@ -91,6 +92,9 @@ message HeartbeatRequest {
   bool initialization_complete = 14;
   bool metadata_ready = 15;
   string readiness_message = 16;
+  uint64 instance_generation = 17; // 0 保留旧节点兼容；新光盘上报必须携带
+  bool require_registered = 18; // 禁止用心跳默认模板替代显式注册
+  bool inventory_unavailable = 19; // 采集失败时保留上次库存，不把未知当作空库存
 }
 
 message HeartbeatReply {
@@ -266,6 +270,8 @@ enum ManagedAccessPath {
   MANAGED_ACCESS_DEFAULT = 0;
   MANAGED_ACCESS_OPTICAL_CACHE_HIT = 1;
   MANAGED_ACCESS_OPTICAL_DISC = 2;
+  MANAGED_ACCESS_ARCHIVE = 3;    // 后台归档模型完成量，非实际网络传输字节
+  MANAGED_ACCESS_MIGRATION = 4;  // 排空迁移的设备服务量
 }
 
 enum ManagedOperationKind {
@@ -339,6 +345,7 @@ message ManagedDeviceInventory {
   uint64 write_bandwidth_bytes_per_sec = 8;
   uint64 accumulated_write_bytes = 9;
   uint64 last_update_ms = 10;
+  string health_source = 11;
 }
 
 message ManagedOpticalLibraryStatus {
@@ -355,6 +362,36 @@ message ManagedOpticalLibraryStatus {
   uint32 pending_write_tasks = 11;
   uint32 pending_read_tasks = 12;
   uint32 busy_drives = 13;
+  // v0 为旧协议；v1 明确区分已观测、采集失败和模型数据。
+  uint32 telemetry_version = 14;
+  bool inventory_valid = 15;
+  bool staging_valid = 16;
+  bool background_valid = 17;
+  bool physical_health_observed = 18;
+  string observation_source = 19;
+  string collection_error = 20;
+  uint64 pending_archive_batches = 21;
+  uint64 background_tasks = 22;
+  uint64 staging_read_reserved_bytes = 23;
+  uint64 staging_write_reserved_bytes = 24;
+  uint64 configured_disc_count = 25;
+  uint64 valid_until_ms = 26;
+  bool accepts_archive_writes = 27; // 与普通副本放置开关分离的光盘归档能力
+}
+
+// 每条访问路径各自维护窗口水位，不能由另一个采集器覆盖去重状态。
+message ManagedMetricsStreamState {
+  ManagedAccessPath access_path = 1;
+  uint64 reporter_epoch = 2;
+  uint64 report_sequence = 3;
+  uint64 window_end_ms = 4;
+  double utilization = 5;
+  uint32 queue_depth = 6;
+  bool retired = 7; // 报告者重启后保留旧水位，仅用于确认已接收窗口的重试
+  uint64 read_operations = 8;
+  uint64 write_operations = 9;
+  uint64 read_bytes = 10;
+  uint64 write_bytes = 11;
 }
 
 message ManagedNodeReadiness {
@@ -415,6 +452,7 @@ message ManagedNodeView {
   uint64 actuated_energy_microjoules = 46;
   uint64 last_actuated_energy_update_ms = 47;
   ManagedNodeReadiness readiness = 48;
+  repeated ManagedMetricsStreamState metrics_streams = 49;
 }
 
 message RegisterManagedNodeRequest {
@@ -448,6 +486,7 @@ message ReportNodeMetricsRequest {
   ManagedAccessPath access_path = 13;
   uint64 report_sequence = 14;
   uint64 reporter_epoch = 15;
+  uint64 instance_generation = 16;
 }
 
 message ReportNodeAccessEventRequest {
@@ -471,6 +510,7 @@ message ReportNodeDrainProgressRequest {
 message ReportOpticalLibraryStatusRequest {
   string node_id = 1;
   ManagedOpticalLibraryStatus status = 2;
+  uint64 instance_generation = 3;
 }
 
 message SetManagedNodeServiceModeRequest {
@@ -481,6 +521,7 @@ message SetManagedNodeServiceModeRequest {
 message ReportManagedNodeReadinessRequest {
   string node_id = 1;
   ManagedNodeReadiness readiness = 2;
+  uint64 instance_generation = 3;
 }
 
 message ManagedNodeRuntimeSnapshot {
@@ -501,6 +542,17 @@ message ManagedNodeCatalogSnapshot {
   uint64 saved_at_ms = 3;
   repeated ManagedNodeRuntimeSnapshot nodes = 4;
   repeated ManagedMetricsSample history = 5;
+  // 与节点状态同一文件提交；恢复后可按原操作 ID 查询已确认的启停结果。
+  repeated NodeOperation operations = 6;
+  uint64 next_operation_id = 7;
+}
+
+// 运维先更新服务器现有配置文件，再请求主循环热加载新增模型。
+// 不接收远程文件路径，不重启 Scheduler，不绕过 CMS 就绪确认。
+message ReloadModelConfigsRequest {}
+message ReloadModelConfigsReply {
+  SchedulerStatus status = 1;
+  bool accepted = 2; // 仅受理；创建结果用 GetManagedNode / CMS 目录确认
 }
 
 message AdvanceSimulationTimeRequest {
@@ -647,6 +699,7 @@ message GetManagedMetricsHistoryReply {
 }
 
 service SchedulerService {
+  rpc ReloadModelConfigs(ReloadModelConfigsRequest) returns (ReloadModelConfigsReply);
   rpc ReportHeartbeat(HeartbeatRequest) returns (HeartbeatReply);
   rpc GetClusterView(GetClusterViewRequest) returns (GetClusterViewReply);
   rpc SetNodeAdminState(SetNodeAdminStateRequest) returns (SetNodeAdminStateReply);

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -109,6 +110,12 @@ public:
         std::function<bool(const std::string&, std::string*)> verifier);
     void SetLogicalEmptyDrainBegin(
         std::function<bool(const std::string&, uint64_t, std::string*)> begin);
+    void SetLogicalOpticalDrain(
+        std::function<bool(const std::string&, uint64_t, std::string*)> begin,
+        std::function<bool(DrainMigrationTask*, uint64_t, std::string*)> advance);
+    void SetPhysicalOpticalDrain(
+        std::function<bool(const std::string&, uint64_t, std::string*)> begin,
+        std::function<bool(DrainMigrationTask*, uint64_t, std::string*)> advance);
     bool BeginManagedDrain(const std::string& node_id, uint64_t now_ms,
                            std::string* error);
     void Tick(uint64_t now_ms);
@@ -127,6 +134,8 @@ private:
     };
     struct InternalTask {
         DrainMigrationTask view;
+        DrainMigrationTask published;
+        std::mutex execution_mu;
         std::vector<WorkItem> work;
         size_t next_work{0};
         bool enumerated{false};
@@ -151,11 +160,15 @@ private:
     ObjectMigrationBackend* backend_{};
     std::function<bool(const std::string&, std::string*)> logical_source_empty_;
     std::function<bool(const std::string&, uint64_t, std::string*)> logical_empty_drain_begin_;
+    std::function<bool(const std::string&, uint64_t, std::string*)> optical_drain_begin_;
+    std::function<bool(DrainMigrationTask*, uint64_t, std::string*)> optical_drain_advance_;
+    std::function<bool(const std::string&, uint64_t, std::string*)> physical_optical_begin_;
+    std::function<bool(DrainMigrationTask*, uint64_t, std::string*)> physical_optical_advance_;
     uint64_t retry_base_ms_{1000};
     uint32_t max_retries_{20};
     uint64_t next_id_{1};
     mutable std::mutex mu_;
-    std::unordered_map<std::string, InternalTask> tasks_;
+    std::unordered_map<std::string, std::shared_ptr<InternalTask>> tasks_;
 };
 
 } // namespace zb::scheduler

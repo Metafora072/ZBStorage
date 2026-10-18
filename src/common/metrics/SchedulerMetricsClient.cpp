@@ -10,7 +10,7 @@ bool ReportCollectedMetrics(brpc::Channel* channel,
                             NodeMetricsCollector* collector,
                             zb::rpc::ManagedAccessPath access_path,
                             uint64_t now_ms,
-                            std::string* error) {
+                            std::string* error, uint64_t instance_generation) {
     if (!channel || node_id.empty() || !collector) {
         if (error) {
             *error = "invalid Scheduler metrics client arguments";
@@ -39,6 +39,7 @@ bool ReportCollectedMetrics(brpc::Channel* channel,
     request.set_access_path(access_path);
     request.set_report_sequence(snapshot.report_sequence);
     request.set_reporter_epoch(snapshot.reporter_epoch);
+    request.set_instance_generation(instance_generation);
 
     zb::rpc::SchedulerService_Stub stub(channel);
     zb::rpc::ManagedNodeReply response;

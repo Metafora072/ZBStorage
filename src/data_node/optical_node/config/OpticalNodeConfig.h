@@ -10,6 +10,8 @@ struct OpticalNodeConfig {
     std::string node_id;
     std::string node_address;
     std::string scheduler_addr;
+    // 权威交接确认地址；源清理只能向此部署配置中的 MDS 查询。
+    std::string mds_address{"127.0.0.1:9000"};
     std::string group_id;
     std::string node_role;
     std::string peer_node_id;
@@ -43,7 +45,7 @@ struct OpticalNodeConfig {
     uint64_t disc_capacity_bytes{1099511627776ULL};
     uint32_t standard_images_per_disc{100};
     // 库内光盘数量（对应 Scheduler 的 local_disc_count）：库位按此数量装载盘片，
-    // 其状态（空白/在刻/已刻）随刻录变化，但盘片数量保持不变。0 或非法值按 1000 生效。
+    // 其状态（空白/在刻/已刻）随刻录变化，但盘片数量保持不变。当前模型不支持 0，显式报错。
     uint64_t total_disc_count{1000};
     // 光盘库槽位数（光盘架总槽数，对应 Scheduler 的 total_slots）。须 >= 光盘数量；
     // 0 或非法值按 100000 生效，小于光盘数量时抬升到光盘数量。
@@ -95,7 +97,7 @@ struct OpticalNodeConfig {
     uint64_t cache_write_bytes_per_sec{200000000ull};
     // 光驱设备组读/写带宽。
     uint64_t drive_read_bytes_per_sec{100000000ull};
-    uint64_t drive_write_bytes_per_sec{10000000ull};
+    uint64_t drive_write_bytes_per_sec{20000000ull};
     // 功率（毫瓦）：峰/中/待机/关。
     uint64_t power_peak_milliwatts{400000};
     uint64_t power_medium_milliwatts{200000};

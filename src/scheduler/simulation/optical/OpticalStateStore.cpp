@@ -135,7 +135,7 @@ bool DecodeTask(const std::string& input, OpticalTaskRecord* task) {
 }
 
 std::string EncodeArchive(const OpticalArchiveRecord& archive) {
-    std::string result = "OA2";
+    std::string result = "OA5";
     result.push_back(static_cast<char>(archive.phase));
     AppendUint64(&result, archive.inode_id);
     AppendUint64(&result, archive.version);
@@ -148,14 +148,20 @@ std::string EncodeArchive(const OpticalArchiveRecord& archive) {
     AppendString(&result, archive.disc_id);
     AppendString(&result, archive.image_id);
     AppendUint64(&result, archive.media_bytes);
+    AppendUint64(&result, archive.source_generation);
+    AppendUint64(&result, archive.source_image_id.size());
+    result += archive.source_image_id;
+    AppendUint64(&result, archive.seal_remaining_us);
+    AppendString(&result, archive.admission_lease_id.empty() ? archive.source_lease_id : archive.admission_lease_id);
     return result;
 }
 
 bool DecodeArchive(const std::string& input, OpticalArchiveRecord* archive) {
     if (!archive || input.size() < 4 ||
-        (input.compare(0, 3, "OA1") != 0 && input.compare(0, 3, "OA2") != 0))
+        (input.compare(0, 3, "OA1") != 0 && input.compare(0, 3, "OA2") != 0 &&
+         input.compare(0, 3, "OA3") != 0 && input.compare(0, 3, "OA4") != 0 && input.compare(0, 3, "OA5") != 0))
         return false;
-    const bool current = input.compare(0, 3, "OA2") == 0;
+    const bool current = input.compare(0, 3, "OA1") != 0;
     const uint8_t phase = static_cast<uint8_t>(input[3]);
     if (phase < static_cast<uint8_t>(OpticalArchivePhase::kTransfer) ||
         phase > static_cast<uint8_t>(OpticalArchivePhase::kFailed)) return false;
@@ -174,6 +180,20 @@ bool DecodeArchive(const std::string& input, OpticalArchiveRecord* archive) {
     if (!decoded) return false;
     if (!current) archive->media_bytes = archive->size;
     else if (!TakeUint64(input, &offset, &archive->media_bytes)) return false;
+    if (input.compare(0, 3, "OA3") == 0 || input.compare(0, 3, "OA4") == 0 || input.compare(0, 3, "OA5") == 0) {
+        uint64_t size = 0;
+        if (!TakeUint64(input, &offset, &archive->source_generation) ||
+            !TakeUint64(input, &offset, &size) || size > 256 ||
+            size > input.size() - offset) return false;
+        archive->source_image_id.assign(input.data() + offset, size);
+        offset += size;
+        if (archive->source_image_id.empty() != (archive->source_generation == 0)) return false;
+    }
+    if ((input.compare(0, 3, "OA4") == 0 || input.compare(0, 3, "OA5") == 0) &&
+        (!TakeUint64(input, &offset, &archive->seal_remaining_us) ||
+         archive->seal_remaining_us > 3600000000ULL)) return false;
+    archive->admission_lease_id = archive->source_lease_id;
+    if (input.compare(0, 3, "OA5") == 0 && !TakeString(input, &offset, &archive->admission_lease_id)) return false;
     return offset == input.size() && archive->inode_id != 0 && archive->version != 0 &&
            (archive->size == 0 || archive->media_bytes != 0) &&
            archive->remaining_us <= 365ULL * 24 * 60 * 60 * 1000000 &&
@@ -377,6 +397,42 @@ bool OpticalStateStore::CompleteArchive(const OpticalArchiveRecord& archive,
     options.sync = true;
     const auto status = db_->Write(options, &batch);
     if (!status.ok() && error) *error = "optical archive completion: " + status.ToString();
+    return status.ok();
+}
+
+bool OpticalStateStore::PutArchiveGroup(const std::vector<OpticalArchiveRecord>& archives,
+                                        bool complete, std::string* error) {
+    if (!db_ || archives.empty()) { if (error) *error = "empty optical archive group"; return false; }
+    rocksdb::WriteBatch batch;
+    for (const auto& archive : archives) {
+        if (complete && archive.phase != OpticalArchivePhase::kAwaitingMds) {
+            if (error) *error = "optical group completion phase mismatch";
+            return false;
+        }
+        batch.Put(ArchiveKey(archive.operation_id), EncodeArchive(archive));
+        if (complete) batch.Put(FileKey(archive.inode_id), EncodeFile({archive.inode_id,
+            archive.version, archive.size, archive.disc_id, archive.image_id, archive.media_bytes}));
+    }
+    rocksdb::WriteOptions options;
+    options.sync = true;
+    const auto status = db_->Write(options, &batch);
+    if (!status.ok() && error) *error = "optical archive group persistence: " + status.ToString();
+    return status.ok();
+}
+
+bool OpticalStateStore::CheckpointWork(const std::vector<OpticalArchiveRecord>& archives,
+                                       const std::vector<OpticalTaskRecord>& tasks,
+                                       std::string* error) {
+    if (!db_) { if (error) *error = "optical state not initialized"; return false; }
+    rocksdb::WriteBatch batch;
+    for (const auto& archive : archives)
+        batch.Put(ArchiveKey(archive.operation_id), EncodeArchive(archive));
+    for (const auto& task : tasks)
+        batch.Put(TaskKey(task.task_id), EncodeTask(task));
+    rocksdb::WriteOptions options;
+    options.sync = true;
+    const auto status = db_->Write(options, &batch);
+    if (!status.ok() && error) *error = "optical work checkpoint: " + status.ToString();
     return status.ok();
 }
 

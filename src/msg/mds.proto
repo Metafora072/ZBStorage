@@ -149,6 +149,66 @@ message ModelOpticalArchiveReply {
   bool already_committed = 2;
 }
 
+// 仅用于无载荷模型光盘库排空。目标完成持久逻辑接收后，条件切换
+// 光盘位置；不触发冷目录发现、Masstree 导入或真实盘片操作。
+message CommitModelOpticalMigrationRequest {
+  string operation_id = 1;
+  uint64 inode_id = 2;
+  uint64 expected_version = 3;
+  uint64 size = 4;
+  OpticalFileLocation expected_source = 5;
+  OpticalFileLocation target = 6;
+}
+
+message CommitModelOpticalMigrationReply {
+  MdsStatus status = 1;
+  bool already_committed = 2;
+}
+
+// 真实文件化光盘库的整库交接：保持盘片/镜像编号，必须使用空白接收库。
+// 清单包含实际介质、未封盘产物和重启快照；不是仅复制元数据。
+message OpticalHandoffFile {
+  string path = 1;
+  uint64 size = 2;
+  string sha256 = 3;
+}
+message OpticalLibraryHandoffRecord {
+  string operation_id = 1;
+  OpticalFileLocation source = 2;
+  OpticalFileLocation target = 3;
+  string format_signature = 4;
+  repeated OpticalHandoffFile files = 5;
+  string manifest_id = 6;
+  string phase = 7; // FREEZING / EXPORTED / RECEIVING / INSTALLING / ACTIVE / RELEASED
+}
+enum OpticalHandoffAction {
+  HANDOFF_QUERY = 0;
+  HANDOFF_FREEZE = 1;
+  HANDOFF_ACCEPT = 2;
+  HANDOFF_READ = 3;
+  HANDOFF_WRITE = 4;
+  HANDOFF_ACTIVATE = 5;
+  HANDOFF_RELEASE = 6;
+}
+message OpticalLibraryHandoffRequest {
+  string node_id = 1;
+  uint64 instance_generation = 2;
+  OpticalHandoffAction action = 3;
+  OpticalLibraryHandoffRecord record = 4;
+  string path = 5;
+  uint64 offset = 6;
+  bytes data = 7;
+  uint32 chunk_size = 8; // 最大 1 MiB；写入允许相同位置幂等覆盖
+}
+message CommitOpticalLibraryHandoffRequest {
+  OpticalLibraryHandoffRecord record = 1;
+  bool commit = 2; // false 仅查询该精确交接是否已经提交
+}
+message CommitOpticalLibraryHandoffReply {
+  MdsStatus status = 1;
+  bool committed = 2;
+}
+
 // Scheduler proposes operational state, but CMS is the authority that commits
 // membership, compact identifiers and the placement-visible node catalog.
 message CmsNodeCatalogEntry {
@@ -715,6 +775,10 @@ service MdsService {
   rpc GetFileLocation(GetFileLocationRequest) returns (GetFileLocationReply);
   rpc CommitFileMigration(CommitFileMigrationRequest) returns (CommitFileMigrationReply);
   rpc ModelOpticalArchive(ModelOpticalArchiveRequest) returns (ModelOpticalArchiveReply);
+  // 真实归档完成确认：复用租约/版本 CAS 清单，另核验真实目标介质文件，不能用模型冒充。
+  rpc CommitPhysicalOpticalArchive(ModelOpticalArchiveRequest) returns (ModelOpticalArchiveReply);
+  rpc CommitModelOpticalMigration(CommitModelOpticalMigrationRequest) returns (CommitModelOpticalMigrationReply);
+  rpc CommitOpticalLibraryHandoff(CommitOpticalLibraryHandoffRequest) returns (CommitOpticalLibraryHandoffReply);
   rpc CommitCmsNodeCatalog(CommitCmsNodeCatalogRequest) returns (CommitCmsNodeCatalogReply);
   rpc GetCmsNodeCatalog(GetCmsNodeCatalogRequest) returns (GetCmsNodeCatalogReply);
   rpc VerifyNodeReferences(VerifyNodeReferencesRequest) returns (VerifyNodeReferencesReply);

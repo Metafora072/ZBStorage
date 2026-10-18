@@ -50,6 +50,19 @@ bool DrainMigrationCoordinator::BeginManagedDrain(const std::string& node_id,
         if (error) *error = "managed source node disappeared: " + node_id;
         return false;
     }
+    if (runtime.profile.kind == ManagedNodeKind::kOpticalLibrary &&
+        runtime.profile.execution_mode == ExecutionMode::kPhysical) {
+        if (!physical_optical_begin_) { if (error) *error = "physical optical handoff backend unavailable"; return false; }
+        return physical_optical_begin_(node_id, now_ms, error);
+    }
+    if (runtime.profile.kind == ManagedNodeKind::kOpticalLibrary &&
+        runtime.profile.execution_mode == ExecutionMode::kVirtual) {
+        if (!optical_drain_begin_) {
+            if (error) *error = "logical optical drain backend unavailable";
+            return false;
+        }
+        return optical_drain_begin_(node_id, now_ms, error);
+    }
     if (runtime.profile.kind == ManagedNodeKind::kStorage &&
         runtime.profile.execution_mode == ExecutionMode::kVirtual) {
         if (!logical_empty_drain_begin_) {
@@ -114,11 +127,12 @@ bool DrainMigrationCoordinator::Start(const std::string& node_id,
                                       runtime.profile.execution_mode == ExecutionMode::kVirtual);
     std::lock_guard<std::mutex> lock(mu_);
     auto existing = tasks_.find(node_id);
-    if (existing != tasks_.end() && existing->second.view.state != DrainMigrationState::kCompleted &&
-        existing->second.view.state != DrainMigrationState::kBlocked) {
+    if (existing != tasks_.end() && existing->second->published.state != DrainMigrationState::kCompleted &&
+        existing->second->published.state != DrainMigrationState::kBlocked) {
         return true;
     }
-    InternalTask task;
+    auto owned = std::make_shared<InternalTask>();
+    auto& task = *owned;
     task.view.migration_id = "drain-" + std::to_string(now_ms) + "-" + std::to_string(next_id_++);
     task.view.source_node_id = node_id;
     task.view.source_address = runtime.profile.execution_mode == ExecutionMode::kVirtual &&
@@ -133,14 +147,21 @@ bool DrainMigrationCoordinator::Start(const std::string& node_id,
         task.enumerated = true;
         task.view.state = DrainMigrationState::kRunning;
     }
-    tasks_[node_id] = std::move(task);
+    task.published = task.view;
+    tasks_[node_id] = std::move(owned);
     return true;
 }
 
 void DrainMigrationCoordinator::Tick(uint64_t now_ms) {
-    std::lock_guard<std::mutex> lock(mu_);
-    for (auto& entry : tasks_) {
-        InternalTask& task = entry.second;
+    std::vector<std::shared_ptr<InternalTask>> tasks;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (const auto& [_, task] : tasks_) tasks.push_back(task);
+    }
+    for (auto& owned : tasks) {
+        std::unique_lock<std::mutex> execution(owned->execution_mu, std::try_to_lock);
+        if (!execution.owns_lock()) continue;
+        InternalTask& task = *owned;
         if (task.view.state == DrainMigrationState::kCompleted ||
             task.view.state == DrainMigrationState::kBlocked ||
             (task.view.state == DrainMigrationState::kRetryWait && now_ms < task.view.next_retry_ms)) {
@@ -151,6 +172,9 @@ void DrainMigrationCoordinator::Tick(uint64_t now_ms) {
         } else {
             (void)ProcessWorkLocked(&task, now_ms);
         }
+        // 网络/模型等待不持有目录锁；查询读取最近完成的一步进度，不阻塞 CMS。
+        std::lock_guard<std::mutex> publish(mu_);
+        task.published = task.view;
     }
 }
 
@@ -159,7 +183,7 @@ bool DrainMigrationCoordinator::GetTask(const std::string& node_id, DrainMigrati
     std::lock_guard<std::mutex> lock(mu_);
     auto it = tasks_.find(node_id);
     if (it == tasks_.end()) return false;
-    *out = it->second.view;
+    *out = it->second->published;
     return true;
 }
 
@@ -167,7 +191,7 @@ std::vector<DrainMigrationTask> DrainMigrationCoordinator::ListTasks() const {
     std::lock_guard<std::mutex> lock(mu_);
     std::vector<DrainMigrationTask> out;
     out.reserve(tasks_.size());
-    for (const auto& entry : tasks_) out.push_back(entry.second.view);
+    for (const auto& entry : tasks_) out.push_back(entry.second->published);
     std::sort(out.begin(), out.end(), [](const auto& lhs, const auto& rhs) {
         return lhs.created_at_ms < rhs.created_at_ms;
     });
@@ -318,6 +342,29 @@ bool DrainMigrationCoordinator::SelectTargetLocked(const InternalTask& task,
 }
 
 bool DrainMigrationCoordinator::ProcessWorkLocked(InternalTask* task, uint64_t now_ms) {
+    ManagedNodeRuntime runtime;
+    if (nodes_->GetNode(task->view.source_node_id, &runtime) &&
+        runtime.profile.kind == ManagedNodeKind::kOpticalLibrary &&
+        runtime.profile.execution_mode == ExecutionMode::kPhysical) {
+        std::string error;
+        if (!physical_optical_advance_ || !physical_optical_advance_(&task->view, now_ms, &error)) {
+            task->view.updated_at_ms = now_ms;
+            if (!error.empty()) RetryLocked(task, now_ms, error);
+            else { task->view.state = DrainMigrationState::kRunning; task->view.last_error.clear(); }
+            return false;
+        }
+    }
+    if (nodes_->GetNode(task->view.source_node_id, &runtime) &&
+        runtime.profile.kind == ManagedNodeKind::kOpticalLibrary &&
+        runtime.profile.execution_mode == ExecutionMode::kVirtual && optical_drain_advance_) {
+        std::string error;
+        if (!optical_drain_advance_(&task->view, now_ms, &error)) {
+            task->view.updated_at_ms = now_ms;
+            if (!error.empty()) RetryLocked(task, now_ms, error);
+            else { task->view.state = DrainMigrationState::kRunning; task->view.last_error.clear(); }
+            return false;
+        }
+    }
     if (task->next_work >= task->work.size()) {
         CompleteLocked(task, now_ms);
         return task->view.state == DrainMigrationState::kCompleted;
@@ -385,6 +432,19 @@ bool DrainMigrationCoordinator::ProcessWorkLocked(InternalTask* task, uint64_t n
                                     task->view.remaining_bytes, 0, nullptr);
     }
     return true;
+}
+
+void DrainMigrationCoordinator::SetLogicalOpticalDrain(
+    std::function<bool(const std::string&, uint64_t, std::string*)> begin,
+    std::function<bool(DrainMigrationTask*, uint64_t, std::string*)> advance) {
+    optical_drain_begin_ = std::move(begin);
+    optical_drain_advance_ = std::move(advance);
+}
+
+void DrainMigrationCoordinator::SetPhysicalOpticalDrain(
+    std::function<bool(const std::string&, uint64_t, std::string*)> begin,
+    std::function<bool(DrainMigrationTask*, uint64_t, std::string*)> advance) {
+    physical_optical_begin_ = std::move(begin); physical_optical_advance_ = std::move(advance);
 }
 
 void DrainMigrationCoordinator::RetryLocked(InternalTask* task,
@@ -474,6 +534,15 @@ void DrainMigrationCoordinator::CompleteLocked(InternalTask* task, uint64_t now_
                                             &operation, &error)) {
         RetryLocked(task, now_ms, "post-drain stop failed: " + error);
         return;
+    }
+    if (runtime.profile.kind == ManagedNodeKind::kOpticalLibrary &&
+        runtime.profile.execution_mode == ExecutionMode::kPhysical) {
+        if (operation.message.find("No command template configured") != std::string::npos) {
+            RetryLocked(task, now_ms, "physical optical retirement requires configured stop actuator; no power-off confirmation");
+            return;
+        }
+        nodes_->ReportPowerActuation(task->view.source_node_id, PowerLevel::kOff, now_ms, true,
+                                     "configured stop actuator completed after optical handoff", nullptr);
     }
     if (!nodes_->FinalizeRemoveNode(task->view.source_node_id, now_ms, false, &error)) {
         RetryLocked(task, now_ms, "post-drain retirement failed: " + error);

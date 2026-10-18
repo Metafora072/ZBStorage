@@ -4,6 +4,7 @@
 #include <chrono>
 #include <functional>
 #include <utility>
+#include <stdexcept>
 
 namespace zb::scheduler {
 namespace {
@@ -93,6 +94,10 @@ HeartbeatAssignment ClusterState::ReportHeartbeat(const zb::rpc::HeartbeatReques
     ManagedNodeRuntime node;
     std::string error;
     if (!nodes_->GetNode(request.node_id(), &node)) {
+        if (request.require_registered()) {
+            failed.error = "explicit managed-node registration is required";
+            return failed;
+        }
         const ManagedNodeProfile profile = DefaultHeartbeatProfile(request);
         if (!nodes_->RegisterNode(profile, now_ms,
                                   std::hash<std::string>{}(request.node_id()), &error)) {
@@ -101,24 +106,36 @@ HeartbeatAssignment ClusterState::ReportHeartbeat(const zb::rpc::HeartbeatReques
         }
         nodes_->GetNode(request.node_id(), &node);
     }
+    if ((node.profile.kind == ManagedNodeKind::kOpticalLibrary &&
+         node.optical_library.telemetry_version != 0 && request.instance_generation() == 0) ||
+        (request.instance_generation() != 0 &&
+         request.instance_generation() != node.profile.instance_generation)) {
+        failed.error = "heartbeat instance generation does not match registered node";
+        return failed;
+    }
 
     zb::storage_model::NodeInventorySnapshot inventory;
-    inventory.node_id = request.node_id();
-    inventory.generation = node.inventory.generation + 1;
-    inventory.observed_at_ms = now_ms;
-    inventory.devices.reserve(static_cast<size_t>(request.disks_size()));
-    for (const auto& disk : request.disks()) {
-        zb::storage_model::DeviceInventory device;
-        device.disk_id = disk.disk_id();
-        device.kind = HeartbeatDeviceKind(disk, node.profile.kind);
-        device.capacity_bytes = disk.capacity_bytes();
-        device.free_bytes = disk.free_bytes();
-        device.is_healthy = disk.is_healthy();
-        device.read_bandwidth_bytes_per_sec = disk.read_bandwidth_bytes_per_sec();
-        device.write_bandwidth_bytes_per_sec = disk.write_bandwidth_bytes_per_sec();
-        device.accumulated_write_bytes = disk.accumulated_write_bytes();
-        device.last_update_ms = now_ms;
-        inventory.devices.push_back(std::move(device));
+    if (request.inventory_unavailable()) {
+        inventory = node.inventory;
+    } else {
+        inventory.node_id = request.node_id();
+        inventory.generation = node.inventory.generation + 1;
+        inventory.observed_at_ms = now_ms;
+        inventory.devices.reserve(static_cast<size_t>(request.disks_size()));
+        for (const auto& disk : request.disks()) {
+            zb::storage_model::DeviceInventory device;
+            device.disk_id = disk.disk_id();
+            device.kind = HeartbeatDeviceKind(disk, node.profile.kind);
+            device.capacity_bytes = disk.capacity_bytes();
+            device.free_bytes = disk.free_bytes();
+            device.is_healthy = disk.is_healthy();
+            device.read_bandwidth_bytes_per_sec = disk.read_bandwidth_bytes_per_sec();
+            device.write_bandwidth_bytes_per_sec = disk.write_bandwidth_bytes_per_sec();
+            device.accumulated_write_bytes = disk.accumulated_write_bytes();
+            device.last_update_ms = now_ms;
+            device.health_source = disk.health_source();
+            inventory.devices.push_back(std::move(device));
+        }
     }
     if (!nodes_->ReportHeartbeat(request.node_id(), request.address(), std::move(inventory),
                                  now_ms, &error)) {
@@ -129,11 +146,12 @@ HeartbeatAssignment ClusterState::ReportHeartbeat(const zb::rpc::HeartbeatReques
         zb::storage_model::NodeReadinessStatus readiness;
         readiness.observed = true;
         readiness.initialization_complete = request.initialization_complete();
-        readiness.inventory_ready = request.disks_size() > 0;
+        readiness.inventory_ready = !request.inventory_unavailable() && request.disks_size() > 0;
         readiness.metadata_ready = request.metadata_ready();
         readiness.observed_at_ms = now_ms;
         readiness.message = request.readiness_message();
-        if (!nodes_->ReportReadiness(request.node_id(), readiness, &error)) {
+        if (!nodes_->ReportReadiness(request.node_id(), readiness, &error,
+                                      request.instance_generation())) {
             failed.error = error;
             return failed;
         }
@@ -239,6 +257,16 @@ bool ClusterState::CreateOperation(const std::string& node_id,
     }
     std::lock_guard<std::mutex> lock(mu_);
     NodeOperationState op;
+    if (next_operation_id_ == UINT64_MAX) {
+        if (error) *error = "lifecycle operation sequence exhausted";
+        return false;
+    }
+    for (const auto& [id, existing] : operations_) {
+        if (existing.node_id == node_id && existing.status == zb::rpc::NODE_OP_RUNNING) {
+            if (error) *error = "node lifecycle operation already running: " + id;
+            return false;
+        }
+    }
     op.operation_id = "op-" + std::to_string(next_operation_id_++);
     op.node_id = node_id;
     op.operation_type = type;
@@ -312,6 +340,72 @@ HeartbeatAssignment ClusterState::BuildAssignment(const ManagedNodeRuntime& node
     out.primary_node_id = node.profile.node_id;
     out.primary_address = node.identity.service_address;
     return out;
+}
+
+void ClusterState::SnapshotOperations(std::vector<zb::rpc::NodeOperation>* output, uint64_t* next_id) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    output->clear();
+    *next_id = next_operation_id_;
+    for (const auto& [id, operation] : operations_) {
+        auto& item = output->emplace_back();
+        item.set_operation_id(id);
+        item.set_node_id(operation.node_id);
+        item.set_operation_type(operation.operation_type);
+        item.set_status(operation.status);
+        item.set_message(operation.message);
+        item.set_start_ts_ms(operation.start_ts_ms);
+        item.set_finish_ts_ms(operation.finish_ts_ms);
+    }
+}
+
+bool ClusterState::RestoreOperations(
+    const google::protobuf::RepeatedPtrField<zb::rpc::NodeOperation>& input,
+    uint64_t next_id, uint64_t restore_time_ms, std::string* error) {
+    std::unordered_map<std::string, NodeOperationState> restored;
+    uint64_t minimum_next = 1;
+    for (const auto& item : input) {
+        uint64_t number = 0;
+        try {
+            size_t consumed = 0;
+            if (item.operation_id().rfind("op-", 0) != 0) throw std::invalid_argument("id");
+            const auto suffix = item.operation_id().substr(3);
+            number = std::stoull(suffix, &consumed);
+            if (consumed != suffix.size() || number == 0 || number == UINT64_MAX)
+                throw std::invalid_argument("id");
+        } catch (...) {
+            if (error) *error = "invalid persisted lifecycle operation ID";
+            return false;
+        }
+        if (item.node_id().empty() || !zb::rpc::NodeOperationType_IsValid(item.operation_type()) ||
+            !zb::rpc::NodeOperationStatus_IsValid(item.status()) || restored.count(item.operation_id())) {
+            if (error) *error = "invalid or duplicate persisted lifecycle operation";
+            return false;
+        }
+        NodeOperationState operation;
+        operation.operation_id = item.operation_id();
+        operation.node_id = item.node_id();
+        operation.operation_type = item.operation_type();
+        operation.status = item.status();
+        operation.message = item.message();
+        operation.start_ts_ms = item.start_ts_ms();
+        operation.finish_ts_ms = item.finish_ts_ms();
+        if (operation.status == zb::rpc::NODE_OP_RUNNING || operation.status == zb::rpc::NODE_OP_PENDING) {
+            operation.status = zb::rpc::NODE_OP_FAILED;
+            operation.finish_ts_ms = restore_time_ms;
+            operation.message = "Scheduler restarted during operation; query node/CMS state before retry";
+        }
+        restored.emplace(operation.operation_id, std::move(operation));
+        minimum_next = std::max(minimum_next, number + 1);
+    }
+    if (next_id == UINT64_MAX || (next_id != 0 && next_id < minimum_next)) {
+        if (error) *error = "invalid persisted lifecycle operation sequence";
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    operations_ = std::move(restored);
+    next_operation_id_ = std::max(next_id, minimum_next);
+    if (error) error->clear();
+    return true;
 }
 
 uint64_t ClusterState::NowMs() {

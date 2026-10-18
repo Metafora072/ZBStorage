@@ -16,7 +16,7 @@ bool ReportCollectedMetrics(brpc::Channel* channel,
                             NodeMetricsCollector* collector,
                             zb::rpc::ManagedAccessPath access_path,
                             uint64_t now_ms,
-                            std::string* error);
+                            std::string* error, uint64_t instance_generation = 0);
 
 bool EnsureMetadataNodeRegistered(brpc::Channel* channel,
                                   const std::string& node_id,

@@ -22,6 +22,7 @@
 #include "../../real_node/service/ArchiveObjectMetaStore.h"
 #include "../../../msg/storage_node_messages.h"
 #include "ModelStateStore.h"
+#include "common/rpc/ModelIoFaults.h"
 
 namespace zb::virtual_node {
 
@@ -99,6 +100,10 @@ public:
                                   const std::string& secondary_address);
     ReplicationStatusSnapshot GetReplicationStatus() const;
     IoResourceSnapshot GetIoResourceSnapshot() const;
+    // 逻辑迁移的设备服务时间，复用前台队列/带宽，不生成或保存载荷。
+    zb::msg::Status SimulateModelTransfer(uint64_t bytes, bool is_read) {
+        return SimulateIo(bytes, is_read);
+    }
 
     zb::msg::WriteObjectReply WriteObject(const zb::msg::WriteObjectRequest& request);
     zb::msg::ReadObjectReply ReadObject(const zb::msg::ReadObjectRequest& request);
@@ -142,7 +147,7 @@ public:
                                               const std::string& object_id,
                                               uint64_t expected_size) const;
     zb::msg::Status ExportModelFile(uint64_t inode_id, zb::msg::FileMeta* meta) const;
-    zb::msg::Status ImportModelFile(const zb::msg::FileMeta& meta);
+    zb::msg::Status ImportModelFile(const zb::msg::FileMeta& meta, const std::string& disk_id = {});
     zb::msg::Status VerifyModelArchiveSource(uint64_t inode_id,
                                              const std::string& disk_id,
                                              uint64_t expected_size,
@@ -208,6 +213,7 @@ private:
     bool PersistFileMetaRowLocked(uint64_t inode_id, std::string* error);
 
     VirtualNodeConfig config_;
+    zb::model::IoFaultPolicy io_faults_;
     std::unordered_set<std::string> disk_set_;
     mutable std::mutex object_mu_;
     std::unordered_map<std::string, std::string> object_home_disk_;

@@ -32,6 +32,7 @@ struct NodeAccessMetrics {
     uint64_t busy_time_ms{0};
     uint64_t last_access_ms{0};
     AccessPath access_path{AccessPath::kDefault};
+    uint64_t instance_generation{0};
 };
 
 struct NodeAccessEvent {
@@ -112,10 +113,10 @@ public:
                          std::string* error);
     bool ReportReadiness(const std::string& node_id,
                          const zb::storage_model::NodeReadinessStatus& readiness,
-                         std::string* error);
+                         std::string* error, uint64_t instance_generation = 0);
     bool ReportOpticalLibraryStatus(const std::string& node_id,
                                     const zb::storage_model::OpticalLibraryStatus& status,
-                                    std::string* error);
+                                    std::string* error, uint64_t instance_generation = 0);
     bool SetAdministrativeState(const std::string& node_id,
                                 zb::storage_model::AdministrativeState state,
                                 std::string* error);

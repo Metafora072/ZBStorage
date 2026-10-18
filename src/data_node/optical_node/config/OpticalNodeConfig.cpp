@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 
 namespace zb::optical_node {
@@ -87,6 +89,8 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
     }
 
     std::string line;
+    bool drive_read_configured = false;
+    bool drive_write_configured = false;
     size_t line_no = 0;
     while (std::getline(input, line)) {
         ++line_no;
@@ -111,6 +115,8 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
             cfg.node_address = value;
         } else if (key == "SCHEDULER_ADDR") {
             cfg.scheduler_addr = value;
+        } else if (key == "MDS_ADDRESS") {
+            cfg.mds_address = value;
         } else if (key == "GROUP_ID") {
             cfg.group_id = value;
         } else if (key == "NODE_ROLE") {
@@ -354,11 +360,13 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
                 return {};
             }
         } else if (key == "DRIVE_READ_BYTES_PER_SEC") {
+            drive_read_configured = true;
             if (!ParseUint64(value, &cfg.drive_read_bytes_per_sec)) {
                 if (error) *error = "Invalid DRIVE_READ_BYTES_PER_SEC at line " + std::to_string(line_no);
                 return {};
             }
         } else if (key == "DRIVE_WRITE_BYTES_PER_SEC") {
+            drive_write_configured = true;
             if (!ParseUint64(value, &cfg.drive_write_bytes_per_sec)) {
                 if (error) *error = "Invalid DRIVE_WRITE_BYTES_PER_SEC at line " + std::to_string(line_no);
                 return {};
@@ -445,7 +453,10 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
         cfg.standard_images_per_disc = 100;
     }
     if (cfg.total_disc_count == 0) {
-        cfg.total_disc_count = 1000;
+        // 现有 cd_manager_sim 不支持零盘，不能把请求的零盘伪报成 1000 片。
+        // 这里只校验上报配置，不修改内部装盘/迁出算法。
+        if (error) *error = "TOTAL_DISC_COUNT=0 is unsupported by cd_manager_sim; cannot claim an observed empty physical library";
+        return {};
     }
     // 槽位数须 >= 光盘数量，否则 local_disc_count > total_slots 会被服务端校验拒绝。
     if (cfg.slot_count == 0) {
@@ -529,11 +540,23 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
     if (cfg.cache_write_bytes_per_sec == 0) {
         cfg.cache_write_bytes_per_sec = 200000000ull;
     }
-    if (cfg.drive_read_bytes_per_sec == 0) {
-        cfg.drive_read_bytes_per_sec = 100000000ull;
+    // 未显式设置上报额定带宽时，从现有模拟参数派生；显式额定上限保持原值。
+    const auto rate = [&](double mbps, uint64_t* bytes) {
+        const long double value = static_cast<long double>(mbps) * 1000000.0L;
+        if (!std::isfinite(mbps) || value < 1 ||
+            value > std::numeric_limits<uint64_t>::max()) return false;
+        *bytes = static_cast<uint64_t>(value);
+        return true;
+    };
+    if ((!drive_read_configured || cfg.drive_read_bytes_per_sec == 0) &&
+        !rate(cfg.read_bandwidth_mbps, &cfg.drive_read_bytes_per_sec)) {
+        if (error) *error = "READ_BANDWIDTH_MBPS cannot be represented in reported bytes/sec";
+        return {};
     }
-    if (cfg.drive_write_bytes_per_sec == 0) {
-        cfg.drive_write_bytes_per_sec = 10000000ull;
+    if ((!drive_write_configured || cfg.drive_write_bytes_per_sec == 0) &&
+        !rate(cfg.burn_bandwidth_mbps, &cfg.drive_write_bytes_per_sec)) {
+        if (error) *error = "BURN_BANDWIDTH_MBPS cannot be represented in reported bytes/sec";
+        return {};
     }
     return cfg;
 }

@@ -188,6 +188,7 @@ add_executable(optical_node_server
     src/common/metrics/SchedulerMetricsClient.cpp
     src/data_node/optical_node/config/OpticalNodeConfig.cpp
     src/data_node/optical_node/service/OpticalStorageServiceImpl.cpp
+    src/data_node/optical_node/service/OpticalLibraryHandoff.cpp
     src/data_node/optical_node/service/BrpcOpticalNodeService.cpp
     src/data_node/optical_node/service/ReadEventSessionRegistry.cpp
     src/data_node/optical_node/server/optical_node_server.cpp
@@ -805,6 +806,7 @@ add_executable(mds_server
     src/common/metrics/NodeMetricsCollector.cpp
     src/common/metrics/SchedulerMetricsClient.cpp
     src/mds/service/MdsServiceImpl.cpp
+    src/mds/service/OpticalLibraryHandoff.cpp
     src/mds/server/mds_server.cpp
 )
 set_target_properties(mds_server PROPERTIES
@@ -881,6 +883,7 @@ target_link_libraries(scheduler_node_model PUBLIC zb_storage_model)
 
 add_library(zb_scheduler_api_client STATIC
     src/scheduler/api/SchedulerClient.cpp
+    src/scheduler/api/OpticalArchiveClient.cpp
 )
 target_compile_features(zb_scheduler_api_client PUBLIC cxx_std_17)
 target_include_directories(zb_scheduler_api_client PUBLIC
@@ -947,6 +950,7 @@ add_executable(scheduler_server
     src/scheduler/lifecycle/NodeActuator.cpp
     src/scheduler/lifecycle/LifecycleManager.cpp
     src/scheduler/migration/DrainMigrationCoordinator.cpp
+    src/scheduler/migration/PhysicalOpticalDrain.cpp
     src/scheduler/migration/BrpcObjectMigrationBackend.cpp
     src/scheduler/power/PowerActuationController.cpp
     src/scheduler/persistence/ManagedNodeSnapshotStore.cpp
@@ -988,13 +992,11 @@ if(BUILD_TESTING)
     endif()
     add_executable(scheduler_model_closure_probe EXCLUDE_FROM_ALL
         tests/scheduler/model_closure_probe.cpp)
-    target_link_libraries(scheduler_model_closure_probe PRIVATE zb_proto brpc-static)
+    target_link_libraries(scheduler_model_closure_probe PRIVATE zb_scheduler_api_client)
     target_include_directories(scheduler_model_closure_probe PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
         ${CMAKE_CURRENT_BINARY_DIR})
-    if(BRPC_DYNAMIC_LIB)
-        target_link_libraries(scheduler_model_closure_probe PRIVATE ${BRPC_DYNAMIC_LIB})
-    endif()
+    # API 库已 PUBLIC 传播 BRPC 及其系统依赖，避免重复直连打乱静态库顺序。
 endif()
 
 add_executable(scheduler_trace_replay
@@ -1171,6 +1173,7 @@ if(BUILD_TESTING)
         src/common/metrics/NodeMetricsCollector.cpp
         src/data_node/optical_node/config/OpticalNodeConfig.cpp
         src/data_node/optical_node/service/OpticalStorageServiceImpl.cpp
+        src/data_node/optical_node/service/OpticalLibraryHandoff.cpp
         src/data_node/optical_node/service/BrpcOpticalNodeService.cpp
         src/data_node/optical_node/service/ReadEventSessionRegistry.cpp
     )

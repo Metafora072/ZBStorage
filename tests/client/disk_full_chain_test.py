@@ -2,6 +2,8 @@
 """Manual full-chain check: production FUSE/MDS/Scheduler, physical and modeled disks."""
 import argparse
 import concurrent.futures
+import copy
+import errno
 import hashlib
 import json
 import os
@@ -118,6 +120,7 @@ class FullEnvironment(Environment):
         finally:
             for name in self.real_ports:
                 stop(self.processes.get(name))
+            stop(self.processes.get('delete-route-fault'))
 
 
 def write(path, payload):
@@ -130,6 +133,88 @@ def write(path, payload):
             offset += count
     finally:
         os.close(fd)
+
+
+def verify_delete_route_failures(env, placement):
+    """External catalog fault injection; all MDS/data RPC handlers are production code.
+
+    Only this private test's CMS addresses are changed. The fault endpoint is a
+    second real Scheduler process: node a has the wrong incarnation, b is absent.
+    Restore addresses before checking surviving data and successful deletion.
+    """
+    root = env.root / 'delete-route-fault'
+    root.mkdir()
+    with socket.socket() as control, socket.socket() as data:
+        control.bind(('127.0.0.1', 0))
+        data.bind(('127.0.0.1', 0))
+        port, data_port = control.getsockname()[1], data.getsockname()[1]
+    fault_address = f'127.0.0.1:{data_port}'
+    model = (env.root / 'full-model-a.conf').read_text().replace('INSTANCE_GENERATION=7', 'INSTANCE_GENERATION=999')
+    (root / 'model.conf').write_text(model)
+    config(root / 'scheduler.conf', dict(
+        SIMULATION_DISK_CONFIGS='model.conf', SIMULATION_DATA_PORT=data_port,
+        SIMULATION_DATA_ADDRESS=fault_address, MANAGED_STATE_SNAPSHOT_PATH=root / 'managed.pb',
+        POWER_ACTUATION_ENABLED='false'))
+    env.launch('delete-route-fault', [env.binary('scheduler_server'), f'--config={root / "scheduler.conf"}',
+                                      f'--port={port}', '--bthread_concurrency=4'])
+    def listening():
+        try:
+            with socket.create_connection(('127.0.0.1', data_port), .2):
+                return True
+        except OSError:
+            return False
+    env.wait(listening)
+    catalog = rpc(env.mds, 'MdsService', 'GetCmsNodeCatalog')
+    proposal = copy.deepcopy(catalog['nodes'])
+    for entry in proposal:
+        view = field(entry, 'placement_view', {})
+        if field(view, 'node_id') in ('full-model-a', 'full-model-b'):
+            view['address'] = fault_address
+            managed = field(entry, 'managed_view')
+            managed.pop('serviceAddress', None)
+            managed['service_address'] = fault_address
+    # Keep normal Scheduler publications from replacing the diagnostic proposal
+    # mid-request. This isolated environment is discarded after the check.
+    generation = int(field(catalog, 'scheduler_generation')) + 1000000
+    save_json(env.root / 'delete-route-fault-catalog.json', dict(
+        scheduler_generation=generation, nodes=proposal,
+        fault_process=env.processes['delete-route-fault'].pid))
+    cases = {}
+    try:
+        rpc(env.mds, 'MdsService', 'CommitCmsNodeCatalog', scheduler_generation=str(generation), nodes=proposal)
+        for node, message in [('full-model-a', 'stale logical node generation'),
+                              ('full-model-b', 'logical node not found:')]:
+            item = next(p for p in placement if p['node'] == node)
+            path = env.mount / item['path']
+            before = env.location('/' + item['path'])
+            try:
+                path.unlink()
+            except OSError as error:
+                require(error.errno == errno.EIO, f'{node}: unexpected unlink error: {error}')
+            else:
+                raise RuntimeError(f'{node}: unsafe unlink succeeded with an invalid target')
+            # The failed POSIX call must preserve the path, inode and location.
+            require(env.location('/' + item['path']) == before, f'{node}: failed unlink changed metadata')
+            try:
+                rpc(env.mds, 'MdsService', 'Unlink', path='/' + item['path'])
+            except RuntimeError as error:
+                detail = str(error)
+                require(message in detail, f'{node}: wrong rejection: {detail}')
+            else:
+                raise RuntimeError(f'{node}: direct MDS unlink unexpectedly succeeded')
+            require(env.location('/' + item['path']) == before, f'{node}: failed RPC changed metadata')
+            cases[node] = {'status': 'PASS', 'rejection': detail, 'metadata_retained': True, 'path': item['path']}
+    finally:
+        rpc(env.mds, 'MdsService', 'CommitCmsNodeCatalog', scheduler_generation=str(generation + 1), nodes=catalog['nodes'])
+    for node, case in cases.items():
+        item = next(p for p in placement if p['path'] == case['path'])
+        path = env.mount / case['path']
+        require(path.read_bytes() == b'x' * item['size'], f'{node}: data lost after rejected deletion')
+        path.unlink()
+        require(not path.exists(), f'{node}: unlink failed after route recovery')
+        case.update(data_retained=True, delete_after_recovery=True)
+    save_json(env.root / 'delete-route-failures.json', cases)
+    return cases
 
 
 def verify(env):
@@ -210,7 +295,18 @@ def verify(env):
         try:
             empty.unlink()
             require(not empty.exists() and 'empty.bin' not in os.listdir(empty.parent), f'{tier}: unlink failed')
-            unlink_results[tier] = {'status': 'PASS'}
+            nonempty = empty.with_name('delete-data.bin')
+            write(nonempty, b'delete via production MDS' * 2000)
+            location = env.location(f'/{tier}/{nonempty.name}')
+            inode = int(field(location['attr'], 'inode_id'))
+            nonempty.unlink()
+            require(not nonempty.exists() and nonempty.name not in os.listdir(nonempty.parent),
+                    f'{tier}: nonempty unlink failed')
+            if tier == 'real':
+                disk = field(location, 'disk_location')
+                backend = env.root / field(disk, 'node_id') / 'disks' / field(disk, 'disk_id')
+                require(not list(backend.rglob(f'obj-{inode}-*')), 'nonempty unlink left real data objects')
+            unlink_results[tier] = {'status': 'PASS', 'empty_file': True, 'nonempty_file': True}
         except OSError as error:
             unlink_results[tier] = {'status': 'FAIL', 'posix_error': str(error)}
             # A separate, empty diagnostic file exposes the public MDS error.
@@ -240,8 +336,11 @@ def verify(env):
                    for view in snapshots.values() for key in ('read_bytes', 'write_bytes'))
     env.wait(reported)
     save_json(env.root / 'managed-after.json', snapshots)
+    print('附加检查：错误代际与不存在节点必须拒绝删除，并保留 MDS 元数据和文件内容……', flush=True)
+    route_failures = verify_delete_route_failures(env, placement)
     return dict(status='PASS' if all(r['status'] == 'PASS' for r in unlink_results.values()) else 'FAIL',
                 read_write_status={'real': 'PASS', 'virtual': 'PASS'}, unlink=unlink_results,
+                delete_route_failures=route_failures,
                 deployment='production FUSE + MDS + Scheduler + 2 real nodes + 2 in-process model disks',
                 parallel_files=24, placement=placement, posix_checks=['create', 'concurrent write/read', 'random read',
                 'cross-object read', 'EOF', 'same-client concurrent write', 'truncate', 'empty file'],

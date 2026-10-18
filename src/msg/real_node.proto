@@ -12,6 +12,7 @@ enum StatusCode {
   STATUS_NOT_FOUND = 2;
   STATUS_IO_ERROR = 3;
   STATUS_INTERNAL_ERROR = 4;
+  STATUS_BUSY = 5;
 }
 
 message Status {
@@ -37,6 +38,7 @@ message WriteObjectRequest {
   uint64 file_mtime = 15;
   uint32 file_object_index = 16;
   bool is_replication = 17;
+  string write_lock_token = 18;
 }
 
 message WriteObjectReply {
@@ -204,12 +206,26 @@ message ResolveFileReadReply {
   repeated FileObjectSlice slices = 3;
 }
 
+// Locks belong to one primary-node process and protect one inode. No automatic
+// expiration: a slow writer must never overlap a replacement owner.
+message AcquireFileWriteLockRequest { uint64 inode_id = 1; }
+message AcquireFileWriteLockReply {
+  Status status = 1;
+  string token = 2;
+}
+message ReleaseFileWriteLockRequest {
+  uint64 inode_id = 1;
+  string token = 2;
+}
+message ReleaseFileWriteLockReply { Status status = 1; }
+
 message AllocateFileWriteRequest {
   uint64 inode_id = 1;
   uint64 offset = 2;
   uint64 size = 3;
   string disk_id = 4;
   uint64 object_unit_size_hint = 5;
+  string write_lock_token = 6;
 }
 
 message AllocateFileWriteReply {
@@ -227,6 +243,7 @@ message CommitFileWriteRequest {
   uint64 expected_version = 5;
   bool allow_create = 6;
   uint64 mtime_sec = 7;
+  string write_lock_token = 8;
 }
 
 message CommitFileWriteReply {
@@ -251,6 +268,8 @@ message InstallMigratedFileRequest {
 message InstallMigratedFileReply { Status status = 1; }
 
 service RealNodeService {
+  rpc AcquireFileWriteLock(AcquireFileWriteLockRequest) returns (AcquireFileWriteLockReply);
+  rpc ReleaseFileWriteLock(ReleaseFileWriteLockRequest) returns (ReleaseFileWriteLockReply);
   rpc WriteObject(WriteObjectRequest) returns (WriteObjectReply);
   rpc ReadObject(ReadObjectRequest) returns (ReadObjectReply);
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectReply);

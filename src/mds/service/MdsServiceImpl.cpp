@@ -22,6 +22,7 @@
 #include "real_node.pb.h"
 #include "optical_node.pb.h"
 #include "common/rpc/HandoffFiles.h"
+#include "common/rpc/LogicalNodeRoute.h"
 
 namespace zb::mds {
 
@@ -4065,6 +4066,21 @@ bool MdsServiceImpl::DeleteFileMetaOnAnchor(const zb::rpc::ReplicaLocation& anch
     zb::rpc::RealNodeService_Stub stub(channel);
     brpc::Controller cntl;
     cntl.set_timeout_ms(3000);
+    uint64_t generation = anchor.instance_generation();
+    if (generation == 0) {
+        // Only legacy physical-node metadata may omit the incarnation. Never
+        // substitute the current catalog generation for a modeled file's route.
+        zb::rpc::CmsNodeCatalogEntry node;
+        if (node_registry_ && node_registry_->GetCommittedNode(anchor.node_id(), &node) &&
+            node.placement_view().node_type() == zb::rpc::NODE_REAL &&
+            node.managed_view().spec().execution_mode() == zb::rpc::MANAGED_EXECUTION_PHYSICAL) {
+            generation = 1;
+        }
+    }
+    if (!zb::rpc_route::SetLogicalNodeRoute(&cntl, anchor.node_id(), generation)) {
+        if (error) *error = "invalid logical node route for DeleteFileMeta";
+        return false;
+    }
     zb::rpc::DeleteFileMetaRequest req;
     req.set_inode_id(inode_id);
     req.set_disk_id(anchor.disk_id());
@@ -4077,7 +4093,15 @@ bool MdsServiceImpl::DeleteFileMetaOnAnchor(const zb::rpc::ReplicaLocation& anch
         }
         return false;
     }
-    if (resp.status().code() == zb::rpc::STATUS_OK || resp.status().code() == zb::rpc::STATUS_NOT_FOUND) {
+    if (!resp.has_status()) {
+        if (error) *error = "missing DeleteFileMeta status";
+        return false;
+    }
+    // A missing node/disk is also NOT_FOUND, but does not prove this file was
+    // removed. Preserve MDS metadata unless the target confirms file absence.
+    if (resp.status().code() == zb::rpc::STATUS_OK ||
+        (resp.status().code() == zb::rpc::STATUS_NOT_FOUND &&
+         resp.status().message() == "file meta not found")) {
         return true;
     }
     if (error) {

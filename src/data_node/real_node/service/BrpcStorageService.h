@@ -1,6 +1,8 @@
 #pragma once
 
 #include "StorageServiceImpl.h"
+#include "FileWriteLocks.h"
+#include "common/concurrency/BoundedExecutor.h"
 #include "common/metrics/NodeMetricsCollector.h"
 #include "real_node.pb.h"
 
@@ -15,7 +17,18 @@ public:
                         const zb::rpc::BeginNodeDrainRequest*,
                         zb::rpc::BeginNodeDrainReply*, google::protobuf::Closure*) override;
     explicit BrpcStorageService(StorageServiceImpl* service,
-                                zb::metrics::NodeMetricsCollector* metrics = nullptr);
+                                zb::metrics::NodeMetricsCollector* metrics = nullptr,
+                                zb::concurrency::ExecutorOptions options = {},
+                                uint64_t max_request_bytes = 16ULL * 1024 * 1024);
+    ~BrpcStorageService() override;
+    void Drain() { io_.Stop(); }
+
+    void AcquireFileWriteLock(google::protobuf::RpcController*,
+        const zb::rpc::AcquireFileWriteLockRequest*, zb::rpc::AcquireFileWriteLockReply*,
+        google::protobuf::Closure*) override;
+    void ReleaseFileWriteLock(google::protobuf::RpcController*,
+        const zb::rpc::ReleaseFileWriteLockRequest*, zb::rpc::ReleaseFileWriteLockReply*,
+        google::protobuf::Closure*) override;
 
     void WriteObject(google::protobuf::RpcController* cntl_base,
                      const zb::rpc::WriteObjectRequest* request,
@@ -83,6 +96,15 @@ public:
                          google::protobuf::Closure* done) override;
 
 private:
+    FileWriteLocks file_write_locks_;
+    zb::concurrency::BoundedExecutor io_;
+    uint64_t max_request_bytes_;
+    void ReadObjectNow(google::protobuf::RpcController*, const zb::rpc::ReadObjectRequest*,
+                     zb::rpc::ReadObjectReply*, google::protobuf::Closure*);
+    void WriteObjectNow(google::protobuf::RpcController*, const zb::rpc::WriteObjectRequest*,
+                     zb::rpc::WriteObjectReply*, google::protobuf::Closure*);
+    void DeleteObjectNow(google::protobuf::RpcController*, const zb::rpc::DeleteObjectRequest*,
+                     zb::rpc::DeleteObjectReply*, google::protobuf::Closure*);
     StorageServiceImpl* service_{};
     zb::metrics::NodeMetricsCollector* metrics_{};
 };

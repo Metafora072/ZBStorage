@@ -67,7 +67,24 @@ NodeConfig NodeConfig::LoadFromFile(const std::string& path, std::string* error)
         }
         std::string key = Trim(trimmed.substr(0, eq));
         std::string value = Trim(trimmed.substr(eq + 1));
-        if (key == "ZB_DISKS") {
+        if (key == "IO_WORKER_THREADS" || key == "IO_QUEUE_DEPTH" || key == "DISK_MAX_INFLIGHT" ||
+            key == "IO_MAX_INFLIGHT_BYTES" || key == "MAX_OBJECT_IO_BYTES") {
+            try {
+                size_t consumed = 0;
+                const uint64_t n = std::stoull(value, &consumed);
+                if (value.empty() || value[0] == '-' || consumed != value.size() || !n ||
+                    ((key == "IO_WORKER_THREADS" || key == "IO_QUEUE_DEPTH" || key == "DISK_MAX_INFLIGHT") && n > 65536))
+                    throw std::invalid_argument("invalid limit");
+                if (key == "IO_WORKER_THREADS") cfg.io_workers = n;
+                if (key == "IO_QUEUE_DEPTH") cfg.io_queue_depth = n;
+                if (key == "DISK_MAX_INFLIGHT") cfg.disk_max_inflight = n;
+                if (key == "IO_MAX_INFLIGHT_BYTES") cfg.io_max_inflight_bytes = n;
+                if (key == "MAX_OBJECT_IO_BYTES") cfg.max_object_io_bytes = n;
+            } catch (const std::exception&) {
+                if (error) *error = "Invalid " + key + " at line " + std::to_string(line_no);
+                return {};
+            }
+        } else if (key == "ZB_DISKS") {
             cfg.disks_env = value;
         } else if (key == "DATA_ROOT") {
             cfg.data_root = value;

@@ -1,103 +1,64 @@
 #include "IOExecutor.h"
-
-#include <filesystem>
-#include <fstream>
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <limits>
+#include <unistd.h>
 
 namespace zb::real_node {
-
-zb::msg::Status IOExecutor::Write(const std::string& path,
-                                 uint64_t offset,
-                                 const std::string& data,
-                                 uint64_t* bytes_written) {
-    if (path.empty()) {
-        return zb::msg::Status::InvalidArgument("Empty path");
+namespace {
+struct File { int fd; ~File() { if (fd >= 0) ::close(fd); } };
+zb::msg::Status Error(const std::string& what) {
+    const int code = errno;
+    return code == ENOENT ? zb::msg::Status::NotFound(what + ": " + std::strerror(code))
+                         : zb::msg::Status::IoError(what + ": " + std::strerror(code));
+}
+bool Range(uint64_t offset, uint64_t size) {
+    const auto max = static_cast<uint64_t>(std::numeric_limits<off_t>::max());
+    return offset <= max && size <= max - offset && size <= std::numeric_limits<size_t>::max();
+}
+}
+zb::msg::Status IOExecutor::Write(const std::string& path, uint64_t offset,
+                                 const std::string& data, uint64_t* written) {
+    if (written) *written = 0;
+    if (path.empty() || !Range(offset, data.size())) return zb::msg::Status::InvalidArgument("invalid write range");
+    File file{::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0644)};
+    if (file.fd < 0) return Error("open " + path);
+    size_t pos = 0;
+    while (pos < data.size()) {
+        auto n = ::pwrite(file.fd, data.data() + pos,
+                          std::min<size_t>(data.size() - pos, 1024 * 1024), offset + pos);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) return Error("pwrite " + path);
+        if (n == 0) return zb::msg::Status::IoError("pwrite made no progress");
+        pos += n; if (written) *written = pos;
     }
-    if (bytes_written) {
-        *bytes_written = 0;
-    }
-
-    std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
-    if (!file.is_open()) {
-        file.clear();
-        file.open(path, std::ios::out | std::ios::binary);
-        if (!file.is_open()) {
-            return zb::msg::Status::IoError("Failed to create file: " + path);
-        }
-        file.close();
-        file.open(path, std::ios::in | std::ios::out | std::ios::binary);
-        if (!file.is_open()) {
-            return zb::msg::Status::IoError("Failed to open file: " + path);
-        }
-    }
-
-    file.seekp(static_cast<std::streamoff>(offset));
-    if (!file.good()) {
-        return zb::msg::Status::IoError("Failed to seek file: " + path);
-    }
-
-    file.write(data.data(), static_cast<std::streamsize>(data.size()));
-    if (!file.good()) {
-        return zb::msg::Status::IoError("Failed to write file: " + path);
-    }
-
-    if (bytes_written) {
-        *bytes_written = data.size();
-    }
+    int fd = file.fd; file.fd = -1;
+    if (::close(fd)) return Error("close " + path);
     return zb::msg::Status::Ok();
 }
-
-zb::msg::Status IOExecutor::Read(const std::string& path,
-                                uint64_t offset,
-                                uint64_t size,
-                                std::string* out,
-                                uint64_t* bytes_read) {
-    if (path.empty()) {
-        return zb::msg::Status::InvalidArgument("Empty path");
-    }
-    if (!out) {
-        return zb::msg::Status::InvalidArgument("Output buffer is null");
-    }
-    if (bytes_read) {
-        *bytes_read = 0;
-    }
-
-    std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) {
-        return zb::msg::Status::NotFound("File not found: " + path);
-    }
-
-    file.seekg(static_cast<std::streamoff>(offset));
-    if (!file.good()) {
-        return zb::msg::Status::IoError("Failed to seek file: " + path);
-    }
-
+zb::msg::Status IOExecutor::Read(const std::string& path, uint64_t offset, uint64_t size,
+                                std::string* out, uint64_t* read) {
+    if (read) *read = 0;
+    if (!out || path.empty() || !Range(offset, size)) return zb::msg::Status::InvalidArgument("invalid read range");
+    File file{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
+    if (file.fd < 0) return Error("open " + path);
     out->assign(size, '\0');
-    file.read(out->data(), static_cast<std::streamsize>(size));
-    std::streamsize read_bytes = file.gcount();
-    if (read_bytes < 0) {
-        return zb::msg::Status::IoError("Failed to read file: " + path);
+    size_t pos = 0;
+    while (pos < size) {
+        auto n = ::pread(file.fd, out->data() + pos, std::min<uint64_t>(size - pos, 1024 * 1024), offset + pos);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { out->resize(pos); return Error("pread " + path); }
+        if (n == 0) break;
+        pos += n; if (read) *read = pos;
     }
-    out->resize(static_cast<size_t>(read_bytes));
-    if (bytes_read) {
-        *bytes_read = static_cast<uint64_t>(read_bytes);
-    }
-
+    out->resize(pos);
     return zb::msg::Status::Ok();
 }
-
 zb::msg::Status IOExecutor::Delete(const std::string& path) {
-    if (path.empty()) {
-        return zb::msg::Status::InvalidArgument("Empty path");
-    }
-    std::error_code ec;
-    bool removed = std::filesystem::remove(path, ec);
-    if (ec) {
-        return zb::msg::Status::IoError("Failed to delete file: " + path + ", error=" + ec.message());
-    }
-    if (!removed) {
-        return zb::msg::Status::NotFound("File not found: " + path);
-    }
+    if (path.empty()) return zb::msg::Status::InvalidArgument("empty path");
+    if (::unlink(path.c_str())) return Error("unlink " + path);
     return zb::msg::Status::Ok();
 }
-
-} // namespace zb::real_node
+}

@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include "common/concurrency/KeyedLocks.h"
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -175,6 +176,10 @@ private:
     bool LoadFileMetaStoreLocked(std::string* error) const;
     bool PersistFileMetaStoreLocked(std::string* error) const;
 
+    mutable std::shared_mutex maintenance_mu_;
+    std::atomic<uint64_t> next_repair_generation_{1};
+    zb::concurrency::KeyedLocks object_locks_;
+    mutable std::atomic<uint64_t> next_txid_{1};
     DiskManager* disk_manager_{};
     mutable std::shared_mutex write_admission_mu_;
     std::atomic<bool> write_admission_closed_{false};

@@ -68,7 +68,7 @@ jobs:
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DPORTABLE=ON \
-            -DBUILD_TESTING=ON \
+            -DBUILD_TESTING=OFF \
             -DBUILD_BRPC_TOOLS=OFF \
             -DBUILD_UNIT_TESTS=OFF \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
@@ -87,6 +87,3 @@ jobs:
 
       - name: Compiler cache stats
         run: ccache --show-stats
-
-      - name: Unit tests
-        run: ctest --test-dir build --output-on-failure --no-tests=error

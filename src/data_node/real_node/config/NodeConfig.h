@@ -17,6 +17,9 @@ struct NodeConfig {
     std::string data_root;
     std::string disk_base_dir;
     uint32_t disk_count{0};
+    uint32_t io_workers{8}, io_queue_depth{256}, disk_max_inflight{4};
+    uint64_t io_max_inflight_bytes{64ULL * 1024 * 1024};
+    uint64_t max_object_io_bytes{16ULL * 1024 * 1024};
     uint64_t disk_capacity_bytes{0};
     uint64_t disk_read_bytes_per_sec{200ULL * 1000ULL * 1000ULL};
     uint64_t disk_write_bytes_per_sec{200ULL * 1000ULL * 1000ULL};

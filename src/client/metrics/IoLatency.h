@@ -28,7 +28,7 @@ struct IoLatencyRecord {
     int ret{0};
     StorageTier storage_tier{StorageTier::Unknown};
     uint64_t mds_ns{0};
-    uint64_t data_node_ns{0};
+    uint64_t data_node_ns{0}; // Sum of RPC durations; parallel calls overlap in total_ns.
     uint64_t total_ns{0};
 };
 

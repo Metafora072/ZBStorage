@@ -263,6 +263,7 @@ ReplicationStatusSnapshot StorageServiceImpl::GetReplicationStatus() const {
 }
 
 zb::msg::WriteObjectReply StorageServiceImpl::WriteObject(const zb::msg::WriteObjectRequest& request) {
+    std::shared_lock<std::shared_mutex> maintenance_guard(maintenance_mu_);
     zb::msg::WriteObjectReply reply;
     std::shared_lock<std::shared_mutex> admission(write_admission_mu_);
     if (write_admission_closed_) {
@@ -274,6 +275,8 @@ zb::msg::WriteObjectReply StorageServiceImpl::WriteObject(const zb::msg::WriteOb
         return reply;
     }
     const std::string object_id = request.ArchiveObjectId();
+    auto object_mutex = object_locks_.Get(request.disk_id + "|" + object_id);
+    std::unique_lock<std::shared_mutex> object_guard(*object_mutex);
     if (request.disk_id.empty() || object_id.empty()) {
         reply.status = zb::msg::Status::InvalidArgument("disk_id or object_id is empty");
         return reply;
@@ -288,6 +291,14 @@ zb::msg::WriteObjectReply StorageServiceImpl::WriteObject(const zb::msg::WriteOb
         request.epoch > 0 && request.epoch < repl_snapshot.epoch) {
         reply.status = zb::msg::Status::IoError("STALE_EPOCH");
         return reply;
+    }
+
+    {
+        std::lock_guard<std::mutex> repair_guard(repl_repair_mu_);
+        if (repl_repair_generation_.count(request.disk_id + "|" + object_id)) {
+            reply.status = zb::msg::Status::IoError("object replication repair pending");
+            return reply;
+        }
     }
 
     std::string mount_point = disk_manager_->GetMountPoint(request.disk_id);
@@ -339,12 +350,15 @@ zb::msg::WriteObjectReply StorageServiceImpl::WriteObject(const zb::msg::WriteOb
 }
 
 zb::msg::ReadObjectReply StorageServiceImpl::ReadObject(const zb::msg::ReadObjectRequest& request) {
+    std::shared_lock<std::shared_mutex> maintenance_guard(maintenance_mu_);
     zb::msg::ReadObjectReply reply;
     if (!disk_manager_ || !path_resolver_ || !io_executor_) {
         reply.status = zb::msg::Status::InternalError("Service not initialized");
         return reply;
     }
     const std::string object_id = request.ArchiveObjectId();
+    auto object_mutex = object_locks_.Get(request.disk_id + "|" + object_id);
+    std::shared_lock<std::shared_mutex> object_guard(*object_mutex);
     if (request.disk_id.empty() || object_id.empty()) {
         reply.status = zb::msg::Status::InvalidArgument("disk_id or object_id is empty");
         return reply;
@@ -379,15 +393,26 @@ zb::msg::ReadArchivedFileReply StorageServiceImpl::ReadArchivedFile(const zb::ms
 }
 
 zb::msg::DeleteObjectReply StorageServiceImpl::DeleteObject(const zb::msg::DeleteObjectRequest& request) {
+    std::shared_lock<std::shared_mutex> maintenance_guard(maintenance_mu_);
     zb::msg::DeleteObjectReply reply;
     if (!disk_manager_ || !path_resolver_ || !io_executor_) {
         reply.status = zb::msg::Status::InternalError("Service not initialized");
         return reply;
     }
     const std::string object_id = request.ArchiveObjectId();
+    auto object_mutex = object_locks_.Get(request.disk_id + "|" + object_id);
+    std::unique_lock<std::shared_mutex> object_guard(*object_mutex);
     if (request.disk_id.empty() || object_id.empty()) {
         reply.status = zb::msg::Status::InvalidArgument("disk_id or object_id is empty");
         return reply;
+    }
+
+    {
+        std::lock_guard<std::mutex> repair_guard(repl_repair_mu_);
+        if (repl_repair_generation_.count(request.disk_id + "|" + object_id)) {
+            reply.status = zb::msg::Status::IoError("object replication repair pending");
+            return reply;
+        }
     }
 
     std::string mount_point = disk_manager_->GetMountPoint(request.disk_id);
@@ -445,6 +470,7 @@ zb::msg::Status StorageServiceImpl::DeleteObject(const zb::data_node::ObjectDele
 }
 
 zb::msg::ResetNodeDataReply StorageServiceImpl::ResetNodeData(const zb::msg::ResetNodeDataRequest& request) {
+    std::unique_lock<std::shared_mutex> maintenance_guard(maintenance_mu_);
     zb::msg::ResetNodeDataReply reply;
     if (request.confirm_token != "RESET_NODE_DATA") {
         reply.status = zb::msg::Status::InvalidArgument("confirm_token must be RESET_NODE_DATA");
@@ -662,7 +688,7 @@ zb::msg::DeleteFileMetaReply StorageServiceImpl::DeleteFileMeta(const zb::msg::D
         reply.status = zb::msg::Status::InvalidArgument("disk_id is empty when purge_objects=true");
         return reply;
     }
-    std::lock_guard<std::mutex> lock(file_meta_mu_);
+    std::unique_lock<std::mutex> lock(file_meta_mu_);
     std::string load_error;
     if (!file_meta_loaded_) {
         if (!InitFileMetaStorePath() || !LoadFileMetaStoreLocked(&load_error)) {
@@ -678,6 +704,7 @@ zb::msg::DeleteFileMetaReply StorageServiceImpl::DeleteFileMeta(const zb::msg::D
     const zb::msg::FileMeta old = it->second;
 
     if (request.purge_objects) {
+        lock.unlock();
         const uint64_t object_unit_size = old.object_unit_size > 0 ? old.object_unit_size : kDefaultObjectUnitSize;
         if (object_unit_size == 0) {
             reply.status = zb::msg::Status::IoError("object_unit_size is zero");
@@ -697,10 +724,11 @@ zb::msg::DeleteFileMetaReply StorageServiceImpl::DeleteFileMeta(const zb::msg::D
         }
     }
 
+    if (!lock.owns_lock()) lock.lock();
     const auto tx_old_it = last_commit_txid_by_inode_.find(request.inode_id);
     const bool had_old_tx = tx_old_it != last_commit_txid_by_inode_.end();
     const std::string old_txid = had_old_tx ? tx_old_it->second : std::string();
-    file_meta_by_inode_.erase(it);
+    file_meta_by_inode_.erase(request.inode_id);
     last_commit_txid_by_inode_.erase(request.inode_id);
     std::string persist_error;
     if (!PersistFileMetaStoreLocked(&persist_error)) {
@@ -718,6 +746,7 @@ zb::msg::DeleteFileMetaReply StorageServiceImpl::DeleteFileMeta(const zb::msg::D
 }
 
 zb::msg::ResolveFileReadReply StorageServiceImpl::ResolveFileRead(const zb::msg::ResolveFileReadRequest& request) const {
+    std::shared_lock<std::shared_mutex> maintenance_guard(maintenance_mu_);
     zb::msg::ResolveFileReadReply reply;
     if (request.inode_id == 0) {
         reply.status = zb::msg::Status::InvalidArgument("inode_id is empty");
@@ -760,6 +789,7 @@ zb::msg::ResolveFileReadReply StorageServiceImpl::ResolveFileRead(const zb::msg:
 
 zb::msg::AllocateFileWriteReply StorageServiceImpl::AllocateFileWrite(
     const zb::msg::AllocateFileWriteRequest& request) const {
+    std::shared_lock<std::shared_mutex> maintenance_guard(maintenance_mu_);
     zb::msg::AllocateFileWriteReply reply;
     std::shared_lock<std::shared_mutex> admission(write_admission_mu_);
     if (write_admission_closed_) {
@@ -801,12 +831,13 @@ zb::msg::AllocateFileWriteReply StorageServiceImpl::AllocateFileWrite(
         BuildObjectSlices(request.inode_id, request.offset, request.size, object_unit_size, request.disk_id, &reply.slices);
     }
     reply.txid = "tx-" + std::to_string(request.inode_id) + "-" + std::to_string(NowMilliseconds()) + "-" +
-                 std::to_string(request.offset) + "-" + std::to_string(request.size);
+                 std::to_string(request.offset) + "-" + std::to_string(next_txid_.fetch_add(1));
     reply.status = zb::msg::Status::Ok();
     return reply;
 }
 
 zb::msg::CommitFileWriteReply StorageServiceImpl::CommitFileWrite(const zb::msg::CommitFileWriteRequest& request) {
+    std::shared_lock<std::shared_mutex> maintenance_guard(maintenance_mu_);
     zb::msg::CommitFileWriteReply reply;
     std::shared_lock<std::shared_mutex> admission(write_admission_mu_);
     if (write_admission_closed_) {
@@ -1069,7 +1100,7 @@ zb::msg::Status StorageServiceImpl::ReplicateWriteToSecondary(const zb::msg::Wri
 void StorageServiceImpl::EnqueueReplicationRepair(const zb::msg::WriteObjectRequest& request, uint64_t epoch) {
     std::lock_guard<std::mutex> lock(repl_repair_mu_);
     const std::string key = BuildReplicationRepairKey(request);
-    uint64_t generation = 1;
+    uint64_t generation = next_repair_generation_.fetch_add(1);
     auto gen_it = repl_repair_generation_.find(key);
     if (gen_it != repl_repair_generation_.end()) {
         generation = gen_it->second;
@@ -1105,13 +1136,12 @@ uint64_t StorageServiceImpl::BumpReplicationRepairGeneration(const zb::msg::Writ
     std::lock_guard<std::mutex> lock(repl_repair_mu_);
     const std::string key = BuildReplicationRepairKey(request);
     uint64_t& generation = repl_repair_generation_[key];
-    generation += 1;
+    generation = next_repair_generation_.fetch_add(1);
     return generation;
 }
 
 std::string StorageServiceImpl::BuildReplicationRepairKey(const zb::msg::WriteObjectRequest& request) {
-    return request.disk_id + "|" + request.ArchiveObjectId() + "|" +
-           std::to_string(request.offset) + "|" + std::to_string(request.data.size());
+    return request.disk_id + "|" + request.ArchiveObjectId();
 }
 
 void StorageServiceImpl::ReplicationRepairLoop() {
@@ -1133,6 +1163,14 @@ void StorageServiceImpl::ReplicationRepairLoop() {
             }
         }
 
+        std::shared_lock<std::shared_mutex> maintenance_guard(maintenance_mu_);
+        auto object_mutex = object_locks_.Get(task.key);
+        std::unique_lock<std::shared_mutex> object_guard(*object_mutex);
+        {
+            std::lock_guard<std::mutex> guard(repl_repair_mu_);
+            auto it = repl_repair_generation_.find(task.key);
+            if (it == repl_repair_generation_.end() || it->second != task.generation) continue;
+        }
         zb::msg::Status status = ReplicateWriteToSecondary(task.request, task.epoch);
         if (status.ok()) {
             std::lock_guard<std::mutex> lock(repl_repair_mu_);
@@ -1151,6 +1189,8 @@ void StorageServiceImpl::ReplicationRepairLoop() {
             continue;
         }
 
+        object_guard.unlock();
+        maintenance_guard.unlock();
         ++task.attempts;
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kReplicationRepairRetryIntervalMs * static_cast<int>(task.attempts)));

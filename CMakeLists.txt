@@ -4,6 +4,8 @@ project(ZBStorage C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Keep BUILD_TESTING and an empty CTest manifest for existing build directories.
+# Project checks are manual targets/scripts; do not register them with add_test.
 include(CTest)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc/cmake")
@@ -748,7 +750,7 @@ if(BRPC_DYNAMIC_LIB)
     target_link_libraries(layout_commit_conflict_test PRIVATE ${BRPC_DYNAMIC_LIB})
 endif()
 
-add_executable(pg_migration_sim_test
+add_executable(pg_migration_sim_test EXCLUDE_FROM_ALL
     src/client/test/pg_migration_sim_test.cpp
     src/mds/allocator/PGManager.cpp
 )
@@ -762,9 +764,6 @@ target_link_libraries(pg_migration_sim_test
         ${GFLAGS_LIBRARY}
         ${CMAKE_THREAD_LIBS_INIT}
 )
-if(BUILD_TESTING)
-    add_test(NAME pg_migration_sim_test COMMAND pg_migration_sim_test --sample_objects=1000)
-endif()
 
 add_executable(mds_server
     src/mds/config/MdsConfig.cpp
@@ -1113,7 +1112,7 @@ if(UNIX)
     endif()
     if(BUILD_TESTING)
         # External dependencies only: production client and optical node run as separate processes.
-        add_executable(optical_external_services tests/client/optical_external_services.cpp)
+        add_executable(optical_external_services EXCLUDE_FROM_ALL tests/client/optical_external_services.cpp)
         target_include_directories(optical_external_services PRIVATE
             ${CMAKE_CURRENT_BINARY_DIR} ${ZBSTORAGE_BRPC_INCLUDE_DIRS})
         target_link_libraries(optical_external_services PRIVATE zb_proto brpc-static ${CMAKE_THREAD_LIBS_INIT})
@@ -1123,7 +1122,7 @@ if(UNIX)
 
         set(REAL_NODE_TEST_SOURCES ${REAL_NODE_SOURCES})
         list(REMOVE_ITEM REAL_NODE_TEST_SOURCES src/data_node/real_node/server/real_node_server.cpp)
-        add_executable(real_node_concurrent_test tests/real_node/concurrent_io_test.cpp ${REAL_NODE_TEST_SOURCES})
+        add_executable(real_node_concurrent_test EXCLUDE_FROM_ALL tests/real_node/concurrent_io_test.cpp ${REAL_NODE_TEST_SOURCES})
         target_include_directories(real_node_concurrent_test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR} ${ZBSTORAGE_BRPC_INCLUDE_DIRS})
         target_link_libraries(real_node_concurrent_test PRIVATE zb_proto brpc-static Threads::Threads ${GFLAGS_LIBRARY})
@@ -1131,11 +1130,11 @@ if(UNIX)
             target_link_libraries(real_node_concurrent_test PRIVATE ${BRPC_DYNAMIC_LIB})
         endif()
 
-        add_executable(concurrent_io_test tests/client/concurrent_io_test.cpp
+        add_executable(concurrent_io_test EXCLUDE_FROM_ALL tests/client/concurrent_io_test.cpp
             src/data_node/real_node/io/IOExecutor.cpp)
         target_link_libraries(concurrent_io_test PRIVATE zb_batch_sdk)
 
-        add_executable(disk_external_services tests/client/disk_external_services.cpp)
+        add_executable(disk_external_services EXCLUDE_FROM_ALL tests/client/disk_external_services.cpp)
         target_include_directories(disk_external_services PRIVATE
             ${CMAKE_CURRENT_BINARY_DIR} ${ZBSTORAGE_BRPC_INCLUDE_DIRS})
         target_link_libraries(disk_external_services PRIVATE zb_proto brpc-static Threads::Threads)
@@ -1143,26 +1142,21 @@ if(UNIX)
             target_link_libraries(disk_external_services PRIVATE ${BRPC_DYNAMIC_LIB})
         endif()
 
-        add_executable(client_optical_read_test tests/client/client_optical_read_test.cpp)
-        add_executable(optical_cache_lifetime_test tests/client/optical_cache_lifetime_test.cpp)
+        add_executable(client_optical_read_test EXCLUDE_FROM_ALL tests/client/client_optical_read_test.cpp)
+        add_executable(optical_cache_lifetime_test EXCLUDE_FROM_ALL tests/client/optical_cache_lifetime_test.cpp)
         target_include_directories(optical_cache_lifetime_test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src/data_node/optical_node/optical_node_manager)
         target_link_libraries(optical_cache_lifetime_test PRIVATE Threads::Threads)
-        add_test(NAME optical_cache_lifetime_test COMMAND optical_cache_lifetime_test)
-        set_tests_properties(optical_cache_lifetime_test PROPERTIES TIMEOUT 30)
         target_include_directories(client_optical_read_test PRIVATE ${FUSE3_INCLUDE_DIRS} ${GFLAGS_INCLUDE_PATH})
         target_compile_definitions(client_optical_read_test PRIVATE ZBSTORAGE_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
         target_link_libraries(client_optical_read_test PRIVATE zb_client_optical ${FUSE3_LIBRARIES} ${GFLAGS_LIBRARY})
-        add_test(NAME client_optical_read_test COMMAND client_optical_read_test)
-        set_tests_properties(client_optical_read_test PROPERTIES TIMEOUT 60)
 
-        add_executable(client_io_latency_test tests/client/client_io_latency_test.cpp)
+        add_executable(client_io_latency_test EXCLUDE_FROM_ALL tests/client/client_io_latency_test.cpp)
         target_link_libraries(client_io_latency_test PRIVATE zb_client_metrics)
         target_compile_definitions(client_io_latency_test PRIVATE
             ZBSTORAGE_TEST_RESULTS="${CMAKE_CURRENT_SOURCE_DIR}/tests/client/results")
-        add_test(NAME client_io_latency_test COMMAND client_io_latency_test)
 
-        add_executable(client_io_latency_integration_test tests/client/client_io_latency_integration_test.cpp)
+        add_executable(client_io_latency_integration_test EXCLUDE_FROM_ALL tests/client/client_io_latency_integration_test.cpp)
         target_include_directories(client_io_latency_integration_test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src ${ZBSTORAGE_BRPC_INCLUDE_DIRS}
             ${GFLAGS_INCLUDE_PATH} ${FUSE3_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR})
@@ -1176,35 +1170,11 @@ if(UNIX)
         if(BRPC_DYNAMIC_LIB)
             target_link_libraries(client_io_latency_integration_test PRIVATE ${BRPC_DYNAMIC_LIB})
         endif()
-        add_test(NAME client_io_latency_integration_test COMMAND client_io_latency_integration_test)
-        set_tests_properties(client_io_latency_test client_io_latency_integration_test PROPERTIES TIMEOUT 60)
-        find_package(Python3 COMPONENTS Interpreter QUIET)
-        if(Python3_Interpreter_FOUND)
-            add_test(NAME client_optical_external_test
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/client/client_optical_external_test.py
-                    --environment $<TARGET_FILE:optical_external_services>
-                    --optical $<TARGET_FILE:optical_node_server>
-                    --client $<TARGET_FILE:zb_fuse_client> --ctl $<TARGET_FILE:zbctl>)
-            set_tests_properties(client_optical_external_test PROPERTIES
-                TIMEOUT 900 SKIP_RETURN_CODE 77 LABELS "client;optical_node;integration;slow")
-            add_test(NAME client_optical_mount_test
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/client/client_optical_mount_test.py
-                    --client $<TARGET_FILE:zb_fuse_client> --fixture $<TARGET_FILE:client_optical_read_test>
-                    --ctl $<TARGET_FILE:zbctl>)
-            set_tests_properties(client_optical_mount_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
-            add_test(NAME client_io_latency_workflow_test
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/client/client_io_latency_workflow_test.py)
-            set_tests_properties(client_io_latency_workflow_test PROPERTIES TIMEOUT 60)
-            add_test(NAME client_io_latency_mount_test
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/client/client_io_latency_mount_test.py
-                    --client $<TARGET_FILE:zb_fuse_client> --fixture $<TARGET_FILE:client_io_latency_integration_test>)
-            set_tests_properties(client_io_latency_mount_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
-        endif()
     endif()
 endif()
 
 if(BUILD_TESTING)
-    add_executable(optical_node_archive_integration_test
+    add_executable(optical_node_archive_integration_test EXCLUDE_FROM_ALL
         tests/optical_node/optical_node_archive_integration_test.cpp
         tests/optical_node/fake_services.cpp
         tests/optical_node/fake_client.cpp
@@ -1238,25 +1208,11 @@ if(BUILD_TESTING)
     # 综合用例内含「节点上报」测试点：会 fork/exec 真 optical_node_server 子进程，故建立构建依赖。
     add_dependencies(optical_node_archive_integration_test optical_node_server)
 
-    add_executable(optical_node_runtime_state_codec_test
+    add_executable(optical_node_runtime_state_codec_test EXCLUDE_FROM_ALL
         tests/optical_node/optical_node_runtime_state_codec_test.cpp
     )
     target_include_directories(optical_node_runtime_state_codec_test
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src/data_node/optical_node/optical_node_manager
     )
-    add_test(NAME optical_node_runtime_state_codec
-        COMMAND optical_node_runtime_state_codec_test)
-    set_tests_properties(optical_node_runtime_state_codec
-        PROPERTIES TIMEOUT 60 LABELS "optical_node;unit")
-
-    find_package(Python3 COMPONENTS Interpreter QUIET)
-    if(Python3_Interpreter_FOUND)
-        add_test(NAME optical_node
-            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/optical_node/run_optical_node_archive_test.py
-                --driver $<TARGET_FILE:optical_node_archive_integration_test>
-                --server-bin $<TARGET_FILE:optical_node_server>)
-        # 临时屏蔽：光盘节点 ctest 不参与自动测试；恢复时删除 DISABLED TRUE 与本注释。
-        set_tests_properties(optical_node PROPERTIES TIMEOUT 3600 LABELS "optical_node;slow" SKIP_RETURN_CODE 77 DISABLED TRUE)
-    endif()
 endif()

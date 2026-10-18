@@ -40,6 +40,7 @@ zb::msg::Status DiskManager::Init(const std::string& config_str) {
 }
 
 zb::msg::Status DiskManager::InitFromConfig(const std::string& config_str) {
+    std::unique_lock<std::shared_mutex> guard(mu_);
     use_synthetic_capacity_ = false;
     synthetic_capacity_bytes_ = 0;
     disks_.clear();
@@ -82,6 +83,7 @@ zb::msg::Status DiskManager::InitFromConfig(const std::string& config_str) {
 }
 
 zb::msg::Status DiskManager::InitFromDataRoot(const std::string& data_root) {
+    std::unique_lock<std::shared_mutex> guard(mu_);
     use_synthetic_capacity_ = false;
     synthetic_capacity_bytes_ = 0;
     disks_.clear();
@@ -121,6 +123,7 @@ zb::msg::Status DiskManager::InitFromDataRoot(const std::string& data_root) {
 zb::msg::Status DiskManager::InitFromBaseDir(const std::string& base_dir,
                                              uint32_t disk_count,
                                              uint64_t disk_capacity_bytes) {
+    std::unique_lock<std::shared_mutex> guard(mu_);
     use_synthetic_capacity_ = true;
     synthetic_capacity_bytes_ = disk_capacity_bytes;
     disks_.clear();
@@ -163,20 +166,27 @@ zb::msg::Status DiskManager::InitFromBaseDir(const std::string& base_dir,
 }
 
 zb::msg::Status DiskManager::Refresh() {
-    if (disks_.empty()) {
-        return zb::msg::Status::NotFound("No disks initialized");
+    std::unordered_map<std::string, DiskContext> snapshot;
+    bool synthetic;
+    uint64_t capacity;
+    {
+        std::shared_lock<std::shared_mutex> guard(mu_);
+        snapshot = disks_; synthetic = use_synthetic_capacity_; capacity = synthetic_capacity_bytes_;
     }
-    for (auto& [id, disk] : disks_) {
-        if (use_synthetic_capacity_) {
-            disk.is_healthy = RefreshSyntheticStats(&disk, synthetic_capacity_bytes_);
-        } else {
-            disk.is_healthy = RefreshStats(&disk);
-        }
+    if (snapshot.empty()) return zb::msg::Status::NotFound("No disks initialized");
+    for (auto& entry : snapshot) {
+        auto& disk = entry.second;
+        disk.is_healthy = synthetic ? RefreshSyntheticStats(&disk, capacity) : RefreshStats(&disk);
+    }
+    {
+        std::unique_lock<std::shared_mutex> guard(mu_);
+        disks_.swap(snapshot); // Disk membership is initialized before serving requests.
     }
     return zb::msg::Status::Ok();
 }
 
 std::string DiskManager::GetMountPoint(const std::string& disk_id) const {
+    std::shared_lock<std::shared_mutex> guard(mu_);
     auto it = disks_.find(disk_id);
     if (it == disks_.end() || !it->second.is_healthy) {
         return {};
@@ -185,11 +195,13 @@ std::string DiskManager::GetMountPoint(const std::string& disk_id) const {
 }
 
 bool DiskManager::IsHealthy(const std::string& disk_id) const {
+    std::shared_lock<std::shared_mutex> guard(mu_);
     auto it = disks_.find(disk_id);
     return it != disks_.end() && it->second.is_healthy;
 }
 
 std::vector<zb::msg::DiskReport> DiskManager::GetReport() const {
+    std::shared_lock<std::shared_mutex> guard(mu_);
     std::vector<zb::msg::DiskReport> reports;
     reports.reserve(disks_.size());
     for (const auto& [id, disk] : disks_) {

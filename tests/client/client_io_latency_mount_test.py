@@ -113,7 +113,9 @@ finally:
                             for row in rows:
                                 assert int(row["ret"]) == 8, row
                                 assert float(row["mds_us"]) > 0 and float(row["data_node_us"]) > 0, row
-                                assert float(row["total_us"]) >= float(row["mds_us"]) + float(row["data_node_us"]), row
+                                # Data RPC durations overlap with parallel slices. Metadata RPCs here
+                                # remain serial; only their sum is bounded by the request wall time.
+                                assert float(row["total_us"]) >= float(row["mds_us"]), row
                             validate_shutdown(client.returncode, sigterm_sent, log_path.read_text(), len(rows))
                             if explicit:
                                 assert not (output / "client/metrics").exists()

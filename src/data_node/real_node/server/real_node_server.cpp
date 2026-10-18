@@ -358,7 +358,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     zb::metrics::NodeMetricsCollector node_metrics;
-    zb::real_node::BrpcStorageService brpc_service(&storage_service, &node_metrics);
+    zb::real_node::BrpcStorageService brpc_service(&storage_service, &node_metrics,
+        {cfg.io_workers, cfg.io_queue_depth, cfg.disk_max_inflight, cfg.io_max_inflight_bytes},
+        cfg.max_object_io_bytes);
 
     brpc::Server server;
     if (server.AddService(&brpc_service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {

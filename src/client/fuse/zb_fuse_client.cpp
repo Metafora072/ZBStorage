@@ -30,6 +30,8 @@
 #include <vector>
 
 #include "client/metrics/IoLatency.h"
+#include "client/data/ParallelIoExecutor.h"
+#include <brpc/errno.pb.h>
 #include "common/rpc/LogicalNodeRoute.h"
 #include "mds.pb.h"
 #include "optical_node.pb.h"
@@ -53,6 +55,12 @@ DEFINE_int32(optical_rpc_timeout_ms, 3000, "Timeout for each optical RPC, not ba
 DEFINE_uint32(optical_read_chunk_bytes, 0, "Optional client chunk limit; 0 uses the server limit");
 DEFINE_uint32(optical_read_wait_ms, 120000,
               "Maximum wait for an asynchronous optical read task");
+DEFINE_bool(data_route_log, false, "Log logical data-node routing and RPC results");
+DEFINE_bool(client_direct_io, false, "Bypass FUSE page cache for I/O measurement");
+DEFINE_uint32(disk_io_workers, 8, "Client disk object RPC workers");
+DEFINE_uint32(disk_io_per_node, 4, "Concurrent object RPCs per disk node");
+DEFINE_uint32(disk_io_queue_depth, 256, "Queued disk object RPC limit");
+DEFINE_uint64(disk_io_buffer_bytes, 67108864, "Disk object RPC buffer budget");
 DEFINE_int32(max_retry, 0, "RPC max retry");
 DEFINE_bool(bootstrap_tier_dirs, true, "Create and configure tier-specific subdirectories on mount");
 DEFINE_string(real_dir_name, "real", "Top-level directory for real-node backed POSIX files");
@@ -119,30 +127,14 @@ void LogMdsFailure(const char* op, const char* path, const zb::rpc::MdsStatus& s
               << std::endl;
 }
 
+int StatusToErrno(const zb::rpc::Status& status);
+
 void LogDataFailure(const char* op,
                     const char* path,
                     uint64_t inode_id,
                     const zb::rpc::ReplicaLocation& anchor,
                     const zb::rpc::Status& status) {
-    int mapped_errno = EIO;
-    switch (status.code()) {
-        case zb::rpc::STATUS_OK:
-            mapped_errno = 0;
-            break;
-        case zb::rpc::STATUS_INVALID_ARGUMENT:
-            mapped_errno = EINVAL;
-            break;
-        case zb::rpc::STATUS_NOT_FOUND:
-            mapped_errno = ENOENT;
-            break;
-        case zb::rpc::STATUS_IO_ERROR:
-            mapped_errno = (status.message() == "VERSION_MISMATCH") ? EAGAIN : EIO;
-            break;
-        case zb::rpc::STATUS_INTERNAL_ERROR:
-        default:
-            mapped_errno = EIO;
-            break;
-    }
+    const int mapped_errno = StatusToErrno(status);
     std::cerr << "[fuse] " << op
               << " failed: path=" << (path ? path : "")
               << " inode_id=" << inode_id
@@ -194,6 +186,15 @@ std::string BuildTierRootPath(const std::string& dir_name) {
 }
 
 int StatusToErrno(const zb::rpc::Status& status) {
+    if (status.code() != zb::rpc::STATUS_OK) {
+        if (status.message() == "stale logical node generation") return ESTALE;
+        if (status.message().rfind("logical node not found:", 0) == 0 ||
+            status.message() == "logical node is not registered or was retired") return ENODEV;
+        if (status.message() == "MODEL_IO_QUEUE_FULL" ||
+            status.message() == "MODEL_CATALOG_NOT_CONFIRMED") return EAGAIN;
+        if (status.message() == "MODEL_IO_INJECTED_TIMEOUT" ||
+            status.message() == "RPC_TIMEOUT") return ETIMEDOUT;
+    }
     switch (status.code()) {
         case zb::rpc::STATUS_OK:
             return 0;
@@ -201,6 +202,8 @@ int StatusToErrno(const zb::rpc::Status& status) {
             return EINVAL;
         case zb::rpc::STATUS_NOT_FOUND:
             return ENOENT;
+        case zb::rpc::STATUS_BUSY:
+            return EAGAIN;
         case zb::rpc::STATUS_IO_ERROR:
             if (status.message() == "VERSION_MISMATCH") {
                 return EAGAIN;
@@ -210,6 +213,12 @@ int StatusToErrno(const zb::rpc::Status& status) {
         default:
             return EIO;
     }
+}
+
+bool IsMissingFileMeta(const zb::rpc::Status& status) {
+    // NOT_FOUND may also mean a removed logical node or missing disk. Only a
+    // specifically absent file-meta entry permits bootstrap/read reconstruction.
+    return status.code() == zb::rpc::STATUS_NOT_FOUND && status.message() == "file meta not found";
 }
 
 void FillStat(const zb::rpc::InodeAttr& attr, struct stat* st) {
@@ -918,6 +927,19 @@ private:
     zb::rpc::SchedulerService_Stub stub_{&channel_};
 };
 
+struct NodeEndpoint {
+    std::string node_id;  // Exact logical identity requested by MDS, even for legacy aliases.
+    std::string address;
+    zb::rpc::NodeType node_type{zb::rpc::NODE_REAL};
+};
+
+int DataRpcErrno(const brpc::Controller& controller) {
+    if (controller.ErrorCode() == brpc::ELIMIT) return EAGAIN;
+    if (controller.ErrorCode() == ETIMEDOUT || controller.ErrorCode() == brpc::ERPCTIMEDOUT)
+        return ETIMEDOUT;
+    return EIO;
+}
+
 class DataNodeClient {
 public:
     using NodeAddressResolver = std::function<bool(const std::string&, std::string*)>;
@@ -926,9 +948,79 @@ public:
         resolver_ = std::move(resolver);
     }
 
-    bool Write(const zb::rpc::ReplicaLocation& replica, uint64_t offset, const std::string& data, std::string* error, IoTraceContext* trace = nullptr) {
-        std::vector<std::string> addresses = CollectAddresses(replica, resolver_);
-        if (addresses.empty()) {
+    using EndpointResolver = std::function<bool(const std::string&, NodeEndpoint*)>;
+    void SetNodeEndpointResolver(EndpointResolver resolver) { endpoint_resolver_ = std::move(resolver); }
+
+    struct DataRoute {
+        NodeEndpoint endpoint;
+        uint64_t generation{1};
+        bool Attach(brpc::Controller* controller) const {
+            return zb::rpc_route::SetLogicalNodeRoute(controller, endpoint.node_id, generation);
+        }
+    };
+
+    // One instance per file mutation, retained until every slice has joined and
+    // the metadata update has finished. Never move a locked write to a replica.
+    class WriteLock {
+    public:
+        WriteLock(DataNodeClient& client, const zb::rpc::ReplicaLocation& anchor,
+                  uint64_t inode, IoTraceContext* trace = nullptr)
+            : client_(client), anchor_(anchor), inode_(inode), trace_(trace) {}
+        WriteLock(const WriteLock&) = delete;
+        WriteLock& operator=(const WriteLock&) = delete;
+        int Acquire() {
+            if (!token.empty()) return EINVAL;
+            const auto routes = client_.CollectRoutes(anchor_, true);
+            if (routes.empty()) return EIO;
+            route = routes.front();
+            if (anchor_.storage_tier() == zb::rpc::STORAGE_TIER_OPTICAL ||
+                route.endpoint.node_type == zb::rpc::NODE_VIRTUAL_POOL) return 0;
+            if (route.endpoint.node_type != zb::rpc::NODE_REAL) return EINVAL;
+            channel_ = client_.GetChannel(route.endpoint.address);
+            if (!channel_) return EIO;
+            zb::rpc::AcquireFileWriteLockRequest req;
+            req.set_inode_id(inode_);
+            zb::rpc::AcquireFileWriteLockReply reply;
+            brpc::Controller cntl;
+            cntl.set_max_retry(0);
+            if (!route.Attach(&cntl)) return EINVAL;
+            zb::rpc::RealNodeService_Stub stub(channel_);
+            RpcLatencyScope timing(trace_, RpcTarget::DataNode);
+            stub.AcquireFileWriteLock(&cntl, &req, &reply, nullptr);
+            if (cntl.Failed()) return DataRpcErrno(cntl); // No silent unlocked fallback on old nodes.
+            if (reply.status().code() != zb::rpc::STATUS_OK) return StatusToErrno(reply.status());
+            token = reply.token();
+            return token.empty() ? EIO : 0;
+        }
+        ~WriteLock() {
+            if (token.empty()) return;
+            zb::rpc::ReleaseFileWriteLockRequest req;
+            req.set_inode_id(inode_); req.set_token(token);
+            zb::rpc::ReleaseFileWriteLockReply reply;
+            brpc::Controller cntl;
+            cntl.set_max_retry(0);
+            if (!route.Attach(&cntl)) return;
+            zb::rpc::RealNodeService_Stub stub(channel_);
+            RpcLatencyScope timing(trace_, RpcTarget::DataNode);
+            stub.ReleaseFileWriteLock(&cntl, &req, &reply, nullptr);
+            if (cntl.Failed() || reply.status().code() != zb::rpc::STATUS_OK)
+                std::cerr << "[file_lock] release failed inode=" << inode_
+                          << " node=" << route.endpoint.node_id << " (lock retained; stop writers before recovery)\n";
+        }
+        std::string token;
+        DataRoute route;
+    private:
+        DataNodeClient& client_;
+        zb::rpc::ReplicaLocation anchor_;
+        uint64_t inode_;
+        IoTraceContext* trace_;
+        brpc::Channel* channel_{nullptr};
+    };
+
+    bool Write(const zb::rpc::ReplicaLocation& replica, uint64_t offset, const std::string& data, std::string* error, IoTraceContext* trace = nullptr, int* io_errno = nullptr, const WriteLock* write_lock = nullptr) {
+        const auto routes = write_lock
+            ? std::vector<DataRoute>{write_lock->route} : CollectRoutes(replica, true);
+        if (routes.empty()) {
             if (error) {
                 *error = "No data node address in replica";
             }
@@ -936,7 +1028,8 @@ public:
         }
 
         std::string last_error = "Unknown write error";
-        for (const auto& address : addresses) {
+        for (const auto& route : routes) {
+            const auto& address = route.endpoint.address;
             brpc::Channel* channel = GetChannel(address);
             if (!channel) {
                 last_error = "Failed to init channel: " + address;
@@ -949,21 +1042,25 @@ public:
             request.set_offset(offset);
             request.set_data(data);
             request.set_epoch(replica.epoch());
+            if (write_lock) request.set_write_lock_token(write_lock->token);
             zb::rpc::WriteObjectReply reply;
             brpc::Controller cntl;
-            zb::rpc_route::SetLogicalNodeRoute(&cntl, replica.node_id(),
-                replica.instance_generation() == 0 ? 1 : replica.instance_generation());
+            if (!route.Attach(&cntl)) return false;
             {
                 RpcLatencyScope timing(trace, RpcTarget::DataNode);
                 stub.WriteObject(&cntl, &request, &reply, nullptr);
+                LogRoute("WriteObject", route, request.object_id(), request.data().size(), cntl, reply.status());
             }
             if (cntl.Failed()) {
                 last_error = cntl.ErrorText();
-                continue;
+                if (io_errno) *io_errno = DataRpcErrno(cntl);
+                if (error) *error = last_error;
+                return false;
             }
             if (reply.status().code() == zb::rpc::STATUS_OK) {
                 return true;
             }
+            if (io_errno) *io_errno = StatusToErrno(reply.status());
             last_error = reply.status().message();
         }
         if (error) {
@@ -973,9 +1070,9 @@ public:
     }
 
     bool Read(const zb::rpc::ReplicaLocation& replica, uint64_t offset, uint64_t size, std::string* out,
-              std::string* error, IoTraceContext* trace = nullptr) {
-        std::vector<std::string> addresses = CollectAddresses(replica, resolver_);
-        if (addresses.empty()) {
+              std::string* error, IoTraceContext* trace = nullptr, int* io_errno = nullptr) {
+        const auto routes = CollectRoutes(replica, false);
+        if (routes.empty()) {
             if (error) {
                 *error = "No data node address in replica";
             }
@@ -983,7 +1080,8 @@ public:
         }
 
         std::string last_error = "Unknown read error";
-        for (const auto& address : addresses) {
+        for (const auto& route : routes) {
+            const auto& address = route.endpoint.address;
             brpc::Channel* channel = GetChannel(address);
             if (!channel) {
                 last_error = "Failed to init channel: " + address;
@@ -1002,15 +1100,17 @@ public:
             }
             zb::rpc::ReadObjectReply reply;
             brpc::Controller cntl;
-            zb::rpc_route::SetLogicalNodeRoute(&cntl, replica.node_id(),
-                replica.instance_generation() == 0 ? 1 : replica.instance_generation());
+            if (!route.Attach(&cntl)) return false;
             {
                 RpcLatencyScope timing(trace, RpcTarget::DataNode);
                 stub.ReadObject(&cntl, &request, &reply, nullptr);
+                LogRoute("ReadObject", route, request.object_id(), reply.bytes(), cntl, reply.status());
             }
             if (cntl.Failed()) {
                 last_error = cntl.ErrorText();
-                continue;
+                if (io_errno) *io_errno = DataRpcErrno(cntl);
+                if (error) *error = last_error;
+                return false;
             }
             if (reply.status().code() == zb::rpc::STATUS_OK) {
                 if (out) {
@@ -1018,6 +1118,7 @@ public:
                 }
                 return true;
             }
+            if (io_errno) *io_errno = StatusToErrno(reply.status());
             last_error = reply.status().message();
         }
         if (error) {
@@ -1034,9 +1135,10 @@ public:
             if (error) *error = "incomplete optical read location";
             return false;
         }
-        const auto addresses = CollectAddresses(replica, resolver_);
-        if (addresses.empty()) { if (error) *error = "no optical node address"; return false; }
-        for (const auto& address : addresses) {
+        const auto routes = CollectRoutes(replica, false);
+        if (routes.empty()) { if (error) *error = "no optical node address"; return false; }
+        for (const auto& route : routes) {
+            const auto& address = route.endpoint.address;
             brpc::Channel* channel = GetChannel(address);
             if (!channel) continue;
             zb::rpc::OpticalNodeService_Stub stub(channel);
@@ -1046,9 +1148,7 @@ public:
             request.set_image_id(replica.image_id());
             zb::rpc::RequestAsyncReadFileReply accepted;
             brpc::Controller controller;
-            if (!zb::rpc_route::SetLogicalNodeRoute(
-                    &controller, replica.node_id(),
-                    replica.instance_generation() == 0 ? 1 : replica.instance_generation())) {
+            if (!route.Attach(&controller)) {
                 if (error) *error = "invalid optical instance route";
                 return false;
             }
@@ -1074,9 +1174,7 @@ public:
                 part.set_read_size(chunk);
                 zb::rpc::ReadObjectByTaskIdReply data;
                 brpc::Controller read_controller;
-                zb::rpc_route::SetLogicalNodeRoute(
-                    &read_controller, replica.node_id(),
-                    replica.instance_generation() == 0 ? 1 : replica.instance_generation());
+                if (!route.Attach(&read_controller)) return false;
                 {
                     RpcLatencyScope timing(trace, RpcTarget::DataNode);
                     stub.ReadObjectByTaskId(&read_controller, &part, &data, nullptr);
@@ -1110,9 +1208,10 @@ public:
                          uint64_t object_unit_size_hint,
                          zb::rpc::FileMeta* meta,
                          std::vector<zb::rpc::FileObjectSlice>* slices,
-                         zb::rpc::Status* status, IoTraceContext* trace = nullptr) {
-        std::vector<std::string> addresses = CollectAddresses(replica, resolver_);
-        if (addresses.empty()) {
+                         zb::rpc::Status* status, IoTraceContext* trace = nullptr, const WriteLock* write_lock = nullptr) {
+        const auto routes = write_lock
+            ? std::vector<DataRoute>{write_lock->route} : CollectRoutes(replica, false);
+        if (routes.empty()) {
             if (status) {
                 status->set_code(zb::rpc::STATUS_INVALID_ARGUMENT);
                 status->set_message("No data node address in replica");
@@ -1123,7 +1222,8 @@ public:
         zb::rpc::Status last_status;
         last_status.set_code(zb::rpc::STATUS_INTERNAL_ERROR);
         last_status.set_message("Unknown ResolveFileRead error");
-        for (const auto& address : addresses) {
+        for (const auto& route : routes) {
+            const auto& address = route.endpoint.address;
             brpc::Channel* channel = GetChannel(address);
             if (!channel) {
                 last_status.set_code(zb::rpc::STATUS_INTERNAL_ERROR);
@@ -1139,15 +1239,15 @@ public:
             request.set_object_unit_size_hint(object_unit_size_hint);
             zb::rpc::ResolveFileReadReply reply;
             brpc::Controller cntl;
-            zb::rpc_route::SetLogicalNodeRoute(&cntl, replica.node_id(),
-                replica.instance_generation() == 0 ? 1 : replica.instance_generation());
+            if (!route.Attach(&cntl)) return false;
             {
                 RpcLatencyScope timing(trace, RpcTarget::DataNode);
                 stub.ResolveFileRead(&cntl, &request, &reply, nullptr);
+                LogRoute("ResolveFileRead", route, std::to_string(inode_id), size, cntl, reply.status());
             }
             if (cntl.Failed()) {
-                last_status.set_code(zb::rpc::STATUS_INTERNAL_ERROR);
-                last_status.set_message(cntl.ErrorText());
+                last_status.set_code(zb::rpc::STATUS_IO_ERROR);
+                last_status.set_message(DataRpcErrno(cntl) == ETIMEDOUT ? "RPC_TIMEOUT" : cntl.ErrorText());
                 continue;
             }
             if (reply.status().code() == zb::rpc::STATUS_OK) {
@@ -1178,9 +1278,10 @@ public:
                            zb::rpc::FileMeta* meta,
                            std::string* txid,
                            std::vector<zb::rpc::FileObjectSlice>* slices,
-                           zb::rpc::Status* status, IoTraceContext* trace = nullptr) {
-        std::vector<std::string> addresses = CollectAddresses(replica, resolver_);
-        if (addresses.empty()) {
+                           zb::rpc::Status* status, IoTraceContext* trace = nullptr, const WriteLock* write_lock = nullptr) {
+        const auto routes = write_lock
+            ? std::vector<DataRoute>{write_lock->route} : CollectRoutes(replica, true);
+        if (routes.empty()) {
             if (status) {
                 status->set_code(zb::rpc::STATUS_INVALID_ARGUMENT);
                 status->set_message("No data node address in replica");
@@ -1191,7 +1292,8 @@ public:
         zb::rpc::Status last_status;
         last_status.set_code(zb::rpc::STATUS_INTERNAL_ERROR);
         last_status.set_message("Unknown AllocateFileWrite error");
-        for (const auto& address : addresses) {
+        for (const auto& route : routes) {
+            const auto& address = route.endpoint.address;
             brpc::Channel* channel = GetChannel(address);
             if (!channel) {
                 last_status.set_code(zb::rpc::STATUS_INTERNAL_ERROR);
@@ -1205,17 +1307,18 @@ public:
             request.set_size(size);
             request.set_disk_id(replica.disk_id());
             request.set_object_unit_size_hint(object_unit_size_hint);
+            if (write_lock) request.set_write_lock_token(write_lock->token);
             zb::rpc::AllocateFileWriteReply reply;
             brpc::Controller cntl;
-            zb::rpc_route::SetLogicalNodeRoute(&cntl, replica.node_id(),
-                replica.instance_generation() == 0 ? 1 : replica.instance_generation());
+            if (!route.Attach(&cntl)) return false;
             {
                 RpcLatencyScope timing(trace, RpcTarget::DataNode);
                 stub.AllocateFileWrite(&cntl, &request, &reply, nullptr);
+                LogRoute("AllocateFileWrite", route, std::to_string(inode_id), size, cntl, reply.status());
             }
             if (cntl.Failed()) {
-                last_status.set_code(zb::rpc::STATUS_INTERNAL_ERROR);
-                last_status.set_message(cntl.ErrorText());
+                last_status.set_code(zb::rpc::STATUS_IO_ERROR);
+                last_status.set_message(DataRpcErrno(cntl) == ETIMEDOUT ? "RPC_TIMEOUT" : cntl.ErrorText());
                 continue;
             }
             if (reply.status().code() == zb::rpc::STATUS_OK) {
@@ -1250,9 +1353,10 @@ public:
                          bool allow_create,
                          uint64_t mtime_sec,
                          zb::rpc::FileMeta* meta,
-                         zb::rpc::Status* status, IoTraceContext* trace = nullptr) {
-        std::vector<std::string> addresses = CollectAddresses(replica, resolver_);
-        if (addresses.empty()) {
+                         zb::rpc::Status* status, IoTraceContext* trace = nullptr, const WriteLock* write_lock = nullptr) {
+        const auto routes = write_lock
+            ? std::vector<DataRoute>{write_lock->route} : CollectRoutes(replica, true);
+        if (routes.empty()) {
             if (status) {
                 status->set_code(zb::rpc::STATUS_INVALID_ARGUMENT);
                 status->set_message("No data node address in replica");
@@ -1263,7 +1367,8 @@ public:
         zb::rpc::Status last_status;
         last_status.set_code(zb::rpc::STATUS_INTERNAL_ERROR);
         last_status.set_message("Unknown CommitFileWrite error");
-        for (const auto& address : addresses) {
+        for (const auto& route : routes) {
+            const auto& address = route.endpoint.address;
             brpc::Channel* channel = GetChannel(address);
             if (!channel) {
                 last_status.set_code(zb::rpc::STATUS_INTERNAL_ERROR);
@@ -1279,17 +1384,18 @@ public:
             request.set_expected_version(expected_version);
             request.set_allow_create(allow_create);
             request.set_mtime_sec(mtime_sec);
+            if (write_lock) request.set_write_lock_token(write_lock->token);
             zb::rpc::CommitFileWriteReply reply;
             brpc::Controller cntl;
-            zb::rpc_route::SetLogicalNodeRoute(&cntl, replica.node_id(),
-                replica.instance_generation() == 0 ? 1 : replica.instance_generation());
+            if (!route.Attach(&cntl)) return false;
             {
                 RpcLatencyScope timing(trace, RpcTarget::DataNode);
                 stub.CommitFileWrite(&cntl, &request, &reply, nullptr);
+                LogRoute("CommitFileWrite", route, std::to_string(inode_id), file_size, cntl, reply.status());
             }
             if (cntl.Failed()) {
-                last_status.set_code(zb::rpc::STATUS_INTERNAL_ERROR);
-                last_status.set_message(cntl.ErrorText());
+                last_status.set_code(zb::rpc::STATUS_IO_ERROR);
+                last_status.set_message(DataRpcErrno(cntl) == ETIMEDOUT ? "RPC_TIMEOUT" : cntl.ErrorText());
                 continue;
             }
             if (reply.status().code() == zb::rpc::STATUS_OK) {
@@ -1310,31 +1416,51 @@ public:
     }
 
 private:
-    static std::vector<std::string> CollectAddresses(const zb::rpc::ReplicaLocation& replica,
-                                                     const NodeAddressResolver& resolver) {
-        std::vector<std::string> addresses;
-        auto push_unique = [&addresses](const std::string& address) {
-            if (address.empty()) {
-                return;
-            }
-            if (std::find(addresses.begin(), addresses.end(), address) == addresses.end()) {
-                addresses.push_back(address);
-            }
-        };
-        auto resolve_and_push = [&resolver, &push_unique](const std::string& node_id) {
-            if (!resolver || node_id.empty()) {
-                return;
-            }
-            std::string address;
-            if (resolver(node_id, &address)) {
-                push_unique(address);
-            }
-        };
-        resolve_and_push(replica.primary_node_id());
-        resolve_and_push(replica.node_id());
-        resolve_and_push(replica.secondary_node_id());
+    bool ResolveEndpoint(const std::string& node, NodeEndpoint* endpoint) const {
+        if (endpoint_resolver_) return endpoint_resolver_(node, endpoint);
+        // Legacy in-process callers can still supply the address-only resolver.
+        endpoint->node_id = node;
+        endpoint->node_type = zb::rpc::NODE_REAL;
+        return resolver_ && resolver_(node, &endpoint->address);
+    }
 
-        return addresses;
+    std::vector<DataRoute> CollectRoutes(const zb::rpc::ReplicaLocation& replica, bool writing) const {
+        std::vector<DataRoute> routes;
+        auto add = [&](const std::string& node) {
+            if (node.empty()) return;
+            for (const auto& old : routes) if (old.endpoint.node_id == node) return;
+            DataRoute route;
+            if (!ResolveEndpoint(node, &route.endpoint) || route.endpoint.address.empty()) return;
+            // The protocol supplies a generation for the authoritative location,
+            // not arbitrary other logical nodes. Never fail over between models.
+            if (node != replica.node_id() && route.endpoint.node_type != zb::rpc::NODE_REAL) return;
+            route.generation = node == replica.node_id() ? replica.instance_generation() : 1;
+            if (route.generation == 0) {
+                if (route.endpoint.node_type == zb::rpc::NODE_VIRTUAL_POOL) return;
+                route.generation = 1; // Legacy physical-node metadata.
+            }
+            brpc::Controller validation;
+            if (!route.Attach(&validation)) return;
+            routes.push_back(std::move(route));
+        };
+        if (writing) {
+            add(replica.primary_node_id().empty() ? replica.node_id() : replica.primary_node_id());
+        } else {
+            add(replica.primary_node_id());
+            add(replica.node_id());
+            add(replica.secondary_node_id());
+        }
+        return routes;
+    }
+
+    static void LogRoute(const char* operation, const DataRoute& route, const std::string& file,
+                         uint64_t bytes, const brpc::Controller& controller, const zb::rpc::Status& status) {
+        if (!FLAGS_data_route_log) return;
+        std::fprintf(stderr, "[data_route] op=%s node=%s generation=%llu address=%s type=%d file=%s bytes=%llu status=%d errno=%d\n",
+            operation, route.endpoint.node_id.c_str(), (unsigned long long)route.generation,
+            route.endpoint.address.c_str(), static_cast<int>(route.endpoint.node_type), file.c_str(),
+            (unsigned long long)bytes, static_cast<int>(status.code()),
+            controller.Failed() ? DataRpcErrno(controller) : StatusToErrno(status));
     }
 
     brpc::Channel* GetChannel(const std::string& address) {
@@ -1359,6 +1485,7 @@ private:
     std::mutex mu_;
     std::unordered_map<std::string, std::unique_ptr<brpc::Channel>> channels_;
     NodeAddressResolver resolver_;
+    EndpointResolver endpoint_resolver_;
 };
 
 struct FuseState {
@@ -1377,15 +1504,20 @@ struct FuseState {
     SchedulerClient scheduler;
     bool scheduler_enabled{false};
     DataNodeClient data_nodes;
+    concurrency::KeyedLocks file_operations;
+    data::ParallelIoExecutor parallel_io{{FLAGS_disk_io_workers, FLAGS_disk_io_queue_depth,
+                                          FLAGS_disk_io_per_node, FLAGS_disk_io_buffer_bytes}};
     std::unique_ptr<optical::OpticalReadClient> optical_reads;
     std::unique_ptr<control::PrepareControlServer> prepare_control;
     std::unordered_map<uint64_t, optical::OpticalReadClient::Session> optical_sessions;
     std::string mount_path;
     bool optical_start_failed{false};
     std::mutex mu;
+    uint64_t next_local_handle{1};
     std::unordered_map<uint64_t, uint64_t> handle_to_inode;
+    std::unordered_map<uint64_t, uint64_t> handle_to_mds;
     std::unordered_map<uint64_t, InodeCacheEntry> inode_cache;
-    std::unordered_map<std::string, std::string> node_address_cache;
+    std::unordered_map<std::string, NodeEndpoint> node_endpoint_cache;
     uint64_t cluster_view_generation{0};
     uint64_t cluster_view_update_ms{0};
 
@@ -1416,7 +1548,7 @@ bool RefreshNodeAddressCache(FuseState* state, bool force, std::string* error) {
         const uint64_t refresh_ms = std::max<uint64_t>(1, FLAGS_cluster_view_refresh_ms);
         if (!force && state->cluster_view_update_ms > 0 &&
             now_ms - state->cluster_view_update_ms < refresh_ms) {
-            return !state->node_address_cache.empty();
+            return !state->node_endpoint_cache.empty();
         }
     }
 
@@ -1432,12 +1564,14 @@ bool RefreshNodeAddressCache(FuseState* state, bool force, std::string* error) {
 
     {
         std::lock_guard<std::mutex> lock(state->mu);
-        state->node_address_cache.clear();
+        // Concurrent refreshes must not replace a newer catalog with an older reply.
+        if (generation < state->cluster_view_generation) return true;
+        state->node_endpoint_cache.clear();
         for (const auto& node : nodes) {
             if (node.node_id().empty() || node.address().empty()) {
                 continue;
             }
-            state->node_address_cache[node.node_id()] = node.address();
+            state->node_endpoint_cache[node.node_id()] = {node.node_id(), node.address(), node.node_type()};
         }
         state->cluster_view_generation = generation;
         state->cluster_view_update_ms = now_ms;
@@ -1537,40 +1671,34 @@ bool EnsureTierBootstrap(FuseState* state, std::string* error) {
     return true;
 }
 
-bool ResolveNodeAddress(FuseState* state, const std::string& node_id, std::string* address) {
-    if (!state || node_id.empty() || !address) {
-        return false;
-    }
-    const std::string base_node_id = BaseNodeIdFromVirtual(node_id);
-    const uint64_t now_ms = NowMilliseconds();
-    const uint64_t ttl_ms = std::max<uint64_t>(1, FLAGS_cluster_view_ttl_ms);
-    {
+bool ResolveNodeEndpoint(FuseState* state, const std::string& node_id, NodeEndpoint* endpoint) {
+    if (!state || node_id.empty() || !endpoint) return false;
+    const auto base_node_id = BaseNodeIdFromVirtual(node_id);
+    const auto ttl_ms = std::max<uint64_t>(1, FLAGS_cluster_view_ttl_ms);
+    auto lookup = [&]() {
         std::lock_guard<std::mutex> lock(state->mu);
-        auto it = state->node_address_cache.find(node_id);
-        if (it == state->node_address_cache.end() && base_node_id != node_id) {
-            it = state->node_address_cache.find(base_node_id);
+        if (!state->cluster_view_update_ms || NowMilliseconds() - state->cluster_view_update_ms > ttl_ms)
+            return false;
+        auto it = state->node_endpoint_cache.find(node_id);
+        if (it == state->node_endpoint_cache.end() && base_node_id != node_id) {
+            it = state->node_endpoint_cache.find(base_node_id);
+            if (it != state->node_endpoint_cache.end() && it->second.node_type != zb::rpc::NODE_VIRTUAL_POOL)
+                return false;
         }
-        if (it != state->node_address_cache.end() &&
-            state->cluster_view_update_ms > 0 &&
-            now_ms - state->cluster_view_update_ms <= ttl_ms) {
-            *address = it->second;
-            return true;
-        }
-    }
-
+        if (it == state->node_endpoint_cache.end()) return false;
+        *endpoint = it->second;
+        endpoint->node_id = node_id; // Do not rewrite the MDS identity in attachments.
+        return true;
+    };
+    if (lookup()) return true;
     std::string error;
-    if (!RefreshNodeAddressCache(state, true, &error)) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(state->mu);
-    auto it = state->node_address_cache.find(node_id);
-    if (it == state->node_address_cache.end() && base_node_id != node_id) {
-        it = state->node_address_cache.find(base_node_id);
-    }
-    if (it == state->node_address_cache.end()) {
-        return false;
-    }
-    *address = it->second;
+    return RefreshNodeAddressCache(state, true, &error) && lookup();
+}
+
+bool ResolveNodeAddress(FuseState* state, const std::string& node_id, std::string* address) {
+    NodeEndpoint endpoint;
+    if (!address || !ResolveNodeEndpoint(state, node_id, &endpoint)) return false;
+    *address = endpoint.address;
     return true;
 }
 
@@ -1582,9 +1710,7 @@ bool EnsureReplicaNodeAddress(FuseState* state, zb::rpc::ReplicaLocation* replic
         }
         return false;
     }
-    if (!replica->node_address().empty()) {
-        return true;
-    }
+    if (!state->scheduler_enabled && !replica->node_address().empty()) return true;
     std::string address;
     if (!ResolveNodeAddress(state, replica->node_id(), &address) || address.empty()) {
         if (status) {
@@ -1614,6 +1740,7 @@ void UpdateInodeAttrCache(FuseState* state,
     std::lock_guard<std::mutex> lock(state->mu);
     auto& entry = state->inode_cache[inode_id];
     entry.inode_id = inode_id;
+    if (attr.version() < entry.file_meta_version) return;
     if (attr.object_unit_size() > 0) {
         entry.object_unit_size = attr.object_unit_size();
     }
@@ -1663,6 +1790,7 @@ void UpdateCachedFileMeta(FuseState* state,
     std::lock_guard<std::mutex> lock(state->mu);
     auto& entry = state->inode_cache[inode_id];
     entry.inode_id = inode_id;
+    if (version < entry.file_meta_version) return;
     entry.file_size = file_size;
     if (object_unit_size > 0) {
         entry.object_unit_size = object_unit_size;
@@ -1749,14 +1877,14 @@ bool GetOrFetchNodeFileMeta(FuseState* state,
                             uint64_t* file_size,
                             uint64_t* object_unit_size,
                             uint64_t* file_meta_version,
-                            int* out_errno) {
+                            int* out_errno, const DataNodeClient::WriteLock* write_lock = nullptr) {
     if (!state || inode_id == 0 || !file_size || !object_unit_size || !file_meta_version) {
         if (out_errno) {
             *out_errno = EINVAL;
         }
         return false;
     }
-    if (TryGetCachedInodeMeta(state, inode_id, file_size, object_unit_size, file_meta_version)) {
+    if (!write_lock && TryGetCachedInodeMeta(state, inode_id, file_size, object_unit_size, file_meta_version)) {
         return true;
     }
 
@@ -1770,30 +1898,32 @@ bool GetOrFetchNodeFileMeta(FuseState* state,
                                            hint_object_unit_size > 0 ? hint_object_unit_size : FLAGS_default_object_unit_size,
                                            &meta,
                                            &ignored_slices,
-                                           &data_status)) {
-        if (data_status.code() == zb::rpc::STATUS_NOT_FOUND && allow_create) {
-            const uint64_t create_object_unit_size =
-                hint_object_unit_size > 0 ? hint_object_unit_size : FLAGS_default_object_unit_size;
-            zb::rpc::FileMeta committed;
-            const std::string txid = "bootstrap-" + std::to_string(inode_id) + "-" +
-                                     std::to_string(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::system_clock::now().time_since_epoch()).count()));
-            if (!state->data_nodes.CommitFileWrite(anchor,
-                                                   inode_id,
-                                                   txid,
-                                                   hint_file_size,
-                                                   create_object_unit_size,
-                                                   0,
-                                                   true,
-                                                   static_cast<uint64_t>(std::time(nullptr)),
-                                                   &committed,
-                                                   &data_status)) {
-                if (out_errno) {
-                    *out_errno = StatusToErrno(data_status);
-                }
-                return false;
+                                           &data_status, nullptr, write_lock)) {
+        if (IsMissingFileMeta(data_status) && allow_create) {
+            DataNodeClient::WriteLock bootstrap_lock(state->data_nodes, anchor, inode_id);
+            if (!write_lock) {
+                const int error = bootstrap_lock.Acquire();
+                if (error) { if (out_errno) *out_errno = error; return false; }
+                write_lock = &bootstrap_lock;
             }
-            meta = committed;
+            // Resolve again under the node lock before creating metadata.
+            if (!state->data_nodes.ResolveFileRead(anchor, inode_id, 0, 0,
+                    hint_object_unit_size, &meta, &ignored_slices, &data_status, nullptr, write_lock)) {
+                if (!IsMissingFileMeta(data_status)) {
+                    if (out_errno) *out_errno = StatusToErrno(data_status);
+                    return false;
+                }
+                const uint64_t unit = hint_object_unit_size > 0
+                    ? hint_object_unit_size : FLAGS_default_object_unit_size;
+                const std::string txid = "bootstrap-" + std::to_string(inode_id) + "-" +
+                    write_lock->token + "-" + std::to_string(NowMilliseconds());
+                if (!state->data_nodes.CommitFileWrite(anchor, inode_id, txid, hint_file_size,
+                        unit, 0, true, static_cast<uint64_t>(std::time(nullptr)), &meta,
+                        &data_status, nullptr, write_lock)) {
+                    if (out_errno) *out_errno = StatusToErrno(data_status);
+                    return false;
+                }
+            }
         } else {
             if (out_errno) {
                 *out_errno = StatusToErrno(data_status);
@@ -1819,7 +1949,7 @@ bool CommitNodeFileMeta(FuseState* state,
                         uint64_t object_unit_size,
                         uint64_t expected_version,
                         uint64_t* committed_version,
-                        int* out_errno) {
+                        int* out_errno, const DataNodeClient::WriteLock* write_lock) {
     if (!state || inode_id == 0 || object_unit_size == 0) {
         if (out_errno) {
             *out_errno = EINVAL;
@@ -1829,6 +1959,7 @@ bool CommitNodeFileMeta(FuseState* state,
     zb::rpc::Status data_status;
     zb::rpc::FileMeta committed;
     const std::string txid = "meta-" + std::to_string(inode_id) + "-" +
+                             (write_lock ? write_lock->token : "") + "-" +
                              std::to_string(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                  std::chrono::system_clock::now().time_since_epoch()).count()));
     if (!state->data_nodes.CommitFileWrite(anchor,
@@ -1840,7 +1971,7 @@ bool CommitNodeFileMeta(FuseState* state,
                                            true,
                                            static_cast<uint64_t>(std::time(nullptr)),
                                            &committed,
-                                           &data_status)) {
+                                           &data_status, nullptr, write_lock)) {
         if (out_errno) {
             *out_errno = StatusToErrno(data_status);
         }
@@ -1962,6 +2093,29 @@ optical::FileInfo ResolveOpticalPrepare(FuseState* state, const std::string& pat
             anchor.instance_generation() == 0 ? 1 : anchor.instance_generation()};
 }
 
+// FUSE handles belong to this mount. Do not use remote MDS handle IDs as local
+// keys: concurrent Open replies may reuse an ID in the current MDS allocator.
+uint64_t RegisterOpenHandle(FuseState* state, uint64_t inode, uint64_t mds_handle,
+                            optical::OpticalReadClient::Session session = {}) {
+    std::lock_guard<std::mutex> lock(state->mu);
+    const uint64_t local_handle = state->next_local_handle++;
+    state->handle_to_inode.emplace(local_handle, inode);
+    state->handle_to_mds.emplace(local_handle, mds_handle);
+    if (session) state->optical_sessions.emplace(local_handle, std::move(session));
+    return local_handle;
+}
+
+struct MdsOpenRollback {
+    FuseState* state;
+    uint64_t handle;
+    bool committed{false};
+    ~MdsOpenRollback() {
+        if (committed) return;
+        zb::rpc::MdsStatus ignored;
+        state->mds.Close(handle, &ignored);
+    }
+};
+
 int OpenRequest(FuseState* state, const char* path, struct fuse_file_info* fi) {
     zb::rpc::FileLocationView location;
     zb::rpc::ReplicaLocation open_anchor;
@@ -1972,25 +2126,10 @@ int OpenRequest(FuseState* state, const char* path, struct fuse_file_info* fi) {
         return -StatusToErrno(status);
     }
     // Open may allocate an MDS handle before the optical READY check fails.
-    struct OpenRollback {
-        FuseState* state;
-        uint64_t handle;
-        bool committed{false};
-        ~OpenRollback() {
-            if (committed) return;
-            {
-                std::lock_guard<std::mutex> lock(state->mu);
-                state->handle_to_inode.erase(handle);
-            }
-            zb::rpc::MdsStatus ignored;
-            state->mds.Close(handle, &ignored);
-        }
-    } rollback{state, handle_id};
+    MdsOpenRollback rollback{state, handle_id};
     const zb::rpc::InodeAttr& attr = location.attr();
-    {
-        std::lock_guard<std::mutex> lock(state->mu);
-        state->handle_to_inode[handle_id] = attr.inode_id();
-    }
+    auto file_mutex = state->file_operations.Get(std::to_string(attr.inode_id()));
+    std::unique_lock<std::shared_mutex> file_guard(*file_mutex);
     UpdateInodeAttrCache(state, attr.inode_id(), attr);
     if (attr.type() == zb::rpc::INODE_FILE) {
         zb::rpc::ReplicaLocation anchor = open_anchor;
@@ -2012,16 +2151,15 @@ int OpenRequest(FuseState* state, const char* path, struct fuse_file_info* fi) {
             if (IsWriteOpenFlags(static_cast<uint32_t>(fi->flags))) {
                 return -EROFS;
             }
+            optical::OpticalReadClient::Session session;
             if (state->optical_reads) {
                 try {
-                    auto session = state->optical_reads->Open(attr.inode_id(), OpticalVersion(attr));
-                    std::lock_guard<std::mutex> lock(state->mu);
-                    state->optical_sessions.emplace(handle_id, std::move(session));
+                    session = state->optical_reads->Open(attr.inode_id(), OpticalVersion(attr));
                 } catch (const optical::ClientError& e) {
                     return -e.code();
                 }
             }
-            fi->fh = handle_id;
+            fi->fh = RegisterOpenHandle(state, attr.inode_id(), handle_id, std::move(session));
             rollback.committed = true;
             return 0;
         }
@@ -2048,7 +2186,7 @@ int OpenRequest(FuseState* state, const char* path, struct fuse_file_info* fi) {
             return -node_errno;
         }
     }
-    fi->fh = handle_id;
+    fi->fh = RegisterOpenHandle(state, attr.inode_id(), handle_id);
     rollback.committed = true;
     return 0;
 }
@@ -2060,9 +2198,14 @@ int FuseOpen(const char* path, struct fuse_file_info* fi) {
 int ReleaseRequest(FuseState* state, struct fuse_file_info* fi) {
     zb::rpc::MdsStatus status;
     const uint64_t handle_id = fi->fh;
+    uint64_t mds_handle = 0;
     optical::OpticalReadClient::Session session;
     {
         std::lock_guard<std::mutex> lock(state->mu);
+        const auto remote = state->handle_to_mds.find(handle_id);
+        if (remote == state->handle_to_mds.end()) return -EBADF;
+        mds_handle = remote->second;
+        state->handle_to_mds.erase(remote);
         auto it = state->optical_sessions.find(handle_id);
         if (it != state->optical_sessions.end()) {
             session = it->second;
@@ -2075,7 +2218,7 @@ int ReleaseRequest(FuseState* state, struct fuse_file_info* fi) {
         try { state->optical_reads->Close(session); }
         catch (const optical::ClientError& e) { error = e.code(); }
     }
-    if (!state->mds.Close(handle_id, &status) && !error) error = StatusToErrno(status);
+    if (!state->mds.Close(mds_handle, &status) && !error) error = StatusToErrno(status);
     return -error;
 }
 
@@ -2100,11 +2243,8 @@ int FuseCreate(const char* path, mode_t mode, struct fuse_file_info* fi) {
         LogMdsFailure("Create.OpenAfterCreate", path, status);
         return -StatusToErrno(status);
     }
+    MdsOpenRollback rollback{state, handle_id};
     const zb::rpc::InodeAttr& attr = open_location.attr();
-    {
-        std::lock_guard<std::mutex> lock(state->mu);
-        state->handle_to_inode[handle_id] = attr.inode_id();
-    }
     UpdateInodeAttrCache(state, attr.inode_id(), attr);
     zb::rpc::ReplicaLocation anchor = open_anchor;
     if (anchor.node_id().empty() || anchor.disk_id().empty()) {
@@ -2146,7 +2286,8 @@ int FuseCreate(const char* path, mode_t mode, struct fuse_file_info* fi) {
         LogDataFailure("Create.GetOrFetchNodeFileMeta", path, attr.inode_id(), anchor, st);
         return -node_errno;
     }
-    fi->fh = handle_id;
+    fi->fh = RegisterOpenHandle(state, attr.inode_id(), handle_id);
+    rollback.committed = true;
     return 0;
 }
 
@@ -2229,6 +2370,8 @@ int FuseReadImpl(FuseState* state, const char* path, char* buf, size_t size, off
         return -StatusToErrno(status);
     }
     const uint64_t request_offset = static_cast<uint64_t>(offset);
+    auto file_mutex = state->file_operations.Get(std::to_string(inode_id));
+    std::shared_lock<std::shared_mutex> file_guard(*file_mutex);
     zb::rpc::FileLocationView location;
     if (!state->mds.GetFileLocationView(inode_id, &location, &status, trace)) {
         return -StatusToErrno(status);
@@ -2309,7 +2452,7 @@ int FuseReadImpl(FuseState* state, const char* path, char* buf, size_t size, off
         // Drain migration transfers objects before switching the authoritative
         // MDS location. The destination may have no file-meta acceleration entry.
         // Only recover that specific absence; never mask transport/storage errors.
-        if (data_status.code() != zb::rpc::STATUS_NOT_FOUND) {
+        if (!IsMissingFileMeta(data_status)) {
             return -StatusToErrno(data_status);
         }
         const auto& attr = location.attr();
@@ -2337,26 +2480,28 @@ int FuseReadImpl(FuseState* state, const char* path, char* buf, size_t size, off
         read_size = resolved_meta.file_size() - request_offset;
     }
 
+    if (read_size > static_cast<uint64_t>(INT_MAX)) return -EOVERFLOW;
     std::string output(read_size, '\0');
-    uint64_t write_pos = 0;
+    std::vector<uint64_t> positions, lengths;
+    uint64_t cursor = 0;
     for (const auto& slice : slices) {
-        if (slice.length() == 0) {
-            continue;
-        }
-        const uint64_t read_len = slice.length();
-        std::string data;
-        std::string error;
-        const zb::rpc::ReplicaLocation replica = BuildObjectReplicaFromAnchor(anchor, slice.object_id());
-        if (!state->data_nodes.Read(replica, slice.object_offset(), read_len, &data, &error, trace)) {
-            return -EIO;
-        }
-        const size_t copy_len = static_cast<size_t>(std::min<uint64_t>(read_len, data.size()));
-        if (write_pos + copy_len > output.size()) {
-            return -EIO;
-        }
-        std::memcpy(output.data() + write_pos, data.data(), copy_len);
-        write_pos += read_len;
+        if (cursor > read_size || slice.length() > read_size - cursor) return -EIO;
+        positions.push_back(cursor); lengths.push_back(slice.length()); cursor += slice.length();
     }
+    if (cursor != read_size) return -EIO;
+    const int io_error = state->parallel_io.Run(anchor.node_id(), lengths,
+        [&](size_t i, IoTraceContext* child) {
+            if (!lengths[i]) return 0;
+            std::string data, error;
+            const auto replica = BuildObjectReplicaFromAnchor(anchor, slices[i].object_id());
+            int code = EIO;
+            if (!state->data_nodes.Read(replica, slices[i].object_offset(), lengths[i], &data, &error, child, &code))
+                return code;
+            if (data.size() != lengths[i]) return EIO;
+            std::memcpy(output.data() + positions[i], data.data(), data.size());
+            return 0;
+        }, trace);
+    if (io_error) return -io_error;
 
     std::memcpy(buf, output.data(), output.size());
     return static_cast<int>(output.size());
@@ -2377,6 +2522,8 @@ int FuseWriteImpl(FuseState* state, const char* path, const char* buf, size_t si
         return -StatusToErrno(status);
     }
 
+    auto file_mutex = state->file_operations.Get(std::to_string(inode_id));
+    std::unique_lock<std::shared_mutex> file_guard(*file_mutex);
     zb::rpc::FileLocationView location;
     if (!state->mds.GetFileLocationView(inode_id, &location, &status, trace)) {
         LogMdsFailure("Write.GetFileLocationView", path, status);
@@ -2400,6 +2547,10 @@ int FuseWriteImpl(FuseState* state, const char* path, const char* buf, size_t si
     if (trace) trace->record.storage_tier = anchor.storage_tier() == zb::rpc::STORAGE_TIER_OPTICAL
         ? metrics::StorageTier::Optical : metrics::StorageTier::Disk;
     UpdateInodeAnchorCache(state, inode_id, anchor);
+    DataNodeClient::WriteLock write_lock(state->data_nodes, anchor, inode_id, trace);
+    const int lock_error = write_lock.Acquire();
+    if (lock_error) return -lock_error;
+
 
     uint64_t hint_object_unit_size = FLAGS_default_object_unit_size;
     uint64_t ignored_file_size = 0;
@@ -2423,7 +2574,7 @@ int FuseWriteImpl(FuseState* state, const char* path, const char* buf, size_t si
                                              &plan_meta,
                                              &txid,
                                              &slices,
-                                             &data_status, trace)) {
+                                             &data_status, trace, &write_lock)) {
         LogDataFailure("Write.AllocateFileWrite", path, inode_id, anchor, data_status);
         return -StatusToErrno(data_status);
     }
@@ -2433,30 +2584,23 @@ int FuseWriteImpl(FuseState* state, const char* path, const char* buf, size_t si
         return -EIO;
     }
 
+    std::vector<uint64_t> positions, lengths;
     uint64_t cursor = 0;
     for (const auto& slice : slices) {
-        if (slice.length() == 0) {
-            continue;
-        }
-        if (cursor > static_cast<uint64_t>(size) || slice.length() > static_cast<uint64_t>(size) - cursor) {
-            return -EIO;
-        }
-        const uint64_t write_len = slice.length();
-        std::string data(buf + cursor, buf + cursor + write_len);
-        const zb::rpc::ReplicaLocation replica = BuildObjectReplicaFromAnchor(anchor, slice.object_id());
-        std::string error;
-        if (!state->data_nodes.Write(replica, slice.object_offset(), data, &error, trace)) {
-            zb::rpc::Status st;
-            st.set_code(zb::rpc::STATUS_IO_ERROR);
-            st.set_message(error);
-            LogDataFailure("Write.WriteObject", path, inode_id, replica, st);
-            return -EIO;
-        }
-        cursor += write_len;
+        if (cursor > size || slice.length() > size - cursor) return -EIO;
+        positions.push_back(cursor); lengths.push_back(slice.length()); cursor += slice.length();
     }
-    if (cursor != static_cast<uint64_t>(size)) {
-        return -EIO;
-    }
+    if (cursor != size || size > static_cast<size_t>(INT_MAX)) return -EIO;
+    const int io_error = state->parallel_io.Run(anchor.node_id(), lengths,
+        [&](size_t i, IoTraceContext* child) {
+            if (!lengths[i]) return 0;
+            std::string data(buf + positions[i], lengths[i]), error;
+            const auto replica = BuildObjectReplicaFromAnchor(anchor, slices[i].object_id());
+            int code = EIO;
+            if (!state->data_nodes.Write(replica, slices[i].object_offset(), data, &error, child, &code, &write_lock)) return code;
+            return 0;
+        }, trace);
+    if (io_error) return -io_error;
 
     const uint64_t new_size = std::max<uint64_t>(plan_meta.file_size(), request_end);
     zb::rpc::FileMeta committed_meta;
@@ -2469,7 +2613,7 @@ int FuseWriteImpl(FuseState* state, const char* path, const char* buf, size_t si
                                            true,
                                            static_cast<uint64_t>(std::time(nullptr)),
                                            &committed_meta,
-                                           &data_status, trace)) {
+                                           &data_status, trace, &write_lock)) {
         LogDataFailure("Write.CommitFileWrite", path, inode_id, anchor, data_status);
         return -StatusToErrno(data_status);
     }
@@ -2527,6 +2671,8 @@ int FuseTruncate(const char* path, off_t size, struct fuse_file_info* fi) {
     if (inode_id == 0) {
         return -StatusToErrno(status);
     }
+    auto file_mutex = state->file_operations.Get(std::to_string(inode_id));
+    std::unique_lock<std::shared_mutex> file_guard(*file_mutex);
     zb::rpc::FileLocationView location;
     if (!state->mds.GetFileLocationView(inode_id, &location, &status)) {
         return -StatusToErrno(status);
@@ -2544,6 +2690,10 @@ int FuseTruncate(const char* path, off_t size, struct fuse_file_info* fi) {
         return -StatusToErrno(status);
     }
     UpdateInodeAnchorCache(state, inode_id, anchor);
+    DataNodeClient::WriteLock write_lock(state->data_nodes, anchor, inode_id);
+    const int lock_error = write_lock.Acquire();
+    if (lock_error) return -lock_error;
+
 
     uint64_t hint_file_size = static_cast<uint64_t>(size);
     uint64_t hint_object_unit_size = FLAGS_default_object_unit_size;
@@ -2561,7 +2711,7 @@ int FuseTruncate(const char* path, off_t size, struct fuse_file_info* fi) {
                                 &cached_file_size,
                                 &object_unit_size,
                                 &file_meta_version,
-                                &node_errno)) {
+                                &node_errno, &write_lock)) {
         return -node_errno;
     }
     uint64_t committed_version = 0;
@@ -2572,7 +2722,7 @@ int FuseTruncate(const char* path, off_t size, struct fuse_file_info* fi) {
                             object_unit_size,
                             file_meta_version,
                             &committed_version,
-                            &node_errno)) {
+                            &node_errno, &write_lock)) {
         return -node_errno;
     }
     return 0;
@@ -2620,7 +2770,8 @@ bool PrepareOpticalConfig(FuseState* state, int argc, char** argv, std::string* 
     return true;
 }
 
-void* FuseInit(struct fuse_conn_info*, struct fuse_config*) {
+void* FuseInit(struct fuse_conn_info*, struct fuse_config* config) {
+    if (config) config->direct_io = FLAGS_client_direct_io;
     auto* state = GetState();
     if (FLAGS_optical_read_enabled) {
         try {
@@ -2662,6 +2813,10 @@ void FuseDestroy(void* data) {
 int main(int argc, char* argv[]) {
     google::ParseCommandLineFlags(&argc, &argv, true);
 
+    if (!FLAGS_disk_io_workers || FLAGS_disk_io_workers > 1024 || !FLAGS_disk_io_per_node ||
+        !FLAGS_disk_io_queue_depth || !FLAGS_disk_io_buffer_bytes) {
+        std::fprintf(stderr, "invalid disk I/O limits\n"); return 1;
+    }
     zb::client::fuse_client::FuseState state;
     std::string latency_error;
     if (!zb::client::fuse_client::PrepareLatency(&state, argc, argv, &latency_error)) {
@@ -2690,9 +2845,9 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr, "Failed to fetch scheduler cluster view: %s\n", refresh_error.c_str());
         return 1;
     }
-    state.data_nodes.SetNodeAddressResolver(
-        [&state](const std::string& node_id, std::string* address) {
-            return zb::client::fuse_client::ResolveNodeAddress(&state, node_id, address);
+    state.data_nodes.SetNodeEndpointResolver(
+        [&state](const std::string& node_id, zb::client::fuse_client::NodeEndpoint* endpoint) {
+            return zb::client::fuse_client::ResolveNodeEndpoint(&state, node_id, endpoint);
         });
     if (FLAGS_bootstrap_tier_dirs) {
         std::string bootstrap_error;

@@ -2,6 +2,7 @@
 #include "optical_node.pb.h"
 #include "common/rpc/LogicalNodeRoute.h"
 #include <brpc/channel.h>
+#include <brpc/errno.pb.h>
 #include <brpc/controller.h>
 #include <brpc/stream.h>
 #include <algorithm>
@@ -27,12 +28,16 @@ int StatusErrno(zb::rpc::OpticalStatusCode code, bool handle = false) {
     case zb::rpc::OPTICAL_INVALID_ARGUMENT: return EINVAL;
     case zb::rpc::OPTICAL_NOT_FOUND: return handle ? EBADF : ENOENT;
     case zb::rpc::OPTICAL_NOT_READY: return EAGAIN;
+    case zb::rpc::OPTICAL_STALE_GENERATION: return ESTALE;
+    case zb::rpc::OPTICAL_CONFLICT: return EAGAIN;
     default: return EIO;
     }
 }
 template<class Reply>
 void Check(const brpc::Controller& controller, const Reply& reply, bool handle = false) {
-    if (controller.Failed()) throw ClientError(EIO, controller.ErrorText());
+    if (controller.Failed()) throw ClientError(
+        controller.ErrorCode() == ETIMEDOUT || controller.ErrorCode() == brpc::ERPCTIMEDOUT
+            ? ETIMEDOUT : EIO, controller.ErrorText());
     if (!reply.has_status()) throw ClientError(EIO, "missing OpticalStatus");
     if (int error = StatusErrno(reply.status().code(), handle))
         throw ClientError(error, reply.status().message());
@@ -121,10 +126,11 @@ struct OpticalReadClient::Impl {
     std::map<std::string, std::shared_ptr<Record>> active;
 
     static void Log(const char* phase, const Record& r, uint64_t read_handle = 0) {
-        std::fprintf(stderr, "[optical] %s request=%s node=%s inode=%llu task=%llu read_handle=%llu\n",
+        std::fprintf(stderr, "[optical] %s request=%s node=%s inode=%llu task=%llu read_handle=%llu node_id=%s generation=%llu\n",
             phase, r.result.handle.value.c_str(), r.file.node_address.c_str(),
             (unsigned long long)r.file.inode_id, (unsigned long long)r.task_id,
-            (unsigned long long)read_handle);
+            (unsigned long long)read_handle, r.file.node_id.c_str(),
+            (unsigned long long)r.file.instance_generation);
     }
     explicit Impl(Options o) : options(o) {
         if (o.rpc_timeout_ms <= 0) throw ClientError(EINVAL, "RPC timeout must be positive");
@@ -197,9 +203,10 @@ struct OpticalReadClient::Impl {
                 if (!r.task_id) r.task_id = event.task_id();
                 r.state = State::Ready; // Published before notifying any watcher.
                 const auto us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - r.submitted).count();
-                std::fprintf(stderr, "[optical] ready request=%s inode=%llu task=%llu prepare_us=%lld\n",
+                std::fprintf(stderr, "[optical] ready request=%s inode=%llu task=%llu prepare_us=%lld node_id=%s generation=%llu\n",
                     r.result.handle.value.c_str(), (unsigned long long)r.file.inode_id,
-                    (unsigned long long)r.task_id, (long long)us);
+                    (unsigned long long)r.task_id, (long long)us, r.file.node_id.c_str(),
+                    (unsigned long long)r.file.instance_generation);
             }
             completion = {r.result, r.error, r.message};
             callbacks.swap(r.watchers);

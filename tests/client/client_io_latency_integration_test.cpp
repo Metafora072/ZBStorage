@@ -100,6 +100,16 @@ public:
             slice->set_length(std::min(end, i * 4 + 4) - std::max(offset, i * 4));
         }
     }
+    // Protocol compatibility for the existing latency scenarios; lock behavior
+    // is exercised with production processes by client_disk_external_test.py.
+    void AcquireFileWriteLock(google::protobuf::RpcController*, const rpc::AcquireFileWriteLockRequest*,
+                              rpc::AcquireFileWriteLockReply* reply, google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done); Delay(); reply->set_token("latency-fixture-token");
+    }
+    void ReleaseFileWriteLock(google::protobuf::RpcController*, const rpc::ReleaseFileWriteLockRequest*,
+                              rpc::ReleaseFileWriteLockReply*, google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done); Delay();
+    }
     void ResolveFileRead(google::protobuf::RpcController*, const rpc::ResolveFileReadRequest* request,
                          rpc::ResolveFileReadReply* reply, google::protobuf::Closure* done) override {
         brpc::ClosureGuard guard(done); Delay(); ++resolves; Meta(reply->mutable_meta());
@@ -235,7 +245,7 @@ void TestClientRequests() {
     FuseState state;
     Check(state.mds.Init(mds_server.Address()), "initialize MDS client");
     bool slow_resolver = false;
-    uint64_t resolver_ns = 0;
+    std::atomic<uint64_t> resolver_ns{0};
     state.data_nodes.SetNodeAddressResolver([&](const std::string&, std::string* address) {
         if (slow_resolver) {
             const auto begin = metrics::SteadyClock::now();
@@ -252,7 +262,7 @@ void TestClientRequests() {
         const int m = metadata.calls, d = node.calls;
         resolver_ns = 0;
         Check(call() == ret, "business result changed");
-        expected.push_back({ret, metadata.calls - m, node.calls - d, resolver_ns / 1000.0, tier});
+        expected.push_back({ret, metadata.calls - m, node.calls - d, resolver_ns.load() / 1000.0, tier});
     };
     char buffer[8]{};
     slow_resolver = true;
@@ -297,7 +307,9 @@ void TestClientRequests() {
         const double mds = std::stod(row[11]), data = std::stod(row[12]), total = std::stod(row[13]);
         Check(std::stoi(row[9]) == e.ret && row[10] == e.tier, "result or tier mismatch");
         Check(mds >= e.mds_calls * kMdsDelayUs && data >= e.data_calls * kNodeDelayUs, "RPC wait missing from cumulative timings, row " + std::to_string(i));
-        Check(total + 0.002 >= mds + data + e.local_us, "resolver/local time double-counted as RPC or total too small");
+        // Data RPC sum includes overlapping calls; it may exceed the wall clock.
+        Check(total + 0.002 >= mds, "metadata wait exceeds end-to-end wall time");
+        if (e.local_us > 0) Check(total >= e.local_us / FLAGS_disk_io_workers, "resolver time missing");
         if (e.mds_calls == 0) Check(mds == 0, "no MDS access should have zero latency");
         if (e.data_calls == 0) Check(data == 0, "no data access should have zero latency");
     }

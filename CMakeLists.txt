@@ -1063,6 +1063,23 @@ if(UNIX)
         target_link_libraries(zb_client_optical PUBLIC ${BRPC_DYNAMIC_LIB})
     endif()
 
+    add_library(zb_batch_sdk src/client/sdk/BatchIoClient.cpp)
+    target_include_directories(zb_batch_sdk PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(zb_batch_sdk PUBLIC Threads::Threads)
+    add_executable(zb_batch src/client/tools/zb_batch.cpp)
+    target_link_libraries(zb_batch PRIVATE zb_batch_sdk)
+
+    # Manual client/model integration driver; never part of ALL or CTest.
+    add_executable(scheduler_simulation_fixture EXCLUDE_FROM_ALL
+        tests/client/scheduler_simulation_fixture.cpp)
+    target_include_directories(scheduler_simulation_fixture PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR} ${ZBSTORAGE_BRPC_INCLUDE_DIRS})
+    target_link_libraries(scheduler_simulation_fixture PRIVATE zb_proto brpc-static
+        ${GFLAGS_LIBRARY} ${CMAKE_THREAD_LIBS_INIT})
+    if(BRPC_DYNAMIC_LIB)
+        target_link_libraries(scheduler_simulation_fixture PRIVATE ${BRPC_DYNAMIC_LIB})
+    endif()
+
     add_executable(zbctl src/client/tools/zbctl.cpp)
     target_link_libraries(zbctl PRIVATE zb_prepare_sdk)
 
@@ -1102,6 +1119,28 @@ if(UNIX)
         target_link_libraries(optical_external_services PRIVATE zb_proto brpc-static ${CMAKE_THREAD_LIBS_INIT})
         if(BRPC_DYNAMIC_LIB)
             target_link_libraries(optical_external_services PRIVATE ${BRPC_DYNAMIC_LIB})
+        endif()
+
+        set(REAL_NODE_TEST_SOURCES ${REAL_NODE_SOURCES})
+        list(REMOVE_ITEM REAL_NODE_TEST_SOURCES src/data_node/real_node/server/real_node_server.cpp)
+        add_executable(real_node_concurrent_test tests/real_node/concurrent_io_test.cpp ${REAL_NODE_TEST_SOURCES})
+        target_include_directories(real_node_concurrent_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR} ${ZBSTORAGE_BRPC_INCLUDE_DIRS})
+        target_link_libraries(real_node_concurrent_test PRIVATE zb_proto brpc-static Threads::Threads ${GFLAGS_LIBRARY})
+        if(BRPC_DYNAMIC_LIB)
+            target_link_libraries(real_node_concurrent_test PRIVATE ${BRPC_DYNAMIC_LIB})
+        endif()
+
+        add_executable(concurrent_io_test tests/client/concurrent_io_test.cpp
+            src/data_node/real_node/io/IOExecutor.cpp)
+        target_link_libraries(concurrent_io_test PRIVATE zb_batch_sdk)
+
+        add_executable(disk_external_services tests/client/disk_external_services.cpp)
+        target_include_directories(disk_external_services PRIVATE
+            ${CMAKE_CURRENT_BINARY_DIR} ${ZBSTORAGE_BRPC_INCLUDE_DIRS})
+        target_link_libraries(disk_external_services PRIVATE zb_proto brpc-static Threads::Threads)
+        if(BRPC_DYNAMIC_LIB)
+            target_link_libraries(disk_external_services PRIVATE ${BRPC_DYNAMIC_LIB})
         endif()
 
         add_executable(client_optical_read_test tests/client/client_optical_read_test.cpp)

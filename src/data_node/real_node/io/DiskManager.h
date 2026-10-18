@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <shared_mutex>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -39,6 +41,7 @@ private:
     static bool RefreshStats(DiskContext* disk);
     static bool RefreshSyntheticStats(DiskContext* disk, uint64_t synthetic_capacity_bytes);
 
+    mutable std::shared_mutex mu_;
     std::unordered_map<std::string, DiskContext> disks_;
     bool use_synthetic_capacity_{false};
     uint64_t synthetic_capacity_bytes_{0};

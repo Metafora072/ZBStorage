@@ -70,6 +70,8 @@ void OpticalStorageServiceImpl::ResetHandoffEngine() {
         config.capacity_in_images, config.available_id_count, config.disc_capacity_bytes,
         config.standard_images_per_disc, config.disc_block_size_bytes, config.max_write_images,
         config.scheduler_addr, BuildCDManagerConfig(config));
+    if (config.simple_archive_mds_enabled)
+        optical_node_manager_->ConfigureArchiveMds(config.mds_address, config.node_id, config.node_address);
     optical_node_manager_->SetPreparedFileReadyCallback(
         [this](const optical_node_manager::PreparedFileReadyEvent& ev) { SendReadReady(ev); });
     optical_node_manager_->SetMetricsCollectors(&metrics_cache_hit_, &metrics_disc_);

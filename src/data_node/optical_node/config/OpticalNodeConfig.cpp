@@ -160,6 +160,12 @@ OpticalNodeConfig OpticalNodeConfig::LoadFromFile(const std::string& path, std::
                 }
                 return {};
             }
+        } else if (key == "SIMPLE_ARCHIVE_MDS_ENABLED") {
+            if (value != "true" && value != "false") {
+                if (error) *error = "SIMPLE_ARCHIVE_MDS_ENABLED must be true or false";
+                return {};
+            }
+            cfg.simple_archive_mds_enabled = value == "true";
         } else if (key == "ARCHIVE_ROOT") {
             cfg.archive_root = value;
         } else if (key == "VOLUME_SIZE_BYTES") {

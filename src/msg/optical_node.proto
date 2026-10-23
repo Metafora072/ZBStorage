@@ -28,6 +28,7 @@ message ArchiveFile {
 message SendArchiveMetadataRequest {
   uint64 batch_id = 1;
   repeated ArchiveFile files = 2;
+  bool end_of_batch = 3; // single-job physical protocol: flush after all preceding files
 }
 
 message ArchiveReply {

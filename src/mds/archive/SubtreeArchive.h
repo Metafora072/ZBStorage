@@ -13,6 +13,8 @@ class ArchiveManifestBuilder {
 public:
     static NamespaceStatus Begin(const NamespaceStore&, const FileLocationResolver&,
         const std::string& root, uint32_t work_budget, std::unique_ptr<ArchiveManifestBuilder>*);
+    static NamespaceStatus BeginInodes(const NamespaceStore&, const FileLocationResolver&,
+        const std::vector<uint64_t>& inode_ids, std::unique_ptr<ArchiveManifestBuilder>*);
     NamespaceStatus Next(uint32_t max_files, ArchiveBatch*);
 private:
     ArchiveManifestBuilder(const FileLocationResolver& resolver, std::unique_ptr<NamespaceScanner> scan)
@@ -35,6 +37,9 @@ struct ArchiveSendProgress {
 };
 NamespaceStatus SendArchiveSubtree(const NamespaceStore&, const FileLocationResolver&,
     const std::string& root, uint64_t batch_id, uint32_t max_files, uint32_t work_budget,
+    ArchiveMetadataSink&, ArchiveSendProgress*);
+NamespaceStatus SendArchiveInodes(const NamespaceStore&, const FileLocationResolver&,
+    const std::vector<uint64_t>& inode_ids, uint64_t batch_id, uint32_t max_files,
     ArchiveMetadataSink&, ArchiveSendProgress*);
 // Connects to the physical OpticalNodeService protocol; max_retry is zero.
 NamespaceStatus MakeOpticalArchiveSink(const std::string& address, uint32_t timeout_ms,

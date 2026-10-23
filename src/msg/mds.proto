@@ -434,6 +434,7 @@ message SendSubtreeArchiveRequest {
   uint32 max_files_per_batch = 4; // 0 = 256; maximum 4096
   uint32 scan_work_budget = 5;    // 0 = 1024; maximum 65536
   uint32 rpc_timeout_ms = 6;      // 0 = 5000; maximum 60000, per optical call
+  repeated uint64 inode_ids = 7; // nonempty list OR root_path; duplicates are sent once
 }
 message SendSubtreeArchiveReply {
   MdsStatus status = 1;

@@ -77,3 +77,23 @@ files 为空、end_of_batch=true 的请求；空目录不发送。文件分片�
   不代表验证了物理光驱烧录。测试 peer 另验证容量溢出不会覆盖前一个镜像。
 
 运行产物均放 /mnt/metaiotest/filepath/results；保持固定实验数据集不变。
+
+## 按 inode ID 列表归档
+
+沿用 `MdsService.SendSubtreeArchive`，请求新增 `repeated uint64 inode_ids = 7`。
+`root_path` 与非空 `inode_ids` 必须二选一；两者都空或同时提供返回 INVALID_ARGUMENT。
+列表按第一次出现的顺序去重；ID 0 非法，缺失文件返回 NOT_FOUND，目录 inode 不递归展开。
+列表通过 GetInode 获取属性，复用目录入口的资格校验、位置查询、分片和结束标记。
+`scan_work_budget` 只影响目录输入；`max_files_per_batch` 对两种输入都生效。
+当前片中发现无效文件时整片不发送；此前已经发送的片不回滚，且不发送结束标记。
+
+```json
+{
+  "inode_ids": [101, 102, 103],
+  "optical_node_address": "127.0.0.1:9200",
+  "batch_id": 11,
+  "max_files_per_batch": 256
+}
+```
+
+此扩展不新增反向索引。第二次上报继续按 inode 中的镜像 ID 扫描更新。

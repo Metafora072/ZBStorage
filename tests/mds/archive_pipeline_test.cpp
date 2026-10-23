@@ -134,6 +134,30 @@ int main(int argc, char** argv) { try {
         }
         Check(ids == std::set<uint64_t>{a,b,c}, "subtree coverage");
     }
+    for (uint32_t page : {1u, 2u, 100u}) {
+        Capture listed, scanned; ArchiveSendProgress lp, sp;
+        Check(SendArchiveInodes(ns,resolver,{c,a,b,c,a},90,page,listed,&lp).ok(), "inode list send");
+        Check(SendArchiveSubtree(ns,resolver,"/tree",90,page,1,scanned,&sp).ok(), "reference subtree send");
+        auto fields = [](const Capture& cap) {
+            std::map<uint64_t,std::string> out;
+            for (const auto& request : cap.requests)
+                for (const auto& f : request.files()) out[f.inode_id()] = f.SerializeAsString();
+            return out;
+        };
+        Check(lp.acknowledged_files==3 && fields(listed)==fields(scanned), "deduplicated list matches subtree");
+        Check(listed.requests.front().files(0).inode_id()==c && listed.requests.back().end_of_batch(),
+              "first occurrence order and end marker");
+    }
+    for (auto ids : {std::vector<uint64_t>{}, {0}, {missing}, {1}}) {
+        Capture rejected; ArchiveSendProgress p;
+        const auto status = SendArchiveInodes(ns,resolver,ids,91,100,rejected,&p);
+        Check(status.code==(ids==std::vector<uint64_t>{missing} ? MDS_NOT_FOUND : MDS_INVALID_ARGUMENT)
+              && rejected.requests.empty(), "invalid/missing/directory list input");
+    }
+    Capture partial; ArchiveSendProgress partial_progress;
+    Check(SendArchiveInodes(ns,resolver,{a,missing},92,1,partial,&partial_progress).code==MDS_NOT_FOUND
+        && partial_progress.acknowledged_files==1 && partial.requests.size()==1,
+        "later invalid inode retains earlier progress and sends no end marker");
     Capture failed_end; failed_end.fail_at = 4; ArchiveSendProgress end_progress;
     Check(!SendArchiveSubtree(ns,resolver,"/tree",57,1,1024,failed_end,&end_progress).ok()
         && failed_end.requests.size()==4 && failed_end.requests.back().end_of_batch()

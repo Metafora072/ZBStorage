@@ -184,6 +184,20 @@ def main():
             require(int(empty_sent.get("attempted_batches", 0)) == 0, "empty subtree sends no RPC")
             rpc("Rmdir", {"path": "/archive_empty"})
             require(len(capture.read_text().splitlines()) == 3, "invalid/empty scans send no chunks")
+            list_request = dict(request, root_path="", inode_ids=[ids["b"],ids["a"],ids["b"]], batch_id=110)
+            listed = rpc("SendSubtreeArchive", list_request)
+            require(int(listed["acknowledged_files"])==2, "inode list deduplicates")
+            list_chunks = [json.loads(line) for line in capture.read_text().splitlines()][3:]
+            require(len(list_chunks)==3 and list_chunks[-1].get("end_of_batch"), "list final marker")
+            require({int(c["files"][0]["inode_id"]): c["files"][0] for c in list_chunks[:-1]}==files,
+                    "list and directory payloads match")
+            for bad in [dict(request,inode_ids=[ids["a"]]), dict(request,root_path=""),
+                        dict(list_request,inode_ids=[0]),dict(list_request,inode_ids=[1])]:
+                rpc("SendSubtreeArchive",bad,"MDS_INVALID_ARGUMENT")
+            dead=rpc("Create", {"path":"/list_gone","replica":1})["location"]["attr"]["inode_id"]
+            rpc("Unlink", {"path":"/list_gone"})
+            rpc("SendSubtreeArchive",dict(list_request,inode_ids=[dead]),"MDS_NOT_FOUND")
+            require(len(capture.read_text().splitlines())==6,"invalid list sends no data")
             failure_address, failure_capture = start_peer("optical_failure", 2)
             failed = rpc("SendSubtreeArchive", dict(request, optical_node_address=failure_address, batch_id=103),
                          "MDS_INTERNAL_ERROR")
@@ -213,7 +227,7 @@ def main():
                 except OSError:
                     require(time.monotonic() < deadline, "simple optical startup timeout")
                     time.sleep(0.1)
-            sent = rpc("SendSubtreeArchive", {"root_path": "/rpc_fixture",
+            sent = rpc("SendSubtreeArchive", {"inode_ids": [ids["a"], ids["b"], ids["a"]],
                 "optical_node_address": f"127.0.0.1:{port}", "batch_id": 301,
                 "max_files_per_batch": 1, "scan_work_budget": 1})
             require(int(sent["acknowledged_files"]) == 2, "simple archive submission")

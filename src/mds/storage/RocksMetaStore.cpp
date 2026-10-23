@@ -7,6 +7,29 @@ namespace zb::mds {
 
 namespace {
 
+bool NamespaceKey(const rocksdb::Slice& key) {
+    return key.starts_with("I/") || key.starts_with("D/");
+}
+bool Denied(bool disabled, const std::string& key, std::string* error) {
+    if (!disabled || !NamespaceKey(key)) return false;
+    if (error) *error = "RocksDB namespace access disabled in LHM mode";
+    return true;
+}
+bool CheckControlBatch(bool disabled, rocksdb::WriteBatch* batch, std::string* error) {
+    if (!disabled || !batch) return true;
+    struct Guard : rocksdb::WriteBatch::Handler {
+        rocksdb::Status PutCF(uint32_t, const rocksdb::Slice& key, const rocksdb::Slice&) override {
+            return NamespaceKey(key) ? rocksdb::Status::InvalidArgument("RocksDB namespace access disabled") : rocksdb::Status::OK();
+        }
+        rocksdb::Status DeleteCF(uint32_t, const rocksdb::Slice& key) override {
+            return NamespaceKey(key) ? rocksdb::Status::InvalidArgument("RocksDB namespace access disabled") : rocksdb::Status::OK();
+        }
+    } guard;
+    auto status = batch->Iterate(&guard);
+    if (!status.ok() && error) *error = status.ToString();
+    return status.ok();
+}
+
 constexpr const char* kLegacyDiskFileLocationColumnFamily = "disk_file_locations";
 constexpr const char* kLegacyOpticalFileLocationColumnFamily = "optical_file_locations";
 
@@ -81,6 +104,7 @@ bool RocksMetaStore::Open(const std::string& path, std::string* error) {
 }
 
 bool RocksMetaStore::Put(const std::string& key, const std::string& value, std::string* error) {
+    if (Denied(namespace_disabled_, key, error)) return false;
     std::lock_guard<std::mutex> lock(write_mu_);
     if (!db_) {
         if (error) {
@@ -99,6 +123,7 @@ bool RocksMetaStore::Put(const std::string& key, const std::string& value, std::
 }
 
 bool RocksMetaStore::Get(const std::string& key, std::string* value, std::string* error) const {
+    if (Denied(namespace_disabled_, key, error)) return false;
     if (!db_) {
         if (error) {
             *error = "DB not opened";
@@ -124,6 +149,7 @@ bool RocksMetaStore::Exists(const std::string& key, std::string* error) const {
 }
 
 bool RocksMetaStore::WriteBatch(rocksdb::WriteBatch* batch, std::string* error) {
+    if (!CheckControlBatch(namespace_disabled_, batch, error)) return false;
     std::lock_guard<std::mutex> lock(write_mu_);
     if (!db_) {
         if (error) {
@@ -152,6 +178,8 @@ bool RocksMetaStore::WriteBatchIfValueEquals(const std::string& key,
                                              rocksdb::WriteBatch* batch,
                                              bool* matched,
                                              std::string* error) {
+    if (!CheckControlBatch(namespace_disabled_, batch, error)) return false;
+    if (Denied(namespace_disabled_, key, error)) return false;
     if (matched) *matched = false;
     std::lock_guard<std::mutex> lock(write_mu_);
     if (!db_ || !batch) {

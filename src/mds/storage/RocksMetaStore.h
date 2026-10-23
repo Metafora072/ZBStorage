@@ -15,6 +15,8 @@ public:
     RocksMetaStore() = default;
     ~RocksMetaStore();
 
+    // Set once before serving LHM requests. Control keys remain available.
+    void DisableNamespaceAccess() { namespace_disabled_ = true; }
     bool Open(const std::string& path, std::string* error);
     bool Put(const std::string& key, const std::string& value, std::string* error);
     bool Get(const std::string& key, std::string* value, std::string* error) const;
@@ -30,6 +32,7 @@ public:
     rocksdb::DB* db() const { return db_; }
 
 private:
+    bool namespace_disabled_ = false;
     rocksdb::DB* db_{nullptr};
     std::unordered_map<std::string, rocksdb::ColumnFamilyHandle*> column_families_;
     mutable std::mutex write_mu_;

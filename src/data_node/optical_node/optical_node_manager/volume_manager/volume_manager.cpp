@@ -207,11 +207,13 @@ ErrorCode VolumeManager::AddFileToCollect(const std::string& file_path, uint64_t
         return ErrorCode::VOLUME_FULL;
     }
 
+    bool packed_previous = false;
     // 检查添加后是否会超过卷镜像大小限制（使用压缩后大小）
     if (pending_size_ + metadata.compressed_size > volume_size_) {
         // 先封装当前待封装文件集
         std::string volume_path;
         ErrorCode ret = PackVolume(volume_path, volume_id);
+        packed_previous = true;
         if (ret != ErrorCode::SUCCESS) {
             return ret;
         }
@@ -225,7 +227,7 @@ ErrorCode VolumeManager::AddFileToCollect(const std::string& file_path, uint64_t
     file_metadata_cache_[metadata.inode_id] = metadata;
 
     // 检查是否需要封装卷镜像
-    if (ShouldPackVolume()) {
+    if (!packed_previous && ShouldPackVolume()) {
         std::string volume_path;
         return PackVolume(volume_path, volume_id);
     }

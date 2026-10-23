@@ -40,6 +40,8 @@ struct NodeInfo {
 
 struct MdsConfig {
     std::string db_path;
+    std::string namespace_backend{"rocksdb"};
+    std::string lhm_store_file;
     std::string scheduler_address;
     uint32_t scheduler_refresh_ms{2000};
     std::string managed_node_id;

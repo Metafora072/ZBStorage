@@ -16,6 +16,7 @@ namespace zb::mds {
 class MasstreeImportService {
 public:
     struct TemplateGenerationRequest {
+        uint64_t file_count{0};
         std::string masstree_root;
         std::string template_id;
         std::string path_list_file;

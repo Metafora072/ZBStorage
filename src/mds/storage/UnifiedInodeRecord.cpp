@@ -59,7 +59,7 @@ bool IsValidLocationFormat(uint8_t value) {
 }
 
 bool IsValidArchiveState(uint32_t value) {
-    return value <= static_cast<uint32_t>(zb::rpc::INODE_ARCHIVE_ARCHIVED);
+    return value <= static_cast<uint32_t>(zb::rpc::INODE_ARCHIVE_IMAGE_READY);
 }
 
 zb::rpc::InodeStorageTier ToProtoStorageTier(uint8_t storage_tier) {
@@ -252,6 +252,13 @@ bool DecodeV3UnifiedInodeRecord(std::string_view data, UnifiedInodeRecord* out, 
     record.replica = ReadU16(data, kReplicaOffset);
     record.file_name.assign(data.data() + kFileNameOffset, file_name_len);
     ExpandPackedLocation(&record);
+    // Tagged auxiliary archive location for a hot primary; old v3 reserved bytes are zero.
+    if (record.storage_tier == static_cast<uint8_t>(UnifiedStorageTier::kDisk) &&
+        ReadU32(data, kReservedOffset) == 0x31435241U) { // ARC1
+        record.optical_image_id = ReadU32(data, kReservedOffset + 4);
+        record.optical_disk_id = ReadU64(data, kReservedOffset + 8);
+        record.optical_node_id = ReadU64(data, kReservedOffset + 16);
+    }
     FillDerivedPosixFields(&record, false);
     *out = std::move(record);
     if (error) {
@@ -342,6 +349,13 @@ bool EncodeUnifiedInodeRecord(const UnifiedInodeRecord& record, std::string* out
     WriteU32(out, kObjectUnitSizeOffset, static_cast<uint32_t>(normalized.object_unit_size));
     WriteU16(out, kReplicaOffset, static_cast<uint16_t>(normalized.replica));
     WriteU16(out, kReserved1Offset, 0);
+    if (normalized.storage_tier == static_cast<uint8_t>(UnifiedStorageTier::kDisk) &&
+        normalized.optical_image_id != 0) {
+        WriteU32(out, kReservedOffset, 0x31435241U);
+        WriteU32(out, kReservedOffset + 4, normalized.optical_image_id);
+        WriteU64(out, kReservedOffset + 8, normalized.optical_disk_id);
+        WriteU64(out, kReservedOffset + 16, normalized.optical_node_id);
+    }
     if (!normalized.file_name.empty()) {
         std::memcpy(out->data() + kFileNameOffset, normalized.file_name.data(), normalized.file_name.size());
     }
@@ -410,6 +424,9 @@ void UnifiedInodeRecordToAttr(const UnifiedInodeRecord& record, zb::rpc::InodeAt
             attr->set_disk_node_id(record.disk_node_id);
             attr->set_disk_id(record.disk_id);
             attr->set_disk_node_is_virtual((record.flags & kUnifiedFlagVirtualDiskNode) != 0);
+            attr->set_optical_node_id(record.optical_node_id);
+            attr->set_optical_disk_id(record.optical_disk_id);
+            attr->set_optical_image_id(record.optical_image_id);
             break;
         case UnifiedStorageTier::kOptical:
             attr->set_optical_node_id(record.optical_node_id);

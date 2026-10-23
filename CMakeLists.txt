@@ -765,7 +765,23 @@ target_link_libraries(pg_migration_sim_test
         ${CMAKE_THREAD_LIBS_INIT}
 )
 
+add_library(zb_archive_pipeline STATIC
+    src/mds/location/FileLocationResolver.cpp
+    src/mds/archive/SubtreeArchive.cpp)
+target_compile_features(zb_archive_pipeline PUBLIC cxx_std_17)
+target_include_directories(zb_archive_pipeline PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${ZBSTORAGE_BRPC_INCLUDE_DIRS})
+target_link_libraries(zb_archive_pipeline PUBLIC zb_proto brpc-static ${GFLAGS_LIBRARY} ${BRPC_DYNAMIC_LIB})
+
+add_library(zb_namespace_scan STATIC src/mds/storage/NamespaceScan.cpp)
+target_compile_features(zb_namespace_scan PUBLIC cxx_std_17)
+target_include_directories(zb_namespace_scan PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(zb_namespace_scan PUBLIC zb_proto)
+
+# Bundled RocksDB is built without RTTI; its WriteBatch handler subclasses must match.
+set_source_files_properties(src/mds/storage/RocksMetaStore.cpp PROPERTIES COMPILE_OPTIONS "-fno-rtti")
 add_executable(mds_server
+    src/mds/masstree_meta/LhmTemplateImporter.cpp
     src/mds/config/MdsConfig.cpp
     src/mds/common/SystemMemory.cpp
     src/mds/archive_meta/ArchiveBloomFilter.cpp
@@ -794,6 +810,7 @@ add_executable(mds_server
     src/mds/storage/MetaCodec.cpp
     src/mds/storage/UnifiedInodeRecord.cpp
     src/mds/storage/MetaStoreRouter.cpp
+    src/mds/storage/RocksNamespaceStore.cpp
     src/mds/storage/RocksMetaStore.cpp
     src/mds/allocator/NodeStateCache.cpp
     src/mds/allocator/CmsNodeRegistry.cpp
@@ -805,6 +822,8 @@ add_executable(mds_server
     src/common/metrics/NodeMetricsCollector.cpp
     src/common/metrics/SchedulerMetricsClient.cpp
     src/mds/service/MdsServiceImpl.cpp
+    src/mds/service/ArchiveSubtreeService.cpp
+    src/mds/service/SimpleArchiveService.cpp
     src/mds/service/OpticalLibraryHandoff.cpp
     src/mds/server/mds_server.cpp
 )
@@ -824,6 +843,8 @@ target_include_directories(mds_server
 )
 target_link_libraries(mds_server
     PRIVATE
+        zb_archive_pipeline
+        zb_namespace_scan
         zb_proto
         brpc-static
         ${GFLAGS_LIBRARY}
@@ -850,6 +871,25 @@ if(UNIX)
 endif()
 if(BRPC_DYNAMIC_LIB)
     target_link_libraries(mds_server PRIVATE ${BRPC_DYNAMIC_LIB})
+endif()
+
+if(BUILD_TESTING)
+    # Requires an explicit fresh runtime directory; see docs/design/namespace-store.md.
+    add_executable(lhm_inode_id_test tests/mds/lhm_inode_id_test.cpp)
+    target_compile_features(lhm_inode_id_test PRIVATE cxx_std_17)
+    target_include_directories(lhm_inode_id_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME lhm_inode_id_contract COMMAND lhm_inode_id_test)
+    add_executable(namespace_store_test
+        tests/mds/namespace_store_test.cpp
+        src/mds/storage/RocksNamespaceStore.cpp
+        src/mds/storage/RocksMetaStore.cpp
+        src/mds/storage/MetaCodec.cpp
+        src/mds/storage/UnifiedInodeRecord.cpp
+    )
+    target_compile_features(namespace_store_test PRIVATE cxx_std_20)
+    target_include_directories(namespace_store_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR} ${ROCKSDB_ROOT}/include)
+    target_link_libraries(namespace_store_test PRIVATE zb_namespace_scan zb_proto ${ROCKSDB_TARGET})
 endif()
 
 add_library(zb_storage_model
@@ -1174,6 +1214,14 @@ if(UNIX)
 endif()
 
 if(BUILD_TESTING)
+    get_target_property(ZB_SIMPLE_OPTICAL_SOURCES optical_node_server SOURCES)
+    list(REMOVE_ITEM ZB_SIMPLE_OPTICAL_SOURCES src/data_node/optical_node/server/optical_node_server.cpp)
+    get_target_property(ZB_SIMPLE_OPTICAL_INCLUDES optical_node_server INCLUDE_DIRECTORIES)
+    get_target_property(ZB_SIMPLE_OPTICAL_LIBS optical_node_server LINK_LIBRARIES)
+    add_executable(simple_archive_optical_peer EXCLUDE_FROM_ALL
+        tests/mds/simple_archive_optical_peer.cpp ${ZB_SIMPLE_OPTICAL_SOURCES})
+    target_include_directories(simple_archive_optical_peer PRIVATE ${ZB_SIMPLE_OPTICAL_INCLUDES})
+    target_link_libraries(simple_archive_optical_peer PRIVATE ${ZB_SIMPLE_OPTICAL_LIBS})
     add_executable(optical_node_archive_integration_test EXCLUDE_FROM_ALL
         tests/optical_node/optical_node_archive_integration_test.cpp
         tests/optical_node/fake_services.cpp
@@ -1215,4 +1263,27 @@ if(BUILD_TESTING)
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src/data_node/optical_node/optical_node_manager
     )
+endif()
+
+option(ZB_BUILD_LHM_BRIDGE "Build isolated experimental LHM inode bridge" OFF)
+if(ZB_BUILD_LHM_BRIDGE)
+    find_package(Threads REQUIRED)
+    add_subdirectory(src/mds/lhm)
+    target_link_libraries(mds_server PRIVATE zb_lhm_inode_store)
+    target_compile_definitions(mds_server PRIVATE ZB_HAS_LHM=1)
+endif()
+
+if(BUILD_TESTING AND ZB_BUILD_LHM_BRIDGE)
+    # Exercise service handlers without requiring socket permission.
+    get_target_property(ZB_MDS_SERVICE_SOURCES mds_server SOURCES)
+    list(REMOVE_ITEM ZB_MDS_SERVICE_SOURCES src/mds/server/mds_server.cpp)
+    get_target_property(ZB_MDS_TEST_INCLUDES mds_server INCLUDE_DIRECTORIES)
+    get_target_property(ZB_MDS_TEST_LIBS mds_server LINK_LIBRARIES)
+    get_target_property(ZB_MDS_TEST_DEFS mds_server COMPILE_DEFINITIONS)
+    add_executable(lhm_mds_service_test tests/mds/lhm_mds_service_test.cpp ${ZB_MDS_SERVICE_SOURCES})
+    target_compile_features(lhm_mds_service_test PRIVATE cxx_std_20)
+    target_include_directories(lhm_mds_service_test PRIVATE ${ZB_MDS_TEST_INCLUDES})
+    target_compile_definitions(lhm_mds_service_test PRIVATE ${ZB_MDS_TEST_DEFS})
+    target_compile_options(lhm_mds_service_test PRIVATE -Wno-deprecated-declarations)
+    target_link_libraries(lhm_mds_service_test PRIVATE ${ZB_MDS_TEST_LIBS})
 endif()

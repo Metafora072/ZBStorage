@@ -29,7 +29,8 @@ enum InodeType {
 enum InodeArchiveState {
   INODE_ARCHIVE_PENDING = 0;
   INODE_ARCHIVE_ARCHIVING = 1;
-  INODE_ARCHIVE_ARCHIVED = 2;
+  INODE_ARCHIVE_ARCHIVED = 2; // completed
+  INODE_ARCHIVE_IMAGE_READY = 3;
 }
 
 message InodeAttr {
@@ -394,6 +395,54 @@ message RmdirReply {
   MdsStatus status = 1;
 }
 
+// Synchronous metadata delivery to a physical optical node, not archive completion.
+// Caller keeps the selected subtree/files unchanged and chooses a fresh nonzero
+// batch ID. No retries, leases, snapshots or durable job state are provided.
+// Simple single-MDS archive protocol. IDs are process-lifetime allocations;
+// restart/recovery, transactions and concurrent archive jobs are out of scope.
+message AllocateAvailableImageIdRequest {
+  string node_id = 1;
+  string node_address = 2;
+  uint64 allocate_ts_ms = 3;
+}
+message AllocateAvailableImageIdReply { MdsStatus status = 1; string image_id = 2; }
+message AllocateAvailableDiscIdRequest {
+  string node_id = 1;
+  string node_address = 2;
+  uint64 allocate_ts_ms = 3;
+}
+message AllocateAvailableDiscIdReply { MdsStatus status = 1; string disc_id = 2; }
+message ReportFilesPackedToImageRequest {
+  string node_id = 1;
+  string image_id = 2;
+  repeated uint64 inode_ids = 3;
+}
+message ReportImagesBurnedToDiscRequest {
+  string node_id = 1;
+  string disc_id = 2;
+  repeated string image_ids = 3;
+}
+message SimpleArchiveReportReply {
+  MdsStatus status = 1;
+  uint64 updated_files = 2; // writes completed before return, including on error
+}
+
+message SendSubtreeArchiveRequest {
+  string root_path = 1;
+  string optical_node_address = 2;
+  uint64 batch_id = 3;
+  uint32 max_files_per_batch = 4; // 0 = 256; maximum 4096
+  uint32 scan_work_budget = 5;    // 0 = 1024; maximum 65536
+  uint32 rpc_timeout_ms = 6;      // 0 = 5000; maximum 60000, per optical call
+}
+message SendSubtreeArchiveReply {
+  MdsStatus status = 1;
+  uint64 acknowledged_files = 2;
+  uint64 acknowledged_batches = 3;
+  uint64 attempted_batches = 4;
+  bool last_batch_may_be_accepted = 5;
+}
+
 message GetFileLocationRequest {
   uint64 inode_id = 1;
 }
@@ -588,6 +637,7 @@ message ImportArchiveNamespaceReply {
 }
 
 message GenerateMasstreeTemplateRequest {
+  uint64 file_count = 7; // 0 preserves legacy default; required explicitly in LHM mode.
   string template_id = 1;
   string path_list_file = 2;
   string repeat_dir_prefix = 3;
@@ -762,6 +812,11 @@ message GetMasstreeNamespaceStatsReply {
 }
 
 service MdsService {
+  rpc AllocateAvailableImageId(AllocateAvailableImageIdRequest) returns (AllocateAvailableImageIdReply);
+  rpc AllocateAvailableDiscId(AllocateAvailableDiscIdRequest) returns (AllocateAvailableDiscIdReply);
+  rpc ReportFilesPackedToImage(ReportFilesPackedToImageRequest) returns (SimpleArchiveReportReply);
+  rpc ReportImagesBurnedToDisc(ReportImagesBurnedToDiscRequest) returns (SimpleArchiveReportReply);
+  rpc SendSubtreeArchive(SendSubtreeArchiveRequest) returns (SendSubtreeArchiveReply);
   rpc Lookup(LookupRequest) returns (LookupReply);
   rpc Getattr(GetattrRequest) returns (GetattrReply);
   rpc Open(OpenRequest) returns (OpenReply);

@@ -54,6 +54,9 @@ public:
                        const std::string& scheduler_addr,
                        cd_manager_sim::CDManagerConfig cd_manager_config);
 
+    // Configure before Run; empty address retains standalone local-ID mode.
+    void ConfigureArchiveMds(const std::string& address, const std::string& node,
+                             const std::string& node_address);
     ~OpticalNodeManager();
 
     OpticalNodeManager(const OpticalNodeManager&) = delete;
@@ -158,6 +161,10 @@ public:
     volumemanager::ErrorCode ReleasePreparedRead(uint64_t task_id);
 
 private:
+    std::string archive_mds_address_, archive_node_id_, archive_node_address_;
+    uint64_t AllocateArchiveId(bool image);
+    volumemanager::ErrorCode FlushArchiveTail();
+
     // #endregion
 
     // #region 1. 状态设置
@@ -339,8 +346,8 @@ private:
 
     // 封装触发后调用：扫描 temp_dir_ 剩余 temp_*.compressed，与待打包集合 diff，
     // 从集合移除本次已打包的 inode_id，并把 volume_id → inode_ids 对应关系打印到控制台
-    // （MDS 的 ReportFilesPackedToImage 上报接口未完善前的替代）。
-    void ReportPackedInodes(const std::string& volume_id);
+    // 集成模式同步上报 MDS，返回 false 表示上报失败。
+    bool ReportPackedInodes(const std::string& volume_id);
 
     // 把已登记到 image_dir_ 的写镜像纳入待打包光盘：
     //   1) 计算 vimg 实大小与 SHA-256，构造 DiscImageEntry；
@@ -382,9 +389,9 @@ private:
                                     uint64_t disc_id);
 
     // 第二次上报（镜像 → 光盘）：把本盘包含的全部镜像上报给 MDS。
-    // MDS 的 ReportImagesBurnedToDisc 上报接口未完善前，先以控制台输出替代
+    // 集成模式同步上报 MDS；独立模式只输出日志
     // （格式与 proto 字段对齐：disc_id + image_ids）。
-    void ReportImagesBurnedToDisc(const std::string& disc_id,
+    bool ReportImagesBurnedToDisc(const std::string& disc_id,
                                   const std::vector<DiscImageEntry>& entries);
     // #endregion
 

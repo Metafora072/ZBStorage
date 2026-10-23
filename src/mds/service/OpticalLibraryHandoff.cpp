@@ -92,6 +92,13 @@ void MdsServiceImpl::CommitOpticalLibraryHandoff(google::protobuf::RpcController
     const zb::rpc::CommitOpticalLibraryHandoffRequest* request,
     zb::rpc::CommitOpticalLibraryHandoffReply* response, google::protobuf::Closure* done) {
     brpc::ClosureGuard guard(done);
+    if (!response) return;
+    if (unified_namespace_) {
+        FillStatus(response->mutable_status(), zb::rpc::MDS_INVALID_ARGUMENT,
+                   "CommitOpticalLibraryHandoff is not supported in LHM namespace mode");
+        return;
+    }
+
     const auto fail = [&](zb::rpc::MdsStatusCode code, const std::string& msg) {
         FillStatus(response->mutable_status(), code, msg);
     };

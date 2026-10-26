@@ -154,7 +154,7 @@ inline const char* WRTaskStateToString(WRTaskState state) {
 //   DISC_BURN            光盘级刻录任务：一张光盘包含多个卷镜像，volume_ids 有效
 //   READ_BATCH_BY_VOLUME 仅 volume_id 有效，镜像就绪后批量推进该卷下挂起的 READ 任务
 //   CD_READ              光盘库读请求：让光盘库把某卷镜像加载回 image_dir_（不产出用户数据）
-enum class WRTaskType { READ, WRITE, CD_BURN, DISC_BURN, READ_BATCH_BY_VOLUME, CD_READ };
+enum class WRTaskType { READ, WRITE, CD_BURN, DISC_BURN, READ_BATCH_BY_VOLUME, CD_READ, ARCHIVE_FLUSH };
 
 inline const char* WRTaskTypeToString(WRTaskType type) {
     switch (type) {
@@ -164,6 +164,7 @@ inline const char* WRTaskTypeToString(WRTaskType type) {
         case WRTaskType::DISC_BURN:            return "DISC_BURN";
         case WRTaskType::READ_BATCH_BY_VOLUME: return "READ_BATCH_BY_VOLUME";
         case WRTaskType::CD_READ:              return "CD_READ";
+        case WRTaskType::ARCHIVE_FLUSH:        return "ARCHIVE_FLUSH";
     }
     return "UNKNOWN";
 }
@@ -1061,6 +1062,7 @@ struct ArchiveFileInfo {
 struct SendArchiveMetadataRequest {
     uint64_t batch_id{0};
     std::vector<ArchiveFileInfo> files;
+    bool end_of_batch{false}; // ephemeral, no restart guarantee
 };
 
 // SubmitPrepareTask 的入参：一次整文件异步准备请求的定位信息与上层关联信息。
@@ -1783,7 +1785,7 @@ inline bool ParseWRTaskBlob(const uint8_t* data, size_t size, WR_task::WRTask& o
         !reader.ReadU32(&volume_ids_count)) {
         return false;
     }
-    if (type > static_cast<uint32_t>(WR_task::WRTaskType::CD_READ) ||
+    if (type > static_cast<uint32_t>(WR_task::WRTaskType::ARCHIVE_FLUSH) ||
         state > static_cast<uint32_t>(WR_task::WRTaskState::FAILED)) {
         return false;
     }

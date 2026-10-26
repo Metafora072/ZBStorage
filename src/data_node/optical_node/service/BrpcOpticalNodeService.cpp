@@ -225,6 +225,7 @@ void BrpcOpticalNodeService::SendArchiveMetadata(google::protobuf::RpcController
     // protobuf 请求 -> manager 领域对象。
     optical_node_manager::SendArchiveMetadataRequest domain_request;
     domain_request.batch_id = request->batch_id();
+    domain_request.end_of_batch = request->end_of_batch();
     domain_request.files.reserve(static_cast<std::size_t>(request->files_size()));
     for (const zb::rpc::ArchiveFile& file : request->files()) {
         optical_node_manager::ArchiveFileInfo info;

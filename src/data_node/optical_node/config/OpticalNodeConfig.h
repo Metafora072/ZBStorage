@@ -11,6 +11,7 @@ struct OpticalNodeConfig {
     std::string node_address;
     std::string scheduler_addr;
     // 权威交接确认地址；源清理只能向此部署配置中的 MDS 查询。
+    bool simple_archive_mds_enabled{false}; // opt-in, fresh single-MDS archive session
     std::string mds_address{"127.0.0.1:9000"};
     std::string group_id;
     std::string node_role;

@@ -29,7 +29,9 @@
 #include "../storage/MetaStoreRouter.h"
 #include "../storage/MetaSchema.h"
 #include "../storage/RocksMetaStore.h"
+#include "../storage/RocksNamespaceStore.h"
 #include "mds.pb.h"
+#include "../location/FileLocationResolver.h"
 #include "common/metrics/NodeMetricsCollector.h"
 #include "common/rpc/FiberSharedMutex.h"
 #include <bthread/mutex.h>
@@ -53,7 +55,8 @@ public:
                    bool masstree_preload_background,
                    CmsNodeRegistry* node_registry,
                    FileArchiveCandidateQueue* candidate_queue = nullptr,
-                   ArchiveLeaseManager* lease_manager = nullptr);
+                   ArchiveLeaseManager* lease_manager = nullptr,
+                   NamespaceStore* namespace_store = nullptr, bool unified_namespace = false);
     ~MdsServiceImpl() override;
     void CommitPhysicalOpticalArchive(google::protobuf::RpcController*, const zb::rpc::ModelOpticalArchiveRequest*,
                                       zb::rpc::ModelOpticalArchiveReply*, google::protobuf::Closure*) override;
@@ -114,6 +117,17 @@ public:
                const zb::rpc::RmdirRequest* request,
                zb::rpc::RmdirReply* response,
                google::protobuf::Closure* done) override;
+    void AllocateAvailableImageId(google::protobuf::RpcController*, const zb::rpc::AllocateAvailableImageIdRequest*,
+        zb::rpc::AllocateAvailableImageIdReply*, google::protobuf::Closure*) override;
+    void AllocateAvailableDiscId(google::protobuf::RpcController*, const zb::rpc::AllocateAvailableDiscIdRequest*,
+        zb::rpc::AllocateAvailableDiscIdReply*, google::protobuf::Closure*) override;
+    void ReportFilesPackedToImage(google::protobuf::RpcController*, const zb::rpc::ReportFilesPackedToImageRequest*,
+        zb::rpc::SimpleArchiveReportReply*, google::protobuf::Closure*) override;
+    void ReportImagesBurnedToDisc(google::protobuf::RpcController*, const zb::rpc::ReportImagesBurnedToDiscRequest*,
+        zb::rpc::SimpleArchiveReportReply*, google::protobuf::Closure*) override;
+    void SendSubtreeArchive(google::protobuf::RpcController*,
+                           const zb::rpc::SendSubtreeArchiveRequest*,
+                           zb::rpc::SendSubtreeArchiveReply*, google::protobuf::Closure*) override;
     void GetFileLocation(google::protobuf::RpcController* cntl_base,
                        const zb::rpc::GetFileLocationRequest* request,
                        zb::rpc::GetFileLocationReply* response,
@@ -240,9 +254,6 @@ private:
     bool ResolveParent(const std::string& path, uint64_t* parent_inode, std::string* name, std::string* error);
     bool GetInode(uint64_t inode_id, zb::rpc::InodeAttr* attr, std::string* error);
     bool PutInode(uint64_t inode_id, const zb::rpc::InodeAttr& attr, std::string* error);
-    bool PutDentry(uint64_t parent_inode, const std::string& name, uint64_t inode_id, std::string* error);
-    bool DeleteDentry(uint64_t parent_inode, const std::string& name, std::string* error);
-    bool DentryExists(uint64_t parent_inode, const std::string& name, std::string* error);
     bool DeleteInodeData(uint64_t inode_id, std::string* error);
     bool ResolveObjectReplicas(uint32_t replica_count,
                                const std::string& object_id,
@@ -266,25 +277,19 @@ private:
     bool SavePathPlacementPolicy(const zb::rpc::PathPlacementPolicyRecord& policy, std::string* error);
     bool DeletePathPlacementPolicyByPrefix(const std::string& path_prefix, std::string* error);
     bool LoadDiskFileLocation(uint64_t inode_id, zb::rpc::DiskFileLocation* location, std::string* error) const;
-    bool BuildDiskFileLocationFromAttr(const zb::rpc::InodeAttr& attr,
-                                       zb::rpc::DiskFileLocation* location,
-                                       std::string* error) const;
+    bool BuildDiskFileLocationFromAttr(const zb::rpc::InodeAttr&, zb::rpc::DiskFileLocation*, std::string*) const;
+    bool BuildOpticalFileLocationFromAttr(const zb::rpc::InodeAttr&, uint64_t,
+                                         zb::rpc::OpticalFileLocation*, std::string*) const;
     bool SaveDiskFileLocation(uint64_t inode_id,
                               const zb::rpc::DiskFileLocation& location,
                               rocksdb::WriteBatch* batch) const;
-    bool DeleteDiskFileLocation(uint64_t inode_id, rocksdb::WriteBatch* batch, std::string* error) const;
     bool LoadOpticalFileLocation(uint64_t inode_id, zb::rpc::OpticalFileLocation* location, std::string* error) const;
-    bool BuildOpticalFileLocationFromAttr(const zb::rpc::InodeAttr& attr,
-                                          uint64_t inode_id,
-                                          zb::rpc::OpticalFileLocation* location,
-                                          std::string* error) const;
     bool LoadMasstreeOpticalFileLocation(uint64_t inode_id,
                                          zb::rpc::OpticalFileLocation* location,
                                          std::string* error) const;
     bool SaveOpticalFileLocation(uint64_t inode_id,
                                  const zb::rpc::OpticalFileLocation& location,
                                  rocksdb::WriteBatch* batch) const;
-    bool DeleteOpticalFileLocation(uint64_t inode_id, rocksdb::WriteBatch* batch, std::string* error) const;
     bool BuildFileLocationView(uint64_t inode_id,
                                const zb::rpc::InodeAttr& attr,
                                zb::rpc::FileLocationView* view,
@@ -327,13 +332,21 @@ private:
     void TryPreloadMasstreeSparseIndexes();
     void RunMasstreePreloadWorker();
 
-    uint64_t AllocateInodeId(std::string* error);
     uint64_t AllocateHandleId(std::string* error);
     static uint64_t NowSeconds();
     static uint64_t NowMilliseconds();
     static void FillStatus(zb::rpc::MdsStatus* status, zb::rpc::MdsStatusCode code, const std::string& message);
 
     RocksMetaStore* store_{};
+    RocksNamespaceStore default_namespace_store_;
+    bool unified_namespace_ = false;
+    std::unique_ptr<RecordFileLocationResolver> location_resolver_;
+    // Simple archive allocation records only; no image -> inode reverse index yet.
+    struct SimpleArchiveAllocation { uint64_t id; std::string node_id; };
+    std::mutex simple_archive_mutex_;
+    uint64_t next_simple_archive_id_{1};
+    std::unordered_map<std::string, SimpleArchiveAllocation> simple_images_, simple_discs_;
+    NamespaceStore* namespace_store_{}; // borrowed, must outlive this service
     ObjectAllocator* allocator_{};
     CmsNodeRegistry* node_registry_{};
     uint64_t default_object_unit_size_{0};

@@ -612,6 +612,9 @@ bool MasstreeMetaStore::Readdir(const MasstreeNamespaceRoute& route,
         }
         return true;
     }
+    std::error_code size_error;
+    const auto dentry_file_size = std::filesystem::file_size(generation->manifest->dentry_pages_path, size_error);
+    if (size_error) { if (error) *error = "cannot stat masstree dentry pages"; return false; }
     uint64_t page_offset = sparse_entry.page_offset;
     while (entries->size() < limit) {
         MasstreeDentryPage page;
@@ -645,7 +648,7 @@ bool MasstreeMetaStore::Readdir(const MasstreeNamespaceRoute& route,
             if (entries->size() == limit) {
                 if (has_more) {
                     *has_more = index + 1 < page.entries.size() ||
-                                (page.next_page_offset > page.page_offset);
+                                (page.next_page_offset > page.page_offset && page.next_page_offset < dentry_file_size);
                 }
                 if (next_token && has_more && *has_more) {
                     *next_token = EncodeMasstreeReaddirToken(generation->manifest->generation_id, hit.name);
@@ -658,7 +661,7 @@ bool MasstreeMetaStore::Readdir(const MasstreeNamespaceRoute& route,
         }
         if (page.entries.empty() ||
             page.entries.back().parent_inode != inode_id ||
-            page.next_page_offset <= page.page_offset) {
+            page.next_page_offset <= page.page_offset || page.next_page_offset == dentry_file_size) {
             break;
         }
         page_offset = page.next_page_offset;

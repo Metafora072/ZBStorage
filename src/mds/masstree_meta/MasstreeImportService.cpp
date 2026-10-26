@@ -325,7 +325,7 @@ bool MasstreeImportService::GenerateTemplate(const TemplateGenerationRequest& re
     internal_request.path_list_file = request.path_list_file;
     internal_request.repeat_dir_prefix = request.repeat_dir_prefix;
     internal_request.path_list_leaf_nodes_are_files = request.path_list_leaf_nodes_are_files;
-    internal_request.file_count = kMasstreeTemplateTargetFileCount;
+    internal_request.file_count = request.file_count ? request.file_count : kMasstreeTemplateTargetFileCount;
     internal_request.verify_inode_samples = request.verify_inode_samples;
     internal_request.verify_dentry_samples = request.verify_dentry_samples;
 

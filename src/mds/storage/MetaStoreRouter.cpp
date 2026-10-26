@@ -1,71 +1,34 @@
 #include "MetaStoreRouter.h"
 
-#include <memory>
-#include <sstream>
 #include <vector>
-
-#include <rocksdb/iterator.h>
 
 namespace zb::mds {
 
-namespace {
-
-std::vector<std::string> SplitPath(const std::string& path) {
-    std::vector<std::string> parts;
-    std::string token;
-    std::istringstream stream(path);
-    while (std::getline(stream, token, '/')) {
-        if (!token.empty()) {
-            parts.push_back(token);
-        }
-    }
-    return parts;
-}
-
-} // namespace
-
-MetaStoreRouter::MetaStoreRouter(RocksMetaStore* hot_store,
+MetaStoreRouter::MetaStoreRouter(NamespaceStore* hot_store,
                                  ArchiveNamespaceCatalog* archive_catalog,
                                  ArchiveMetaStore* archive_store,
                                  MasstreeNamespaceCatalog* masstree_catalog,
-                                 MasstreeMetaStore* masstree_store)
-    : hot_store_(hot_store),
+                                 MasstreeMetaStore* masstree_store, bool unified)
+    : unified_(unified), hot_store_(hot_store),
       archive_catalog_(archive_catalog),
       archive_store_(archive_store),
       masstree_catalog_(masstree_catalog),
       masstree_store_(masstree_store) {
 }
 
-bool MetaStoreRouter::GetInode(uint64_t inode_id,
-                               zb::rpc::InodeAttr* attr,
+bool MetaStoreRouter::GetInode(uint64_t inode_id, zb::rpc::InodeAttr* attr,
                                std::string* error) const {
+    if (error) error->clear();
     if (!hot_store_ || !attr || inode_id == 0) {
-        if (error) {
-            *error = "invalid inode lookup args";
-        }
+        if (error) *error = "invalid inode lookup args";
         return false;
     }
-    std::string data;
-    if (!hot_store_->Get(InodeKey(inode_id), &data, error)) {
-        if (error && !error->empty()) {
-            return false;
-        }
-        if (GetArchiveInode(inode_id, attr, error)) {
-            return true;
-        }
-        if (error && !error->empty()) {
-            return false;
-        }
-        return GetMasstreeInode(inode_id, attr, error);
-    }
-    std::string decode_error;
-    if (!MetaCodec::DecodeUnifiedInodeAttr(data, attr, &decode_error)) {
-        if (error) {
-            *error = decode_error.empty() ? "invalid inode data" : decode_error;
-        }
-        return false;
-    }
-    return true;
+    if (unified_) return hot_store_->GetInode(inode_id, attr, error);
+    if (hot_store_->GetInode(inode_id, attr, error)) return true;
+    if (error && !error->empty()) return false;
+    if (GetArchiveInode(inode_id, attr, error)) return true;
+    if (error && !error->empty()) return false;
+    return GetMasstreeInode(inode_id, attr, error);
 }
 
 bool MetaStoreRouter::GetArchiveInode(uint64_t inode_id,
@@ -158,33 +121,11 @@ bool MetaStoreRouter::GetMasstreeInode(uint64_t inode_id,
     return false;
 }
 
-bool MetaStoreRouter::GetDentry(uint64_t parent_inode,
-                                const std::string& name,
-                                uint64_t* inode_id,
-                                std::string* error) const {
-    if (!hot_store_ || !inode_id || parent_inode == 0 || name.empty()) {
-        if (error) {
-            *error = "invalid dentry lookup args";
-        }
-        return false;
-    }
-    std::string data;
-    if (!hot_store_->Get(DentryKey(parent_inode, name), &data, error)) {
-        return false;
-    }
-    if (!MetaCodec::DecodeUInt64(data, inode_id)) {
-        if (error) {
-            *error = "invalid dentry";
-        }
-        return false;
-    }
-    return true;
-}
-
 bool MetaStoreRouter::ResolvePath(const std::string& path,
                                   uint64_t* inode_id,
                                   zb::rpc::InodeAttr* attr,
                                   std::string* error) const {
+    if (unified_) return hot_store_->ResolvePath(path, inode_id, attr, error);
     if (!inode_id) {
         if (error) {
             *error = "inode_id output is null";
@@ -214,35 +155,7 @@ bool MetaStoreRouter::ResolvePath(const std::string& path,
         return false;
     }
 
-    std::vector<std::string> parts = SplitPath(path);
-    uint64_t current = kRootInodeId;
-    if (parts.empty()) {
-        *inode_id = current;
-        if (attr) {
-            return GetInode(current, attr, error);
-        }
-        if (error) {
-            error->clear();
-        }
-        return true;
-    }
-
-    for (const auto& name : parts) {
-        uint64_t next = 0;
-        if (!GetDentry(current, name, &next, error)) {
-            return false;
-        }
-        current = next;
-    }
-
-    *inode_id = current;
-    if (attr) {
-        return GetInode(current, attr, error);
-    }
-    if (error) {
-        error->clear();
-    }
-    return true;
+    return hot_store_->ResolvePath(path, inode_id, attr, error);
 }
 
 bool MetaStoreRouter::Readdir(const std::string& path,
@@ -252,6 +165,7 @@ bool MetaStoreRouter::Readdir(const std::string& path,
                               bool* has_more,
                               std::string* next_token,
                               std::string* error) const {
+    if (unified_) return hot_store_->Readdir(path, start_after, limit, entries, has_more, next_token, error);
     if (!entries) {
         if (error) {
             *error = "entries output is null";
@@ -293,92 +207,7 @@ bool MetaStoreRouter::Readdir(const std::string& path,
         return false;
     }
 
-    zb::rpc::InodeAttr attr;
-    uint64_t inode_id = 0;
-    if (!ResolvePath(path, &inode_id, &attr, error)) {
-        return false;
-    }
-    if (attr.type() != zb::rpc::INODE_DIR) {
-        if (error) {
-            *error = "not a directory";
-        }
-        return false;
-    }
-    return ReaddirHot(inode_id, start_after, limit, entries, has_more, next_token, error);
-}
-
-bool MetaStoreRouter::ReaddirHot(uint64_t parent_inode,
-                                 const std::string& start_after,
-                                 uint32_t limit,
-                                 std::vector<zb::rpc::Dentry>* entries,
-                                 bool* has_more,
-                                 std::string* next_token,
-                                 std::string* error) const {
-    if (!hot_store_ || !entries || !hot_store_->db() || parent_inode == 0) {
-        if (error) {
-            *error = "invalid readdir args";
-        }
-        return false;
-    }
-    if (has_more) {
-        *has_more = false;
-    }
-    if (next_token) {
-        next_token->clear();
-    }
-
-    const std::string prefix = DentryPrefix(parent_inode);
-    const std::string seek_key = prefix + start_after;
-    std::unique_ptr<rocksdb::Iterator> it(hot_store_->db()->NewIterator(rocksdb::ReadOptions()));
-    for (it->Seek(start_after.empty() ? prefix : seek_key); it->Valid(); it->Next()) {
-        if (!it->key().starts_with(prefix)) {
-            break;
-        }
-        const std::string name = it->key().ToString().substr(prefix.size());
-        if (!start_after.empty() && name <= start_after) {
-            continue;
-        }
-        uint64_t child_inode = 0;
-        if (!MetaCodec::DecodeUInt64(it->value().ToString(), &child_inode)) {
-            continue;
-        }
-        zb::rpc::InodeAttr child_attr;
-        std::string inode_error;
-        if (!GetInode(child_inode, &child_attr, &inode_error)) {
-            continue;
-        }
-        zb::rpc::Dentry entry;
-        entry.set_name(name);
-        entry.set_inode_id(child_inode);
-        entry.set_type(child_attr.type());
-        entries->push_back(std::move(entry));
-        if (next_token) {
-            *next_token = name;
-        }
-        if (limit > 0 && entries->size() >= limit) {
-            for (it->Next(); it->Valid(); it->Next()) {
-                if (!it->key().starts_with(prefix)) {
-                    break;
-                }
-                const std::string next_name = it->key().ToString().substr(prefix.size());
-                if (next_name <= name) {
-                    continue;
-                }
-                if (has_more) {
-                    *has_more = true;
-                }
-                break;
-            }
-            if (error) {
-                error->clear();
-            }
-            return true;
-        }
-    }
-    if (error) {
-        error->clear();
-    }
-    return true;
+    return hot_store_->Readdir(path, start_after, limit, entries, has_more, next_token, error);
 }
 
 } // namespace zb::mds

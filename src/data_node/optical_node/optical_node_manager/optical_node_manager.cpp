@@ -26,9 +26,47 @@
 #include <brpc/channel.h>
 #include "common/metrics/NodeMetricsCollector.h"
 #include "real_node.pb.h"
+#include "mds.pb.h"
 #include "scheduler.pb.h"
 
 namespace optical_node_manager {
+
+namespace {
+template<class Request, class Reply, class Method>
+bool CallArchiveMds(const std::string& address, const Request& request, Reply* reply, Method method) {
+    brpc::Channel channel; brpc::ChannelOptions options;
+    options.timeout_ms = 60000; options.connect_timeout_ms = 2000; options.max_retry = 0;
+    if (channel.Init(address.c_str(), &options) != 0) return false;
+    zb::rpc::MdsService_Stub stub(&channel); brpc::Controller controller;
+    (stub.*method)(&controller, &request, reply, nullptr);
+    return !controller.Failed() && reply->has_status() && reply->status().code() == zb::rpc::MDS_OK;
+}
+}
+void OpticalNodeManager::ConfigureArchiveMds(const std::string& address, const std::string& node,
+                                            const std::string& node_address) {
+    archive_mds_address_ = address; archive_node_id_ = node; archive_node_address_ = node_address;
+}
+uint64_t OpticalNodeManager::AllocateArchiveId(bool image) {
+    std::string key;
+    if (image) {
+        zb::rpc::AllocateAvailableImageIdRequest r; zb::rpc::AllocateAvailableImageIdReply out;
+        r.set_node_id(archive_node_id_); r.set_node_address(archive_node_address_);
+        r.set_allocate_ts_ms(WR_task::NowMs());
+        if (!CallArchiveMds(archive_mds_address_, r, &out, &zb::rpc::MdsService_Stub::AllocateAvailableImageId)) return 0;
+        key = out.image_id();
+    } else {
+        zb::rpc::AllocateAvailableDiscIdRequest r; zb::rpc::AllocateAvailableDiscIdReply out;
+        r.set_node_id(archive_node_id_); r.set_node_address(archive_node_address_);
+        r.set_allocate_ts_ms(WR_task::NowMs());
+        if (!CallArchiveMds(archive_mds_address_, r, &out, &zb::rpc::MdsService_Stub::AllocateAvailableDiscId)) return 0;
+        key = out.disc_id();
+    }
+    const std::string prefix = image ? "img-" : "disc-";
+    if (key.rfind(prefix, 0) != 0) return 0;
+    const auto number = key.substr(prefix.size());
+    if (number.empty() || number.find_first_not_of("0123456789") != std::string::npos) return 0;
+    try { return std::stoull(number); } catch (...) { return 0; }
+}
 
 // #region 0. 文件级内部工具（static 辅助函数）
 
@@ -2408,7 +2446,7 @@ namespace optical_node_manager {
             return volumemanager::ErrorCode::MANAGER_NOT_READY;
         }
 
-        if (request.files.empty()) {
+        if (request.files.empty() && !request.end_of_batch) {
             last_failure_reason_buf_ = FormatFailureDetail(start_failure_phase::kSendArchiveMetadata, "empty_files",
                 "batch_id=" + std::to_string(request.batch_id));
             return volumemanager::ErrorCode::INVALID_PARAMETER;
@@ -2757,16 +2795,17 @@ namespace optical_node_manager {
         return next_task_id_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // 本地递增生成 volume_id：MDS 的 AllocateAvailableImageId 尚未实现，先由节点自行分配。
-    // TODO: 接入 MDS 后改为向 MDS 申请全局唯一 image_id。
+    // 集成模式向 MDS 申请；独立光盘测试保留本地编号。
     uint64_t OpticalNodeManager::GenerateVolumeId() {
+        if (!archive_mds_address_.empty()) return AllocateArchiveId(true);
         return next_volume_id_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // 本地递增生成 disk_id：MDS 的 AllocateAvailableDiscId 尚未实现，先由节点自行分配。
+    // 光盘 ID：集成模式由 MDS 分配，独立模式本地递增。
     // 返回数值形式；落任务 / 拼文件名时取其十进制字符串。
-    // TODO: 光盘库刻录细节完善 / 接入 MDS 后，改为向 MDS 申请全局唯一 disc_id。
+    // 集成模式向 MDS 申请 disc_id。
     uint64_t OpticalNodeManager::GenerateDiskId() {
+        if (!archive_mds_address_.empty()) return AllocateArchiveId(false);
         return next_disk_id_.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -2775,7 +2814,9 @@ namespace optical_node_manager {
     void OpticalNodeManager::EnsureAvailableVolumeIds() {
         while (available_volume_ids.size() <
                static_cast<size_t>(available_id_count_)) {
-            available_volume_ids.push(GenerateVolumeId());
+            const auto id = GenerateVolumeId();
+            if (!id) break;
+            available_volume_ids.push(id);
         }
     }
 
@@ -2785,7 +2826,9 @@ namespace optical_node_manager {
     void OpticalNodeManager::EnsureAvailableDiskIds() {
         while (available_disk_ids.size() <
                static_cast<size_t>(available_id_count_)) {
-            available_disk_ids.push(GenerateDiskId());
+            const auto id = GenerateDiskId();
+            if (!id) break;
+            available_disk_ids.push(id);
         }
     }
 
@@ -2998,6 +3041,14 @@ namespace optical_node_manager {
                 continue;
             }
 
+            if (full_task->type == WR_task::WRTaskType::ARCHIVE_FLUSH) {
+                const auto result = FlushArchiveTail();
+                if (result == volumemanager::ErrorCode::SUCCESS)
+                    MarkTaskState(task.task_id, WR_task::WRTaskState::FINISH);
+                else MarkTaskFailed(task.task_id, result, "archive tail flush/report failed");
+                NotifyArchiveCompressionProgress();
+                continue;
+            }
             if (full_task->type == WR_task::WRTaskType::READ) {
                 // 终态保护：避免在失败任务上继续推进状态机。
                 if (full_task->isTaskTerminal()) {
@@ -3270,6 +3321,11 @@ namespace optical_node_manager {
                     volume_id_num = available_volume_ids.front();
                 }
 
+                if (!volume_id_num) {
+                    MarkTaskFailed(task.task_id, volumemanager::ErrorCode::IO_ERROR, "MDS image ID allocation failed");
+                    NotifyArchiveCompressionProgress();
+                    continue;
+                }
                 // 1. 压缩原始文件；失败保留原文件供排查。
                 //    压缩前先把本次 inode 登记到待打包集合，供封装触发后 diff 出本次被打包的文件。
                 {
@@ -3300,9 +3356,6 @@ namespace optical_node_manager {
                 // 唤醒可能正在等待的归档下载线程。
                 NotifyArchiveCompressionProgress();
 
-                // 3. 状态置 FINISH（压缩完成）；状态一律走 MarkTaskState。
-                MarkTaskState(task.task_id, WR_task::WRTaskState::FINISH);
-
                 // 4. 扫描 temp_dir_ 判断是否已触发封装。
                 std::string packed_volume_path;
                 {
@@ -3321,6 +3374,7 @@ namespace optical_node_manager {
 
                 // 5. 未触发封装 → 等待下一个任务。
                 if (packed_volume_path.empty()) {
+                    MarkTaskState(task.task_id, WR_task::WRTaskState::FINISH);
                     continue;
                 }
 
@@ -3339,7 +3393,10 @@ namespace optical_node_manager {
                         basename.size() >= 6 + 5) {
                         volume_id_str = basename.substr(7, basename.size() - 7 - 5);  // 去掉 "volume_" 与 ".vimg"
                     }
-                    ReportPackedInodes(volume_id_str);
+                    if (!ReportPackedInodes(volume_id_str)) {
+                        MarkTaskFailed(task.task_id, volumemanager::ErrorCode::IO_ERROR, "MDS packed-image report failed");
+                        continue;
+                    }
                 }
 
                 // 6. 镜像从 temp_dir_ 转移到 image_dir_/（扇平布局）并登记管理表。
@@ -3408,6 +3465,7 @@ namespace optical_node_manager {
                     continue;
                 }
 
+                MarkTaskState(task.task_id, WR_task::WRTaskState::FINISH);
                 // 8. 第二次上报（镜像 → 光盘）在刻录完成回调 OnCDBurnComplete 中发出，
                 //    本处不实现。
             }
@@ -3501,6 +3559,14 @@ namespace optical_node_manager {
                 pending_archive_file_index_ = 0;
             }
 
+            if (pending_archive_request_->files.empty() && pending_archive_request_->end_of_batch) {
+                const auto id = GenerateTaskId();
+                task_map_->Insert(WR_task::WRTask(id, WR_task::WRTaskType::ARCHIVE_FLUSH));
+                zip_task_queue_->Push(WR_task::WRTaskShort(id, WR_task::WRTaskType::ARCHIVE_FLUSH));
+                pending_archive_request_.reset();
+                telemetry_archive_batches_.fetch_sub(1);
+                continue;
+            }
             // 步骤 1：每次（重新）开始处理时重建节点映射，避免等待期间地址过期。
             std::unordered_map<std::string, std::string> node_address_map;
             if (!BuildNodeAddressMap(&node_address_map)) {
@@ -3568,6 +3634,11 @@ namespace optical_node_manager {
                 break;
             }
 
+            if (pending_archive_request_->end_of_batch) {
+                const auto id = GenerateTaskId();
+                task_map_->Insert(WR_task::WRTask(id, WR_task::WRTaskType::ARCHIVE_FLUSH));
+                zip_task_queue_->Push(WR_task::WRTaskShort(id, WR_task::WRTaskType::ARCHIVE_FLUSH));
+            }
             // 当前 MDS 批次已下完：清空断点，回到外层取下一个批次（本轮配额跨批次累计）。
             pending_archive_request_.reset();
             pending_archive_file_index_ = 0;
@@ -3767,7 +3838,7 @@ namespace optical_node_manager {
 
 // #region 9. 压缩 / 打包与封盘
 
-    void OpticalNodeManager::ReportPackedInodes(const std::string& volume_id) {
+    bool OpticalNodeManager::ReportPackedInodes(const std::string& volume_id) {
         // 扫描 temp_dir_ 剩余 temp_<inode_id>.compressed，收集仍未打包的 inode_id。
         std::unordered_set<uint64_t> remaining_inodes;
         {
@@ -3812,8 +3883,13 @@ namespace optical_node_manager {
             }
         }
 
-        // 本次打包的镜像 → inode 对应关系打印到控制台：MDS 的
-        // ReportFilesPackedToImage 上报尚未实现，先以控制台输出替代，便于单模块测试观察。
+        if (!archive_mds_address_.empty()) {
+            zb::rpc::ReportFilesPackedToImageRequest r; zb::rpc::SimpleArchiveReportReply out;
+            r.set_node_id(archive_node_id_); r.set_image_id("img-" + volume_id);
+            for (auto id : packed_inodes) r.add_inode_ids(id);
+            if (!CallArchiveMds(archive_mds_address_, r, &out, &zb::rpc::MdsService_Stub::ReportFilesPackedToImage)) return false;
+        }
+        // 同时保留镜像 → inode 控制台记录，供独立测试和排查使用。
         std::cout << "[ReportFilesPackedToImage] image_id=" << volume_id
                   << " count=" << packed_inodes.size()
                   << " inode_ids=";
@@ -3824,6 +3900,29 @@ namespace optical_node_manager {
             std::cout << packed_inodes[i];
         }
         std::cout << std::endl;
+        return true;
+    }
+
+    volumemanager::ErrorCode OpticalNodeManager::FlushArchiveTail() {
+        if (!volume_manager_.pending_files_.empty()) {
+            EnsureAvailableVolumeIds();
+            if (available_volume_ids.empty()) return volumemanager::ErrorCode::IO_ERROR;
+            const auto id = available_volume_ids.front();
+            std::string path;
+            auto ret = volume_manager_.PackVolume(path, id);
+            if (ret != volumemanager::ErrorCode::SUCCESS) return ret;
+            available_volume_ids.pop();
+            if (!ReportPackedInodes(std::to_string(id))) return volumemanager::ErrorCode::IO_ERROR;
+            if (!space_manager_) return volumemanager::ErrorCode::IO_ERROR;
+            uint64_t parsed = 0; std::string basename;
+            ret = space_manager_->ParseVolumeFile(path, parsed, basename);
+            if (ret != volumemanager::ErrorCode::SUCCESS) return ret;
+            ret = space_manager_->MoveFrom(path, space_manager::ImageCategory::WRITE);
+            if (ret != volumemanager::ErrorCode::SUCCESS) return ret;
+            ret = AccumulatePackedImage(image_dir_ + basename, id);
+            if (ret != volumemanager::ErrorCode::SUCCESS) return ret;
+        }
+        return SealPendingDiscAndSubmitBurn();
     }
 
     volumemanager::ErrorCode OpticalNodeManager::AccumulatePackedImage(
@@ -3937,11 +4036,13 @@ namespace optical_node_manager {
         if (disc_id_from_pool) {
             disc_id = available_disk_ids.front();
         } else {
+            if (!archive_mds_address_.empty()) return volumemanager::ErrorCode::IO_ERROR;
             disc_id = GenerateDiskId();
             last_sidecar_failure_reason_buf_ = FormatFailureDetail(
                 start_failure_phase::kSealPendingDiscAndSubmitBurn, "available_disk_ids_empty",
                 "fallback_disc_id=" + std::to_string(disc_id));
         }
+        if (!disc_id) return volumemanager::ErrorCode::IO_ERROR;
         const std::string disk_id = std::to_string(disc_id);
 
         // 4. 元数据定稿：pending_disc_meta 改名为 disc_<disk_id>_meta，避免影响后续打包
@@ -4091,7 +4192,10 @@ namespace optical_node_manager {
         }
 
         // 5. 第二次上报（镜像 → 光盘）：本盘包含的全部镜像上报给 MDS。
-        ReportImagesBurnedToDisc(burned_task->disk_id, entries);
+        if (!ReportImagesBurnedToDisc(burned_task->disk_id, entries)) {
+            last_sidecar_failure_reason_buf_ = "MDS burned-disc report failed: " + burned_task->disk_id;
+            std::cerr << last_sidecar_failure_reason_buf_ << std::endl;
+        }
     }
 
     bool OpticalNodeManager::WriteVdiscAndReleaseImages(const std::string& vdisc_path,
@@ -4192,10 +4296,15 @@ namespace optical_node_manager {
         return true;
     }
 
-    void OpticalNodeManager::ReportImagesBurnedToDisc(const std::string& disc_id,
+    bool OpticalNodeManager::ReportImagesBurnedToDisc(const std::string& disc_id,
                                                       const std::vector<DiscImageEntry>& entries) {
-        // 本盘的镜像 → 光盘对应关系打印到控制台：MDS 的 ReportImagesBurnedToDisc
-        // 上报尚未实现，先以控制台输出替代，便于单模块测试观察。
+        if (!archive_mds_address_.empty()) {
+            zb::rpc::ReportImagesBurnedToDiscRequest r; zb::rpc::SimpleArchiveReportReply out;
+            r.set_node_id(archive_node_id_); r.set_disc_id("disc-" + disc_id);
+            for (const auto& entry : entries) r.add_image_ids("img-" + std::to_string(entry.volume_id));
+            if (!CallArchiveMds(archive_mds_address_, r, &out, &zb::rpc::MdsService_Stub::ReportImagesBurnedToDisc)) return false;
+        }
+        // 同时保留镜像 → 光盘控制台记录，供独立测试和排查使用。
         // 字段名与 ReportImagesBurnedToDiscRequest 对齐（disc_id + image_ids），
         // 额外带上 count 便于测试解析。
         std::cout << "[ReportImagesBurnedToDisc] disc_id=" << disc_id
@@ -4208,6 +4317,7 @@ namespace optical_node_manager {
             std::cout << entries[i].volume_id;
         }
         std::cout << std::endl;
+        return true;
     }
 // #endregion
 

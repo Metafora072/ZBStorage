@@ -1,5 +1,9 @@
 #include <brpc/server.h>
 #include <gflags/gflags.h>
+#include <rocksdb/iterator.h>
+#ifdef ZB_HAS_LHM
+#include "../lhm/LhmNamespaceStore.h"
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -47,6 +51,39 @@ int main(int argc, char* argv[]) {
         std::cerr << "Failed to open RocksDB: " << error << std::endl;
         return 1;
     }
+
+    const bool unified = cfg.namespace_backend == "lhm";
+    std::unique_ptr<zb::mds::NamespaceStore> namespace_store;
+    std::string backend_marker;
+    if (store.Get("SYS/NAMESPACE_BACKEND", &backend_marker, &error)) {
+        std::cerr << "Existing LHM control store cannot be reopened or switched; use fresh paths" << std::endl;
+        return 1;
+    }
+    if (!error.empty()) { std::cerr << error << std::endl; return 1; }
+    if (unified) {
+#ifndef ZB_HAS_LHM
+        std::cerr << "LHM backend requires -DZB_BUILD_LHM_BRIDGE=ON" << std::endl;
+        return 1;
+#else
+        std::unique_ptr<rocksdb::Iterator> it(store.db()->NewIterator(rocksdb::ReadOptions()));
+        for (const auto* prefix : {"I/", "D/", "H/"}) {
+            it->Seek(prefix);
+            if (!it->status().ok() || (it->Valid() && it->key().starts_with(prefix))) {
+                std::cerr << "Existing namespace/handles cannot be migrated implicitly; use a fresh control store" << std::endl;
+                return 1;
+            }
+        }
+        auto lhm = std::make_unique<zb::mds::LhmNamespaceStore>(cfg.lhm_store_file);
+        if (!lhm->ready()) {
+            std::cerr << "LHM_STORE_FILE must be a new file in an existing writable directory" << std::endl;
+            return 1;
+        }
+        namespace_store = std::move(lhm);
+        if (!store.Put("SYS/NAMESPACE_BACKEND", "lhm", &error)) { std::cerr << error << std::endl; return 1; }
+        store.DisableNamespaceAccess();
+#endif
+    }
+    std::cerr << "namespace_backend=" << cfg.namespace_backend << std::endl;
 
     // With Scheduler integration enabled, placement remains empty until CMS
     // accepts a complete catalog proposal. Static MDS nodes are only a
@@ -96,7 +133,7 @@ int main(int argc, char* argv[]) {
                                     cfg.masstree_preload_background,
                                     &node_registry,
                                     &candidate_queue,
-                                    &lease_manager);
+                                    &lease_manager, namespace_store.get(), unified);
     std::unique_ptr<zb::mds::OpticalArchiveManager> archive_manager;
     if (cfg.enable_optical_archive) {
         zb::mds::ArchiveBatchStager::Options stager_options;

@@ -236,3 +236,5 @@ int zb_lhm_update_full(zb_lhm_context* ctx, const zb_lhm_full_inode* attr) {
 
 #include "LhmNamespaceBridge.inc"
 #include "LhmScanBridge.inc"
+
+#include "LhmBulkBridge.inc"

@@ -248,6 +248,8 @@ MdsConfig MdsConfig::LoadFromFile(const std::string& path, std::string* error) {
             cfg.namespace_backend = ToLower(value);
         } else if (key == "LHM_STORE_FILE") {
             cfg.lhm_store_file = value;
+        } else if (key == "LHM_BULK_MANIFEST") {
+            cfg.lhm_bulk_manifest = value;
         } else if (key == "SCHEDULER_ADDR") {
             cfg.scheduler_address = value;
         } else if (key == "SCHEDULER_REFRESH_MS") {
@@ -398,6 +400,10 @@ MdsConfig MdsConfig::LoadFromFile(const std::string& path, std::string* error) {
     }
     if (cfg.namespace_backend != "rocksdb" && cfg.namespace_backend != "lhm") {
         if (error) *error = "NAMESPACE_BACKEND must be rocksdb or lhm";
+        return {};
+    }
+    if (!cfg.lhm_bulk_manifest.empty() && cfg.namespace_backend != "lhm") {
+        if (error) *error = "LHM_BULK_MANIFEST requires NAMESPACE_BACKEND=lhm";
         return {};
     }
     if (cfg.namespace_backend == "lhm" && (cfg.lhm_store_file.empty() || cfg.enable_optical_archive)) {

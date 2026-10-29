@@ -85,3 +85,8 @@ if(BUILD_TESTING)
     target_compile_features(archive_pipeline_test PRIVATE cxx_std_17)
     target_link_libraries(archive_pipeline_test PRIVATE zb_lhm_inode_store zb_archive_pipeline)
 endif()
+
+if(BUILD_TESTING)
+    add_executable(lhm_bulk_import_test ${CMAKE_SOURCE_DIR}/tests/mds/lhm_bulk_import_test.cpp)
+    target_link_libraries(lhm_bulk_import_test PRIVATE zb_lhm_inode_store)
+endif()

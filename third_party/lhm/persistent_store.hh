@@ -102,6 +102,8 @@ class PersistentStore {
     bool ReadInodeBlockForRefDirect(const inode_ref& ref, inode_block_image& out) const;
     bool WriteInodeBlock(uint32_t block_id, const inode_block_image& image);
     bool AllocateInodeSlot(inode_ref& out_ref);
+    // Exclusive fresh-store builder: root occupies ticket 0; assign files from 1.
+    bool WriteFreshFileInodes(std::vector<inode_disk>& inodes);
     bool ReadInode(const inode_ref& ref, inode_disk& out) const;
     bool WriteInode(const inode_ref& ref, const inode_disk& inode);
 

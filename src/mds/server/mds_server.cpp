@@ -73,7 +73,17 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
         }
-        auto lhm = std::make_unique<zb::mds::LhmNamespaceStore>(cfg.lhm_store_file);
+        std::unique_ptr<zb::mds::LhmNamespaceStore> lhm;
+        if (cfg.lhm_bulk_manifest.empty()) {
+            lhm = std::make_unique<zb::mds::LhmNamespaceStore>(cfg.lhm_store_file);
+        } else {
+            zb_lhm_bulk_stats stats{};
+            lhm = std::make_unique<zb::mds::LhmNamespaceStore>(cfg.lhm_store_file,
+                cfg.lhm_bulk_manifest, &stats, &error);
+            if (!lhm->ready()) { std::cerr << "LHM bulk import: " << error << std::endl; return 1; }
+            std::cerr << "LHM bulk import files=" << stats.files << " directories=" << stats.directories
+                      << " inode_blocks=" << stats.inode_blocks << " buckets=" << stats.buckets << std::endl;
+        }
         if (!lhm->ready()) {
             std::cerr << "LHM_STORE_FILE must be a new file in an existing writable directory" << std::endl;
             return 1;

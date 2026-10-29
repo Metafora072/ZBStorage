@@ -5,6 +5,10 @@ namespace zb::mds {
 class LhmNamespaceStore final : public NamespaceStore {
 public:
     explicit LhmNamespaceStore(const std::string& fresh_file) : inodes_(fresh_file) {}
+    // Offline metadata-only construction, then normal runtime namespace access.
+    LhmNamespaceStore(const std::string& fresh_file, const std::string& manifest,
+                      zb_lhm_bulk_stats* stats, std::string* error)
+        : inodes_(fresh_file, manifest, stats, error) {}
     bool ready() const { return inodes_.ready(); }
     bool Sync() { return inodes_.Sync(); }
     bool ResolvePath(const std::string&,uint64_t*,zb::rpc::InodeAttr*,std::string*) const override;

@@ -1,11 +1,19 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 
 // Plain C ABI: no Masstree, protobuf or STL layouts cross the shared-library boundary.
 #ifdef __cplusplus
 extern "C" {
 #endif
 typedef struct zb_lhm_context zb_lhm_context;
+typedef struct {
+    uint64_t files, directories, inode_blocks, buckets;
+} zb_lhm_bulk_stats;
+// TSV type/path, explicit root, parents precede children. Exclusive fresh file.
+// On failure a newly created output is removed; existing outputs are untouched.
+zb_lhm_context* zb_lhm_open_bulk(const char* file, const char* manifest,
+    zb_lhm_bulk_stats* stats, char* error, size_t error_size);
 typedef struct {
     uint64_t inode_id, size, ctime_ns, mtime_ns, version;
     uint16_t mode;

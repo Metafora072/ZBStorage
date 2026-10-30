@@ -120,6 +120,10 @@ PersistentStore::PersistentStore()
 
 PersistentStore::~PersistentStore() {
     Close();
+    // ZB constructs/uses/destroys stores on the bridge worker. A later store
+    // may reuse this address; never leave TLS pointing at freed L0 buffers.
+    if (tls_l0_handle_.owner == this) tls_l0_handle_ = {};
+    if (tls_inode_chunk_.owner == this) tls_inode_chunk_ = {};
     std::lock_guard<std::mutex> guard(l0_buffers_mu_);
     for (l0_thread_buffer* buf : l0_buffers_) {
         delete buf;
@@ -1300,6 +1304,47 @@ void PersistentStore::BuildCommonHeader(metadata_common_block_header& out,
     out.owner_inode_id = owner_inode_id;
     out.next_block_id = next_block_id;
     out.flags = flags;
+}
+
+// Called only by the fresh-store factory before publishing the namespace.
+bool PersistentStore::WriteFreshFileInodes(std::vector<inode_disk>& inodes) {
+    auto& tls = tls_inode_chunk_;
+    if (!IsOpen() || tls.owner != this ||
+        tls.epoch != inode_alloc_epoch_.load() || tls.next_ticket != 1 ||
+        next_inode_ticket_.load() != kInodeAllocChunk ||
+        inodes.size() >= uint64_t(0x7ffffffeU) * kInodesPerBlock) return false;
+    const bool l0 = l0_cache_enabled();
+    if (!set_l0_cache_enabled(false)) return false;
+    const uint64_t end = 1 + inodes.size();
+    const uint32_t last = InodeBlockIdFromTicket(end - 1);
+    const uint32_t initialized = highest_initialized_inode_block_.load();
+    for (uint32_t block = 1; block <= last; ++block) {
+        inode_block_image image{};
+        if (block <= initialized) {
+            if (!ReadInodeBlock(block, image)) return false;
+        } else {
+            BuildCommonHeader(image.common, metadata_block_type::inode_block, block,
+                sizeof(inode_block_header) + kInodesPerBlock * sizeof(inode_disk),
+                NextSequenceLocked(), 0, 0, 0);
+            image.header.slot_count = kInodesPerBlock;
+            image.header.alloc_epoch = sequence_;
+        }
+        for (uint32_t slot = (block == 1 ? 1 : 0); slot < kInodesPerBlock; ++slot) {
+            const uint64_t ticket = uint64_t(block - 1) * kInodesPerBlock + slot;
+            if (ticket >= end) break;
+            auto& inode = inodes[ticket - 1];
+            inode.primary_ref = make_inode_ref(block, slot);
+            inode.inode_id = (uint64_t(block) << 32) | slot;
+            image.slots[slot] = inode;
+            if (!IsSlotUsed(image.header, slot)) ++image.header.used_count;
+            SetSlotUsed(image.header, slot, true);
+        }
+        if (!WriteInodeBlock(block, image)) return false;
+    }
+    highest_initialized_inode_block_.store(std::max(initialized, last));
+    next_inode_ticket_.store(end);
+    inode_alloc_epoch_.fetch_add(1); // invalidate the root's reserved TLS chunk
+    return Sync() && set_l0_cache_enabled(l0);
 }
 
 }  // namespace MasstreeLHM

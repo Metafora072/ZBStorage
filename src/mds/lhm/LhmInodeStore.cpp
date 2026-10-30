@@ -96,6 +96,12 @@ public:
 void LhmInodeStore::DecodeAttributes(const zb_lhm_full_inode& raw, zb::rpc::InodeAttr* out) {
     Decode(raw, out);
 }
+LhmInodeStore::LhmInodeStore(const std::string& file, const std::string& manifest,
+    zb_lhm_bulk_stats* stats, std::string* error) {
+    char message[512]{};
+    context_.reset(zb_lhm_open_bulk(file.c_str(), manifest.c_str(), stats, message, sizeof(message)), zb_lhm_close);
+    if (error) *error = message;
+}
 LhmInodeStore::LhmInodeStore(const std::string& file)
     : context_(zb_lhm_open(file.c_str()),zb_lhm_close) {}
 std::unique_ptr<NamespaceCreation> LhmInodeStore::ReserveCreate(

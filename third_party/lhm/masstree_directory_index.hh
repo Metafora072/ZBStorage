@@ -68,12 +68,14 @@ class MasstreeDirectoryIndex {
         table_.destroy(ti);
     }
 
+    // Explicit layer insertions can split the root without updating table_.
+    // Direct traversal must start at the current root, not the old left leaf.
     node_type* root() {
-        return table_.root();
+        return canonicalize_directory_root(table_.root());
     }
 
     const node_type* root() const {
-        return table_.root();
+        return canonicalize_directory_root(table_.root());
     }
 
     table_type& table() {

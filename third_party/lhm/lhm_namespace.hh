@@ -57,6 +57,8 @@ class LhmNamespace {
   public:
     using value_type = MasstreeDirectoryIndex::value_type;
 
+    #include "namespace_bulk_build.inc"
+
     void initialize(threadinfo& ti, const std::string& backing_file = {}) {
         directory_index_.initialize(ti);
         initialize_persistence_store(backing_file);

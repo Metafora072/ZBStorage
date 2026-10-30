@@ -158,6 +158,8 @@ class DirectoryBlockStore {
         return id;
     }
 
+    #include "directory_bulk_build.inc"
+
     bool flush_all() {
         std::lock_guard<std::mutex> guard(cache_mu_);
         for (cache_entry& entry : cache_lru_) {

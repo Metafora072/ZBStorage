@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
         check(zb_lhm_create(ctx.get(), "/dir", 1), "mkdir");
         check(zb_lhm_create(ctx.get(), "/dir/file", 0), "create");
         auto dir = lookup(ctx.get(), "/dir"), inode = lookup(ctx.get(), "/dir/file");
-        check(inode.inode_id == 0x100000001ULL, "file encoded block/slot");
+        check(inode.inode_id == 0x10001ULL, "file encoded block/slot");
         check((dir.inode_id >> 63) == 1, "directory tag");
         for (auto item : {root, dir, inode}) {
             zb_lhm_inode by_id{};
@@ -70,12 +70,14 @@ int main(int argc, char** argv) {
             check(bool(disk), "raw inode read");
             return size;
         };
-        const uint64_t block = inode.inode_id >> 32;
-        const uint64_t slot = static_cast<uint32_t>(inode.inode_id);
+        const uint64_t block = inode.inode_id >> 16;
+        const uint64_t slot = (inode.inode_id & 0xffffULL);
         check(stored_size((2*block-1)*16384 + 256 + slot*256 + 16) == 12345,
               "file ID does not match physical inode position");
         const uint64_t head = dir.inode_id & ~(uint64_t{1} << 63);
-        check(stored_size(2*head*16384 + 128 + 16) == 12345,
+        disk.close(); disk.open(file+".heads", std::ios::binary);
+        const uint64_t ordinal=(head & ~(uint64_t{1} << 47))-1;
+        check(stored_size((ordinal/31)*16384 + 512 + (ordinal%31)*512 + 128 + 16) == 12345,
               "directory ID does not match physical inode position");
         check(zb_lhm_read_inode(ctx.get(), moved.inode_id, &out), "read after sync"); same(moved, out);
         std::atomic<bool> ok{true};

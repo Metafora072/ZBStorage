@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <deque>
 
 #include "metadata_layout.hh"
 #include "namespace_types.hh"
@@ -28,17 +29,17 @@ class DirectoryBlockStore {
     };
 
     struct file_ref_payload {
-        uint32_t inode_block_id = 0;
-        uint16_t inode_slot = 0;
-        uint16_t generation = 0;
+        uint64_t inode_block_id : 48;
+        uint64_t inode_slot : 8;
+        uint64_t generation : 8;
     };
     static_assert(sizeof(file_ref_payload) == 8, "file ref payload must be 8B");
 
     struct directory_ref_payload {
-        uint32_t head_block_id = 0;
+        uint64_t head_block_id = 0;
     };
-    static_assert(sizeof(directory_ref_payload) == 4,
-                  "directory ref payload must be 4B");
+    static_assert(sizeof(directory_ref_payload) == 8,
+                  "directory ref payload must be 8B");
 
     struct dentry_entry_header {
         uint64_t component_hash = 0;
@@ -64,7 +65,7 @@ class DirectoryBlockStore {
         dentry_kind kind = dentry_kind::invalid;
         uint64_t component_hash = 0;
         inode_ref file_ref = make_inode_ref(0, 0);
-        uint32_t directory_head_block_id = 0;
+        uint64_t directory_head_block_id = 0;
         std::string name;
     };
 
@@ -75,13 +76,13 @@ class DirectoryBlockStore {
     };
 
     struct bucket_meta {
-        uint32_t block_id = 0;
+        uint64_t block_id = 0;
         uint16_t local_depth = 0;
         uint16_t entry_count = 0;
         uint32_t version = 0;
         uint32_t flags = 0;
     };
-    static_assert(sizeof(bucket_meta) == 16, "bucket metadata must stay compact");
+    static_assert(sizeof(bucket_meta) == 24, "bucket metadata must stay compact");
 
     struct bucket_directory {
         uint16_t global_depth = 0;
@@ -93,7 +94,7 @@ class DirectoryBlockStore {
 
     struct file_index_state {
         file_index_state_kind state = file_index_state_kind::empty;
-        uint32_t head_block_id = 0;
+        uint64_t head_block_id = 0;
         bucket_directory directory;
         uint64_t split_count = 0;
         uint64_t last_split_moved = 0;
@@ -147,18 +148,55 @@ class DirectoryBlockStore {
         stats_ = stats_snapshot{};
     }
 
-    uint32_t create_file_index(uint32_t head_block_id = 0) {
+    uint64_t create_file_index(uint64_t head_block_id = 0) {
         std::lock_guard<std::mutex> guard(file_index_mu_);
         if (file_indexes_.empty()) {
             file_indexes_.emplace_back();
         }
         file_indexes_.emplace_back();
-        const uint32_t id = static_cast<uint32_t>(file_indexes_.size() - 1);
+        const uint64_t id = static_cast<uint64_t>(file_indexes_.size() - 1);
         file_indexes_[id].head_block_id = head_block_id;
         return id;
     }
 
     #include "directory_bulk_build.inc"
+    void save_file_index(uint64_t id, SnapshotWriter& out) {
+        auto* f=file_index_by_id(id);
+        if (!f) throw std::runtime_error("snapshot file index missing");
+        const auto& d=f->directory;
+        out.u64(static_cast<uint8_t>(f->state)); out.u64(f->head_block_id);
+        out.u64(d.global_depth); out.u64(d.entry_count); out.u64(d.single_bucket);
+        out.u64(d.slots.size()); for(auto slot:d.slots) out.u64(slot);
+        out.u64(d.buckets.size());
+        for(const auto& b:d.buckets) { out.u64(b.block_id); out.u64(b.local_depth);
+            out.u64(b.entry_count); out.u64(b.version); out.u64(b.flags); }
+    }
+    uint64_t load_file_index(uint64_t head, SnapshotReader& in) {
+        file_index_state f; auto state=in.u64(); auto stored_head=in.u64();
+        auto depth=in.u64(); auto count=in.u64(); auto single=in.u32();
+        if(state>2 || (stored_head && stored_head!=head) || depth>20)
+            throw std::runtime_error("invalid snapshot file index");
+        f.state=static_cast<file_index_state_kind>(state); f.head_block_id=head;
+        auto& d=f.directory; d.global_depth=depth; d.entry_count=count; d.single_bucket=single;
+        auto slots=in.u64();
+        if(slots>(1ULL<<20) || (state==2 ? slots!=(1ULL<<depth) : slots!=0))
+            throw std::runtime_error("invalid snapshot slots");
+        for(uint64_t i=0;i<slots;++i) d.slots.push_back(in.u32());
+        auto buckets=in.u64();
+        if(buckets>(1ULL<<20) || (state==0 && buckets) || (state==1 && buckets!=1) ||
+            (state==2 && !buckets)) throw std::runtime_error("invalid snapshot buckets");
+        for(uint64_t i=0;i<buckets;++i) {
+            bucket_meta b; b.block_id=in.u64(); auto local=in.u64(), entries=in.u64();
+            if(!b.block_id || b.block_id>kMaxLogicalBlock || !store_->DirectoryAddressMayExist(b.block_id) || local>depth || entries>UINT16_MAX)
+                throw std::runtime_error("invalid snapshot bucket metadata");
+            b.local_depth=local; b.entry_count=entries; b.version=in.u32(); b.flags=in.u32();
+            d.buckets.push_back(b);
+        }
+        for(auto slot:d.slots) if(slot>=buckets) throw std::runtime_error("invalid bucket reference");
+        if(state==1 && single>=buckets) throw std::runtime_error("invalid single bucket");
+        return install_bulk_file_index(std::move(f));
+    }
+
 
     bool flush_all() {
         std::lock_guard<std::mutex> guard(cache_mu_);
@@ -176,21 +214,21 @@ class DirectoryBlockStore {
 #ifdef ZB_LHM_TESTING
     void fail_next_read_for_test() { fail_next_read_ = true; }
 #endif
-    bool lookup(uint32_t file_index_id, uint64_t component_hash,
+    bool lookup(uint64_t file_index_id, uint64_t component_hash,
                 const std::string& name, entry& out) {
         ++stats_.lookups;
         file_index_state* state = file_index_by_id(file_index_id);
         return state != nullptr && lookup_bucket_directory(*state, component_hash, name, out);
     }
 
-    bool lookup(uint32_t file_index_id, uint64_t component_hash, entry& out) {
+    bool lookup(uint64_t file_index_id, uint64_t component_hash, entry& out) {
         ++stats_.lookups;
         file_index_state* state = file_index_by_id(file_index_id);
         return state != nullptr
             && lookup_bucket_directory(*state, component_hash, std::string(), out);
     }
 
-    bool read_entries(uint32_t file_index_id, std::vector<entry>& out) {
+    bool read_entries(uint64_t file_index_id, std::vector<entry>& out) {
         out.clear();
         file_index_state* state = file_index_by_id(file_index_id);
         return state != nullptr && read_bucket_directory_entries(*state, out);
@@ -207,7 +245,7 @@ class DirectoryBlockStore {
         uint64_t bucket_reads = 0;
     };
 
-    bool scan_file_step(uint32_t file_index_id, file_scan_cursor& cursor,
+    bool scan_file_step(uint64_t file_index_id, file_scan_cursor& cursor,
                         entry& out, bool& found, bool& done) {
         found = done = false;
         if (cursor.position < cursor.buffered.size()) {
@@ -262,7 +300,7 @@ class DirectoryBlockStore {
         std::size_t unique_buckets = 0;
     };
 
-    bool debug_file_index(uint32_t file_index_id, file_index_debug_info& out) {
+    bool debug_file_index(uint64_t file_index_id, file_index_debug_info& out) {
         out = file_index_debug_info{};
         file_index_state* state = file_index_by_id(file_index_id);
         if (state == nullptr) {
@@ -290,9 +328,9 @@ class DirectoryBlockStore {
         return true;
     }
 
-    bool lookup_inline(uint32_t head_block_id, uint64_t component_hash,
+    bool lookup_inline(uint64_t head_block_id, uint64_t component_hash,
                        const std::string& name, entry& out) {
-        uint32_t block_id = head_block_id;
+        uint64_t block_id = head_block_id;
         while (block_id != 0) {
             directory_block_image image{};
             if (!read_block(block_id, image)) {
@@ -307,8 +345,8 @@ class DirectoryBlockStore {
         return false;
     }
 
-    bool read_inline_entries(uint32_t head_block_id, std::vector<entry>& out) {
-        uint32_t block_id = head_block_id;
+    bool read_inline_entries(uint64_t head_block_id, std::vector<entry>& out) {
+        uint64_t block_id = head_block_id;
         while (block_id != 0) {
             directory_block_image image{};
             if (!read_block(block_id, image)) {
@@ -322,7 +360,7 @@ class DirectoryBlockStore {
         return true;
     }
 
-    bool read_directory_inode(uint32_t head_block_id, inode_disk& out) {
+    bool read_directory_inode(uint64_t head_block_id, inode_disk& out) {
         directory_block_image image{};
         if (!read_block(head_block_id, image)) {
             return false;
@@ -334,7 +372,7 @@ class DirectoryBlockStore {
         return true;
     }
 
-    bool write_directory_inode(uint32_t head_block_id, const inode_disk& inode) {
+    bool write_directory_inode(uint64_t head_block_id, const inode_disk& inode) {
         directory_block_image image{};
         if (!read_block(head_block_id, image)) {
             return false;
@@ -346,7 +384,7 @@ class DirectoryBlockStore {
         return write_block(head_block_id, image);
     }
 
-    bool write_directory_self_name(uint32_t head_block_id, uint64_t component_hash,
+    bool write_directory_self_name(uint64_t head_block_id, uint64_t component_hash,
                                    const std::string& name) {
         if (name.size() > kMaxEntryNameBytes) {
             return false;
@@ -361,7 +399,7 @@ class DirectoryBlockStore {
         return write_block(head_block_id, image);
     }
 
-    bool read_directory_self_name(uint32_t head_block_id, std::string& out) {
+    bool read_directory_self_name(uint64_t head_block_id, std::string& out) {
         directory_block_image image{};
         if (!read_block(head_block_id, image)) {
             return false;
@@ -369,7 +407,7 @@ class DirectoryBlockStore {
         return decode_self_name(image, out);
     }
 
-    bool insert(uint32_t file_index_id, uint32_t head_block_id, const entry& item,
+    bool insert(uint64_t file_index_id, uint64_t head_block_id, const entry& item,
                 bool overwrite_existing) {
         ++stats_.inserts;
         if (store_ == nullptr || !store_->IsOpen() || item.name.empty()
@@ -393,22 +431,22 @@ class DirectoryBlockStore {
         return insert_into_bucket_directory(*state, item);
     }
 
-    bool remove(uint32_t file_index_id, uint64_t component_hash, const std::string& name) {
+    bool remove(uint64_t file_index_id, uint64_t component_hash, const std::string& name) {
         ++stats_.removes;
         file_index_state* state = file_index_by_id(file_index_id);
         return state != nullptr && remove_from_bucket_directory(*state, component_hash, name);
     }
 
-    bool remove(uint32_t file_index_id, uint64_t component_hash) {
+    bool remove(uint64_t file_index_id, uint64_t component_hash) {
         ++stats_.removes;
         file_index_state* state = file_index_by_id(file_index_id);
         return state != nullptr
             && remove_from_bucket_directory(*state, component_hash, std::string());
     }
 
-    bool remove_inline(uint32_t head_block_id, uint64_t component_hash,
+    bool remove_inline(uint64_t head_block_id, uint64_t component_hash,
                        const std::string& name) {
-        uint32_t block_id = head_block_id;
+        uint64_t block_id = head_block_id;
         while (block_id != 0) {
             directory_block_image image{};
             if (!read_block(block_id, image)) {
@@ -439,7 +477,7 @@ class DirectoryBlockStore {
         return out;
     }
 
-    static entry make_directory_entry(uint64_t component_hash, uint32_t head_block_id,
+    static entry make_directory_entry(uint64_t component_hash, uint64_t head_block_id,
                                       const std::string& name) {
         entry out;
         out.kind = dentry_kind::directory;
@@ -474,7 +512,7 @@ class DirectoryBlockStore {
     struct cache_entry {
         bool valid = false;
         bool dirty = false;
-        uint32_t block_id = 0;
+        uint64_t block_id = 0;
         uint64_t last_access = 0;
         directory_block_image image{};
     };
@@ -495,7 +533,7 @@ class DirectoryBlockStore {
         file_indexes_.emplace_back();
     }
 
-    file_index_state* file_index_by_id(uint32_t file_index_id) {
+    file_index_state* file_index_by_id(uint64_t file_index_id) {
         if (file_index_id == 0) {
             return nullptr;
         }
@@ -506,7 +544,7 @@ class DirectoryBlockStore {
         return &file_indexes_[file_index_id];
     }
 
-    bool allocate_bucket_block(uint64_t dir_inode_id, uint32_t& out_block_id) {
+    bool allocate_bucket_block(uint64_t dir_inode_id, uint64_t& out_block_id) {
         out_block_id = 0;
         if (store_ == nullptr || !store_->IsOpen()) {
             return false;
@@ -529,7 +567,7 @@ class DirectoryBlockStore {
         std::memset(image.payload, 0, sizeof(image.payload));
     }
 
-    bool append_entry_to_block(uint32_t block_id, const entry& item) {
+    bool append_entry_to_block(uint64_t block_id, const entry& item) {
         directory_block_image image{};
         if (!read_block(block_id, image)) {
             return false;
@@ -541,7 +579,7 @@ class DirectoryBlockStore {
         return write_block(block_id, image);
     }
 
-    bucket_meta* bucket_by_id(file_index_state& state, uint32_t bucket_id) {
+    bucket_meta* bucket_by_id(file_index_state& state, uint64_t bucket_id) {
         if (bucket_id >= state.directory.buckets.size()
             || state.directory.buckets[bucket_id].block_id == 0) {
             return nullptr;
@@ -549,7 +587,7 @@ class DirectoryBlockStore {
         return &state.directory.buckets[bucket_id];
     }
 
-    const bucket_meta* bucket_by_id(const file_index_state& state, uint32_t bucket_id) const {
+    const bucket_meta* bucket_by_id(const file_index_state& state, uint64_t bucket_id) const {
         if (bucket_id >= state.directory.buckets.size()
             || state.directory.buckets[bucket_id].block_id == 0) {
             return nullptr;
@@ -628,7 +666,7 @@ class DirectoryBlockStore {
         if (state.state != file_index_state_kind::empty || state.head_block_id == 0) {
             return false;
         }
-        uint32_t bucket_block_id = 0;
+        uint64_t bucket_block_id = 0;
         directory_block_image head{};
         if (!read_block(state.head_block_id, head)) {
             return false;
@@ -713,7 +751,7 @@ class DirectoryBlockStore {
         return true;
     }
 
-    bool split_bucket(file_index_state& state, uint32_t old_bucket_id) {
+    bool split_bucket(file_index_state& state, uint64_t old_bucket_id) {
         bucket_meta* old_meta = bucket_by_id(state, old_bucket_id);
         if (old_meta == nullptr) {
             return false;
@@ -747,7 +785,7 @@ class DirectoryBlockStore {
             return false;
         }
 
-        uint32_t new_bucket_block_id = 0;
+        uint64_t new_bucket_block_id = 0;
         if (!allocate_bucket_block(old_image.header.dir_inode_id, new_bucket_block_id)) {
             return false;
         }
@@ -824,11 +862,11 @@ class DirectoryBlockStore {
         return (value + alignment - 1) & ~(alignment - 1);
     }
 
-    static uint32_t index_count(const directory_block_image& image) {
+    static uint64_t index_count(const directory_block_image& image) {
         return image.header.delta_count;
     }
 
-    static uint32_t index_start(const directory_block_image& image) {
+    static uint64_t index_start(const directory_block_image& image) {
         return kDirectoryBlockPayloadBytes
             - index_count(image) * sizeof(dentry_index_entry);
     }
@@ -855,7 +893,7 @@ class DirectoryBlockStore {
             > kDirectoryBlockPayloadBytes - bytes) {
             return false;
         }
-        image.header.delta_count = static_cast<uint32_t>(indexes.size());
+        image.header.delta_count = static_cast<uint64_t>(indexes.size());
         uint32_t offset = kDirectoryBlockPayloadBytes - bytes;
         if (bytes != 0) {
             std::memcpy(image.payload + offset, indexes.data(), bytes);
@@ -939,7 +977,7 @@ class DirectoryBlockStore {
         const uint32_t ref_bytes =
             item.kind == dentry_kind::directory ? sizeof(directory_ref_payload)
                                                 : sizeof(file_ref_payload);
-        const uint32_t raw_bytes = sizeof(dentry_entry_header) + ref_bytes
+        const uint64_t raw_bytes = sizeof(dentry_entry_header) + ref_bytes
             + static_cast<uint32_t>(item.name.size());
         const uint32_t record_bytes = align_up(raw_bytes, kEntryAlignment);
         const uint32_t needed = record_bytes + sizeof(dentry_index_entry);
@@ -952,7 +990,7 @@ class DirectoryBlockStore {
             return false;
         }
 
-        const uint32_t offset = image.header.used_bytes;
+        const uint64_t offset = image.header.used_bytes;
         dentry_entry_header header{};
         header.component_hash = item.component_hash;
         header.record_bytes = static_cast<uint16_t>(record_bytes);
@@ -962,7 +1000,7 @@ class DirectoryBlockStore {
         header.ref_bytes = static_cast<uint16_t>(ref_bytes);
         std::memcpy(image.payload + offset, &header, sizeof(header));
 
-        uint32_t cursor = offset + sizeof(header);
+        uint64_t cursor = offset + sizeof(header);
         if (item.kind == dentry_kind::directory) {
             directory_ref_payload ref{};
             ref.head_block_id = item.directory_head_block_id;
@@ -1037,7 +1075,7 @@ class DirectoryBlockStore {
         header.flags = 0;
         header.ref_bytes = 0;
         std::memcpy(image.payload, &header, sizeof(header));
-        uint32_t cursor = sizeof(header);
+        uint64_t cursor = sizeof(header);
         std::memcpy(image.payload + cursor, name.data(), name.size());
         cursor += static_cast<uint32_t>(name.size());
         if (cursor < record_bytes) {
@@ -1092,7 +1130,7 @@ class DirectoryBlockStore {
             return false;
         }
         dentry_kind kind = static_cast<dentry_kind>(header.kind);
-        uint32_t cursor = offset + sizeof(header);
+        uint64_t cursor = offset + sizeof(header);
         if (kind == dentry_kind::directory) {
             if (header.ref_bytes != sizeof(directory_ref_payload)) {
                 return false;
@@ -1177,7 +1215,7 @@ class DirectoryBlockStore {
         return true;
     }
 
-    cache_iterator find_cache_entry_locked(uint32_t block_id) {
+    cache_iterator find_cache_entry_locked(uint64_t block_id) {
         auto it = cache_index_.find(block_id);
         if (it == cache_index_.end()) {
             return cache_lru_.end();
@@ -1202,7 +1240,7 @@ class DirectoryBlockStore {
         return cache_lru_.begin();
     }
 
-    bool insert_cache_entry_locked(uint32_t block_id, const directory_block_image& image,
+    bool insert_cache_entry_locked(uint64_t block_id, const directory_block_image& image,
                                    bool dirty) {
         cache_iterator entry = find_cache_entry_locked(block_id);
         if (entry == cache_lru_.end()) {
@@ -1221,7 +1259,7 @@ class DirectoryBlockStore {
         return true;
     }
 
-    bool flush_cached_block(uint32_t block_id) {
+    bool flush_cached_block(uint64_t block_id) {
         std::lock_guard<std::mutex> guard(cache_mu_);
         cache_iterator entry = find_cache_entry_locked(block_id);
         if (entry == cache_lru_.end()) {
@@ -1230,7 +1268,7 @@ class DirectoryBlockStore {
         return flush_cache_entry_locked(*entry);
     }
 
-    bool drop_cached_block(uint32_t block_id, bool flush_dirty) {
+    bool drop_cached_block(uint64_t block_id, bool flush_dirty) {
         std::lock_guard<std::mutex> guard(cache_mu_);
         cache_iterator entry = find_cache_entry_locked(block_id);
         if (entry == cache_lru_.end()) {
@@ -1248,7 +1286,7 @@ class DirectoryBlockStore {
 #ifdef ZB_LHM_TESTING
     bool fail_next_read_ = false;
 #endif
-    bool read_block(uint32_t block_id, directory_block_image& out) {
+    bool read_block(uint64_t block_id, directory_block_image& out) {
 #ifdef ZB_LHM_TESTING
         if (fail_next_read_) { fail_next_read_ = false; read_failed_ = true; return false; }
 #endif
@@ -1285,7 +1323,7 @@ class DirectoryBlockStore {
         return true;
     }
 
-    bool write_block(uint32_t block_id, const directory_block_image& image) {
+    bool write_block(uint64_t block_id, const directory_block_image& image) {
         if (store_ == nullptr) {
             return false;
         }
@@ -1317,10 +1355,10 @@ class DirectoryBlockStore {
     std::size_t cache_capacity_ = kDefaultCacheBlocks;
     uint64_t access_clock_ = 0;
     cache_list cache_lru_{};
-    std::unordered_map<uint32_t, cache_iterator> cache_index_{};
+    std::unordered_map<uint64_t, cache_iterator> cache_index_{};
     std::mutex cache_mu_;
     std::mutex file_index_mu_;
-    std::vector<file_index_state> file_indexes_{};
+    std::deque<file_index_state> file_indexes_{};
 };
 
 }  // namespace MasstreeLHM

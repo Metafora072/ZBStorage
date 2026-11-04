@@ -90,3 +90,8 @@ if(BUILD_TESTING)
     add_executable(lhm_bulk_import_test ${CMAKE_SOURCE_DIR}/tests/mds/lhm_bulk_import_test.cpp)
     target_link_libraries(lhm_bulk_import_test PRIVATE zb_lhm_inode_store)
 endif()
+
+if(BUILD_TESTING)
+    add_executable(lhm_lifecycle_test ${CMAKE_SOURCE_DIR}/tests/mds/lhm_lifecycle_test.cpp)
+    target_link_libraries(lhm_lifecycle_test PRIVATE zb_lhm_inode_store)
+endif()

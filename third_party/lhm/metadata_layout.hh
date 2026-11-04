@@ -33,14 +33,14 @@ struct metadata_common_block_header {
     uint32_t magic;             // 固定魔数，用于快速判定块是否合法
     uint16_t block_type;        // 元数据块类型，见 metadata_block_type
     uint16_t layout_version;    // 布局版本号，用于未来升级兼容
-    uint32_t block_id;          // 当前块号（逻辑块编号）
+    uint64_t block_id;          // 当前块号（逻辑块编号）
     uint32_t payload_bytes;     // 有效载荷字节数（不含 common header）
     uint32_t checksum;          // 当前块校验和
     uint64_t sequence;          // 提交序列号/版本序号
     uint64_t owner_inode_id;    // 块所属 inode（目录块/数据块可复用）
-    uint32_t next_block_id;     // 链式组织时的下一块块号（0 表示无）
+    uint64_t next_block_id;     // 链式组织时的下一块块号（0 表示无）
     uint32_t flags;             // 通用标记位
-    uint8_t reserved[16];       // 预留扩展字段，补齐到 64B
+    uint8_t reserved[12];       // v2 widened references; 64-byte header
 };
 static_assert(sizeof(metadata_common_block_header) == kCommonBlockHeaderBytes,
               "common block header must be 64B");
@@ -150,11 +150,11 @@ struct directory_block_header {
     uint32_t entry_count;       // 本块目录项数量
     uint32_t used_bytes;        // 本块 payload 已使用字节数
     uint64_t base_version;      // 目录稳定版本号（flush 生成）
-    uint32_t prev_block_id;     // 前一目录块块号（链表头可为 0）
-    uint32_t next_block_id;     // 下一目录块块号（尾块为 0）
+    uint64_t prev_block_id;     // 前一目录块块号（链表头可为 0）
+    uint64_t next_block_id;     // 下一目录块块号（尾块为 0）
     uint32_t delta_count;       // 本块由多少 delta 合并生成（统计/调试）
     uint32_t flags;             // 目录块标记位
-    uint8_t reserved[24];       // 预留扩展字段，补齐到 64B
+    uint8_t reserved[16];       // v2 widened references; 64-byte header
 };
 static_assert(sizeof(directory_block_header) == 64,
               "directory block header must be 64B");

@@ -4071,3 +4071,17 @@ void MdsServiceImpl::FillStatus(zb::rpc::MdsStatus* status,
 }
 
 } // namespace zb::mds
+
+namespace zb::mds {
+void MdsServiceImpl::ImportNamespace(google::protobuf::RpcController*,const zb::rpc::ImportNamespaceRequest* request,
+    zb::rpc::ImportNamespaceReply* response,google::protobuf::Closure* done) {
+    brpc::ClosureGuard guard(done);
+    NamespaceImportResult result;
+    auto status=namespace_store_->ImportManifest(request->target_path(),request->manifest_path(),
+        request->memory_budget_bytes()?request->memory_budget_bytes():(4ULL<<20),&result);
+    response->mutable_status()->set_code(status.code); response->mutable_status()->set_message(status.message);
+    response->set_root_inode_id(result.root_inode_id); response->set_files(result.files);
+    response->set_directories(result.directories); response->set_processed_records(result.processed_records);
+    response->set_error_line(result.error_line);
+}
+}

@@ -32,7 +32,9 @@ DEFINE_int32(port, 9000, "Port for MDS brpc server");
 DEFINE_int32(idle_timeout_sec, -1, "Idle timeout for connections");
 
 int main(int argc, char* argv[]) {
+    google::SetCommandLineOption("graceful_quit_on_sigterm", "true");
     google::ParseCommandLineFlags(&argc, &argv, true);
+    (void)brpc::IsAskedToQuit(); // Install handlers before accepting requests.
 
     if (FLAGS_config.empty()) {
         std::cerr << "Missing --config, please specify config file path" << std::endl;
@@ -55,11 +57,20 @@ int main(int argc, char* argv[]) {
     const bool unified = cfg.namespace_backend == "lhm";
     std::unique_ptr<zb::mds::NamespaceStore> namespace_store;
     std::string backend_marker;
-    if (store.Get("SYS/NAMESPACE_BACKEND", &backend_marker, &error)) {
+    const bool reopen_lhm=unified && cfg.lhm_store_mode=="reopen";
+    const bool marked=store.Get("SYS/NAMESPACE_BACKEND", &backend_marker, &error);
+    if (marked && (!reopen_lhm || backend_marker!="lhm")) {
         std::cerr << "Existing LHM control store cannot be reopened or switched; use fresh paths" << std::endl;
         return 1;
     }
     if (!error.empty()) { std::cerr << error << std::endl; return 1; }
+    if(reopen_lhm) {
+        std::string bound;
+        if(!marked || !store.Get("SYS/LHM_STORE_FILE",&bound,&error) ||
+            bound!=std::filesystem::absolute(cfg.lhm_store_file).lexically_normal().string()) {
+            std::cerr << "LHM reopen requires its matching control store" << std::endl; return 1;
+        }
+    }
     if (unified) {
 #ifndef ZB_HAS_LHM
         std::cerr << "LHM backend requires -DZB_BUILD_LHM_BRIDGE=ON" << std::endl;
@@ -67,6 +78,7 @@ int main(int argc, char* argv[]) {
 #else
         std::unique_ptr<rocksdb::Iterator> it(store.db()->NewIterator(rocksdb::ReadOptions()));
         for (const auto* prefix : {"I/", "D/", "H/"}) {
+            if(reopen_lhm && std::string(prefix)=="H/") continue;
             it->Seek(prefix);
             if (!it->status().ok() || (it->Valid() && it->key().starts_with(prefix))) {
                 std::cerr << "Existing namespace/handles cannot be migrated implicitly; use a fresh control store" << std::endl;
@@ -75,7 +87,7 @@ int main(int argc, char* argv[]) {
         }
         std::unique_ptr<zb::mds::LhmNamespaceStore> lhm;
         if (cfg.lhm_bulk_manifest.empty()) {
-            lhm = std::make_unique<zb::mds::LhmNamespaceStore>(cfg.lhm_store_file);
+            lhm = std::make_unique<zb::mds::LhmNamespaceStore>(cfg.lhm_store_file,reopen_lhm,&error);
         } else {
             zb_lhm_bulk_stats stats{};
             lhm = std::make_unique<zb::mds::LhmNamespaceStore>(cfg.lhm_store_file,
@@ -85,11 +97,14 @@ int main(int argc, char* argv[]) {
                       << " inode_blocks=" << stats.inode_blocks << " buckets=" << stats.buckets << std::endl;
         }
         if (!lhm->ready()) {
-            std::cerr << "LHM_STORE_FILE must be a new file in an existing writable directory" << std::endl;
+            std::cerr << "LHM open failed: " << error << std::endl;
             return 1;
         }
         namespace_store = std::move(lhm);
         if (!store.Put("SYS/NAMESPACE_BACKEND", "lhm", &error)) { std::cerr << error << std::endl; return 1; }
+        if(!store.Put("SYS/LHM_STORE_FILE",std::filesystem::absolute(cfg.lhm_store_file).lexically_normal().string(),&error)) {
+            std::cerr << error << std::endl; return 1;
+        }
         store.DisableNamespaceAccess();
 #endif
     }
@@ -281,5 +296,11 @@ int main(int argc, char* argv[]) {
     if (archive_thread.joinable()) {
         archive_thread.join();
     }
+#ifdef ZB_HAS_LHM
+    if(unified) {
+        auto* lhm=static_cast<zb::mds::LhmNamespaceStore*>(namespace_store.get());
+        if(!lhm->Close(&error)) { std::cerr << "LHM normal close failed: " << error << std::endl; return 1; }
+    }
+#endif
     return 0;
 }

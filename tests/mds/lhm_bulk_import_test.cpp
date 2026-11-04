@@ -57,7 +57,7 @@ void Boundary(const fs::path& base, unsigned count) {
         const std::string path = "/f" + std::to_string(i);
         auto a = Lookup(ns, path);
         const uint64_t ticket = i + 1;
-        Check(a.inode_id() == (((ticket / 63 + 1) << 32) | (ticket % 63)), "packed inode address");
+        Check(a.inode_id() == (((ticket / 63 + 1) << 16) | (ticket % 63)), "packed inode address");
         ids[path] = a.inode_id();
     }
     // Cross several normal allocator chunks after bulk construction.

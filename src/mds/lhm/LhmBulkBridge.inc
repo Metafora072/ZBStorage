@@ -73,6 +73,7 @@ extern "C" zb_lhm_context* zb_lhm_open_bulk(const char* file, const char* manife
         return worker().run([&](threadinfo& ti) -> zb_lhm_context* {
             auto ctx = std::make_unique<zb_lhm_context>();
             try {
+                LockStore(*ctx,path);
                 ctx->ns.initialize(ti, path);
                 MasstreeLHM::LhmNamespace::bulk_stats result;
                 if (!ctx->ns.build_fresh_namespace(entries, result, ti))

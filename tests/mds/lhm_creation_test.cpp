@@ -77,7 +77,7 @@ int main(int argc,char** argv) {
         // Inspect the actual extended inode bytes, independent of decoder/cache.
         std::ifstream disk(file,std::ios::binary);
         const auto id=a.inode_id();
-        const uint64_t offset=(2*(id>>32)-1)*16384+256+uint32_t(id)*256;
+        const uint64_t offset=(2*(id>>16)-1)*16384+256+(id & 0xffffULL)*256;
         char magic[4]{}; disk.seekg(offset+92); disk.read(magic,4);
         Check(bool(disk) && std::string(magic,4)=="ZBA1","extension missing at native inode offset");
         Check(store.GetInode(a.inode_id(),&out),"read full after sync"); Same(a,out);

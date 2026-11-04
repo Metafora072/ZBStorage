@@ -1,6 +1,6 @@
 // Included in DirectoryBlockStore's public section. No live index is published
 // until all bucket images have been constructed and flushed by the caller.
-bool prepare_bulk_file_index(uint32_t head, const std::vector<entry>& entries,
+bool prepare_bulk_file_index(uint64_t head, const std::vector<entry>& entries,
                              file_index_state& plan) {
     plan = {};
     plan.head_block_id = head;
@@ -27,7 +27,7 @@ bool prepare_bulk_file_index(uint32_t head, const std::vector<entry>& entries,
             pending.push_back(std::move(high)); pending.push_back(std::move(low));
             continue;
         }
-        uint32_t block = 0;
+        uint64_t block = 0;
         if (!allocate_bucket_block(owner.header.dir_inode_id, block)) return false;
         directory_block_image target{};
         if (!read_block(block, target)) return false;
@@ -58,8 +58,8 @@ bool prepare_bulk_file_index(uint32_t head, const std::vector<entry>& entries,
     }
     return true;
 }
-uint32_t install_bulk_file_index(file_index_state&& plan) {
+uint64_t install_bulk_file_index(file_index_state&& plan) {
     std::lock_guard<std::mutex> guard(file_index_mu_);
     file_indexes_.push_back(std::move(plan));
-    return static_cast<uint32_t>(file_indexes_.size() - 1);
+    return static_cast<uint64_t>(file_indexes_.size() - 1);
 }

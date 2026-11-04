@@ -1,7 +1,7 @@
 #pragma once
 #include "LhmInodeStore.h"
 namespace zb::mds {
-// Fresh-store namespace backend. All native operations use the bridge worker.
+// Versioned namespace backend with explicit normal reopen. All native operations use the bridge worker.
 class LhmNamespaceStore final : public NamespaceStore {
 public:
     explicit LhmNamespaceStore(const std::string& fresh_file) : inodes_(fresh_file) {}
@@ -9,6 +9,10 @@ public:
     LhmNamespaceStore(const std::string& fresh_file, const std::string& manifest,
                       zb_lhm_bulk_stats* stats, std::string* error)
         : inodes_(fresh_file, manifest, stats, error) {}
+    LhmNamespaceStore(const std::string& file, bool reopen, std::string* error)
+        : inodes_(file,reopen,error) {}
+    bool Close(std::string* error) { return inodes_.Close(error); }
+    NamespaceStatus ImportManifest(const std::string&,const std::string&,uint64_t,NamespaceImportResult*) override;
     bool ready() const { return inodes_.ready(); }
     bool Sync() { return inodes_.Sync(); }
     bool ResolvePath(const std::string&,uint64_t*,zb::rpc::InodeAttr*,std::string*) const override;

@@ -4,6 +4,16 @@
 
 namespace zb::mds {
 namespace {
+struct CloseContext {
+    bool* result=nullptr;
+    std::string* error=nullptr;
+    void operator()(zb_lhm_context* ctx) const {
+        char message[512]{}; bool ok=zb_lhm_close_checked(ctx,message,sizeof(message));
+        if(result) *result=ok;
+        if(error) *error=message;
+        if(!ok && !error) std::fprintf(stderr,"LHM close: %s\n",message);
+    }
+};
 bool Encode(const zb::rpc::InodeAttr& a, zb_lhm_full_inode* out) {
     if (a.file_name().size() > 64 || (a.type() != zb::rpc::INODE_FILE && a.type() != zb::rpc::INODE_DIR) ||
         !zb::rpc::InodeArchiveState_IsValid(a.file_archive_state()) ||
@@ -99,11 +109,24 @@ void LhmInodeStore::DecodeAttributes(const zb_lhm_full_inode& raw, zb::rpc::Inod
 LhmInodeStore::LhmInodeStore(const std::string& file, const std::string& manifest,
     zb_lhm_bulk_stats* stats, std::string* error) {
     char message[512]{};
-    context_.reset(zb_lhm_open_bulk(file.c_str(), manifest.c_str(), stats, message, sizeof(message)), zb_lhm_close);
+    context_.reset(zb_lhm_open_bulk(file.c_str(), manifest.c_str(), stats, message, sizeof(message)), CloseContext{});
     if (error) *error = message;
 }
 LhmInodeStore::LhmInodeStore(const std::string& file)
-    : context_(zb_lhm_open(file.c_str()),zb_lhm_close) {}
+    : context_(zb_lhm_open(file.c_str()),CloseContext{}) {}
+LhmInodeStore::LhmInodeStore(const std::string& file,bool reopen,std::string* error) {
+    char message[512]{};
+    context_=std::shared_ptr<zb_lhm_context>(reopen ? zb_lhm_reopen(file.c_str(),message,sizeof(message)) : zb_lhm_open(file.c_str()),CloseContext{});
+    if(error) *error=message;
+}
+bool LhmInodeStore::Close(std::string* error) {
+    if(error) error->clear();
+    if(!context_) return true;
+    if(context_.use_count()!=1) { if(error) *error="active creation or scanner still owns the store"; return false; }
+    bool ok=false; auto* deleter=std::get_deleter<CloseContext>(context_);
+    deleter->result=&ok; deleter->error=error; context_.reset(); return ok;
+}
+
 std::unique_ptr<NamespaceCreation> LhmInodeStore::ReserveCreate(
     const std::string& path, zb::rpc::InodeType type, std::string* error) {
     if (error) error->clear();

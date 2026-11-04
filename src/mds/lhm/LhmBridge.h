@@ -74,10 +74,14 @@ int zb_lhm_lookup_full(zb_lhm_context*, const char* path, zb_lhm_full_inode*);
 int zb_lhm_update_full(zb_lhm_context*, const zb_lhm_full_inode*);
 
 // Returns 1 on success, 0 for invalid/missing/error. Detailed statuses are step 3/4.
-// Fresh file only; the parent directory must already exist. No reopen/recovery.
+// Fresh file only; parent must exist. Use zb_lhm_reopen for normal reopen.
 zb_lhm_context* zb_lhm_open(const char* fresh_backing_file);
 // Caller must quiesce all calls on ctx before close; the pointer then becomes invalid.
 void zb_lhm_close(zb_lhm_context* ctx);
+// Normal-close snapshot only. Existing stores require a matching clean snapshot.
+zb_lhm_context* zb_lhm_reopen(const char* file, char* error, size_t error_size);
+// Consumes ctx even on failure; failure leaves no clean snapshot.
+int zb_lhm_close_checked(zb_lhm_context*, char* error, size_t error_size);
 int zb_lhm_create(zb_lhm_context* ctx, const char* path, int directory);
 int zb_lhm_lookup(zb_lhm_context* ctx, const char* path, zb_lhm_inode* out);
 int zb_lhm_read_inode(zb_lhm_context* ctx, uint64_t id, zb_lhm_inode* out);
@@ -86,6 +90,22 @@ int zb_lhm_rename(zb_lhm_context* ctx, const char* from, const char* to);
 // Functional harness removal; only files or empty directories. Formal API in step 4.
 int zb_lhm_remove(zb_lhm_context* ctx, const char* path);
 int zb_lhm_sync(zb_lhm_context* ctx);
+#ifdef __cplusplus
+}
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+// Synchronous streaming append. Target must be a new child of an existing
+// directory. Manifest begins with dir /; remaining paths are rooted there.
+// Budget bounds parser records (not final indexes or backend block caches).
+// Failure may leave the successfully imported prefix. No retry/rollback promise.
+typedef struct {
+    uint64_t root_inode_id, files, directories, processed_records, error_line;
+} zb_lhm_import_result;
+int zb_lhm_import_manifest(zb_lhm_context*, const char* target, const char* manifest,
+    uint64_t memory_budget_bytes, zb_lhm_import_result*, char* error, size_t error_size);
 #ifdef __cplusplus
 }
 #endif

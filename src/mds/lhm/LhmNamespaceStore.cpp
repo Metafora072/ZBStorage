@@ -101,3 +101,14 @@ bool LhmNamespaceStore::Readdir(const std::string& path,const std::string& after
     return true;
 }
 }
+
+namespace zb::mds {
+NamespaceStatus LhmNamespaceStore::ImportManifest(const std::string& target,const std::string& manifest,
+    uint64_t budget,NamespaceImportResult* result) {
+    if(!result) return {zb::rpc::MDS_INVALID_ARGUMENT,"missing import result"};
+    zb_lhm_import_result raw{}; char error[1024]{};
+    auto rc=zb_lhm_import_manifest(inodes_.context_.get(),target.c_str(),manifest.c_str(),budget,&raw,error,sizeof(error));
+    *result={raw.root_inode_id,raw.files,raw.directories,raw.processed_records,raw.error_line};
+    return {rc==ZB_LHM_OK ? zb::rpc::MDS_OK : rc==ZB_LHM_INVALID ? zb::rpc::MDS_INVALID_ARGUMENT : zb::rpc::MDS_INTERNAL_ERROR,error};
+}
+}

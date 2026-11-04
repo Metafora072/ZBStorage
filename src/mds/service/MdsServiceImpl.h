@@ -68,6 +68,8 @@ public:
     zb::metrics::NodeMetricsCollector* MetricsCollector() { return &metrics_; }
     zb::rpc_support::FiberSharedMutex* PlacementTransactionMutex() { return &placement_transaction_mu_; }
 
+    void ImportNamespace(google::protobuf::RpcController*, const zb::rpc::ImportNamespaceRequest*,
+                         zb::rpc::ImportNamespaceReply*, google::protobuf::Closure*) override;
     void Lookup(google::protobuf::RpcController* cntl_base,
                 const zb::rpc::LookupRequest* request,
                 zb::rpc::LookupReply* response,

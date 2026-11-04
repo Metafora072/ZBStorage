@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "metadata_layout.hh"
+#include "snapshot_io.hh"
 
 namespace MasstreeLHM {
 
@@ -75,7 +76,9 @@ class PersistentStore {
     PersistentStore(const PersistentStore&) = delete;
     PersistentStore& operator=(const PersistentStore&) = delete;
 
-    bool OpenOrCreate(const std::string& path);
+    bool OpenOrCreate(const std::string& path, bool from_snapshot = false);
+    void SaveAllocation(SnapshotWriter& out) const;
+    void LoadAllocation(SnapshotReader& in);
     void Close();
     bool IsOpen() const;
     bool Sync();
@@ -83,24 +86,24 @@ class PersistentStore {
     bool l0_cache_enabled() const;
 
     // 基础块读写接口（固定 16KB）。
-    bool ReadBlock(uint32_t block_id, metadata_block_bytes& out) const;
-    bool WriteBlock(uint32_t block_id, const metadata_block_bytes& data);
+    bool ReadBlock(uint64_t block_id, metadata_block_bytes& out) const;
+    bool WriteBlock(uint64_t block_id, const metadata_block_bytes& data);
 
     // 顺序分配一个新块号（当前为 append-only 策略）。
-    bool AllocateBlock(uint32_t& out_block_id);
+    bool AllocateBlock(uint64_t& out_block_id);
 
     // 控制块读写（block_id=0 固定 superblock）。
     bool ReadSuperblock(superblock_payload& out) const;
     bool WriteSuperblock(const superblock_payload& payload);
-    bool ReadCheckpoint(uint32_t block_id, checkpoint_payload& out) const;
-    bool WriteCheckpoint(uint32_t block_id, const checkpoint_payload& payload);
-    bool ReadAllocatorState(uint32_t block_id, allocator_state_payload& out) const;
-    bool WriteAllocatorState(uint32_t block_id, const allocator_state_payload& payload);
+    bool ReadCheckpoint(uint64_t block_id, checkpoint_payload& out) const;
+    bool WriteCheckpoint(uint64_t block_id, const checkpoint_payload& payload);
+    bool ReadAllocatorState(uint64_t block_id, allocator_state_payload& out) const;
+    bool WriteAllocatorState(uint64_t block_id, const allocator_state_payload& payload);
 
     // inode 块与 inode slot 操作。
-    bool ReadInodeBlock(uint32_t block_id, inode_block_image& out) const;
+    bool ReadInodeBlock(uint64_t block_id, inode_block_image& out) const;
     bool ReadInodeBlockForRefDirect(const inode_ref& ref, inode_block_image& out) const;
-    bool WriteInodeBlock(uint32_t block_id, const inode_block_image& image);
+    bool WriteInodeBlock(uint64_t block_id, const inode_block_image& image);
     bool AllocateInodeSlot(inode_ref& out_ref);
     // Exclusive fresh-store builder: root occupies ticket 0; assign files from 1.
     bool WriteFreshFileInodes(std::vector<inode_disk>& inodes);
@@ -108,11 +111,11 @@ class PersistentStore {
     bool WriteInode(const inode_ref& ref, const inode_disk& inode);
 
     // 目录块操作。
-    bool ReadDirectoryBlock(uint32_t block_id, directory_block_image& out) const;
-    bool WriteDirectoryBlock(uint32_t block_id, const directory_block_image& image);
-    bool ReadDirectoryInode(uint32_t head_block_id, inode_disk& out) const;
-    bool WriteDirectoryInode(uint32_t head_block_id, const inode_disk& inode);
-    bool CreateDirectoryChain(uint64_t dir_inode_id, inode_ref& out_head_ref);
+    bool ReadDirectoryBlock(uint64_t block_id, directory_block_image& out) const;
+    bool WriteDirectoryBlock(uint64_t block_id, const directory_block_image& image);
+    bool ReadDirectoryInode(uint64_t head_block_id, inode_disk& out) const;
+    bool WriteDirectoryInode(uint64_t head_block_id, const inode_disk& inode);
+    bool CreateDirectoryChain(uint64_t dir_inode_id, inode_ref& out_head_ref, bool compact_head = false);
     bool AppendDirectoryChainBlock(const inode_ref& tail_ref,
                                    uint64_t dir_inode_id,
                                    inode_ref& out_new_tail_ref);
@@ -122,17 +125,18 @@ class PersistentStore {
         return ref.block_id && ref.offset < kInodesPerBlock &&
             (uint64_t(ref.block_id - 1) * kInodesPerBlock + ref.offset) < next_inode_ticket_.load(std::memory_order_relaxed);
     }
-    bool DirectoryAddressMayExist(uint32_t block) const {
-        return block && block < next_directory_block_.load(std::memory_order_relaxed);
+    bool DirectoryAddressMayExist(uint64_t block) const {
+        return (block & kCompactHeadTag) ? ((block & ~kCompactHeadTag) && (block & ~kCompactHeadTag) < next_head_)
+            : block && block < next_directory_block_.load(std::memory_order_relaxed);
     }
-    uint32_t NextAllocBlock() const;
+    uint64_t NextAllocBlock() const;
     const std::string& BackingFile() const;
     void ResetStats();
     stats_snapshot Stats() const;
 
   private:
     static constexpr uint64_t kInodeAllocChunk = 256;
-    static constexpr uint32_t kL0FlushOpsThreshold = 64;
+    static constexpr uint64_t kL0FlushOpsThreshold = 64;
     static constexpr std::size_t kInodeCacheShardCount = 8;
     static constexpr std::size_t kInodeCacheEntriesPerShard = 64;
     static constexpr std::size_t kInodeCacheDirtyWordCount =
@@ -151,8 +155,8 @@ class PersistentStore {
         std::mutex mu;
         bool has_active_block = false;    // 当前是否持有活动 inode block。
         bool active_dirty = false;        // 活动块是否有未下发到 L1 的修改。
-        uint32_t active_block_id = 0;     // 活动块号。
-        uint32_t pending_ops = 0;         // 自上次 flush 后累计操作数。
+        uint64_t active_block_id = 0;     // 活动块号。
+        uint64_t pending_ops = 0;         // 自上次 flush 后累计操作数。
         inode_block_image active_image{}; // 活动块镜像。
     };
 
@@ -167,7 +171,7 @@ class PersistentStore {
     struct inode_block_cache_entry {
         bool valid = false;     // 该槽位是否已装载有效 block。
         bool dirty = false;     // 该槽位是否包含未落盘修改。
-        uint32_t block_id = 0;  // 当前缓存命中的 inode block_id。
+        uint64_t block_id = 0;  // 当前缓存命中的 inode block_id。
         inode_block_image image{};
     };
 
@@ -178,30 +182,30 @@ class PersistentStore {
         std::array<uint64_t, kInodeCacheDirtyWordCount> dirty_bitmap{};
     };
 
-    bool EnsureBlockCount(uint32_t block_count);
+    bool EnsureBlockCount(uint64_t block_count);
     bool InitializeFreshStore();
     bool RecomputeNextAllocBlock();
     bool RecomputeLinearInodeCursor();
     bool RecomputeNextDirectoryBlock();
-    bool AllocateBlockLocked(uint32_t& out_block_id);
-    bool AllocateDirectoryBlockLocked(uint32_t& out_block_id);
+    bool AllocateBlockLocked(uint64_t& out_block_id);
+    bool AllocateDirectoryBlockLocked(uint64_t& out_block_id);
     uint64_t NextSequenceLocked();
     void InitDirectoryBlockImage(directory_block_image& out,
-                                 uint32_t block_id,
+                                 uint64_t block_id,
                                  uint64_t dir_inode_id,
-                                 uint32_t prev_block_id,
-                                 uint32_t next_block_id,
+                                 uint64_t prev_block_id,
+                                 uint64_t next_block_id,
                                  uint64_t base_version,
                                  uint64_t sequence);
-    bool EnsureInodeBlocksInitializedLocked(uint32_t target_block_id);
+    bool EnsureInodeBlocksInitializedLocked(uint64_t target_block_id);
     bool AcquireInodeTicketRange(uint64_t& begin_ticket, uint64_t& end_ticket);
     l0_thread_buffer* GetOrCreateL0ThreadBuffer();
     l0_thread_buffer* GetL0ThreadBufferIfValid() const;
     bool FlushL0ThreadBufferLocked(l0_thread_buffer& buffer, bool keep_active_block);
     bool FlushAllL0Buffers();
     void ResetAllL0Buffers();
-    bool ReadInodeBlockDirect(uint32_t block_id, inode_block_image& out) const;
-    bool WriteInodeBlockDirect(uint32_t block_id, const inode_block_image& image);
+    bool ReadInodeBlockDirect(uint64_t block_id, inode_block_image& out) const;
+    bool WriteInodeBlockDirect(uint64_t block_id, const inode_block_image& image);
     bool FlushInodeCacheEntryLocked(inode_block_cache_shard& shard, std::size_t slot_index);
     bool FlushInodeCacheShard(std::size_t shard_index);
     bool FlushInodeCache();
@@ -210,34 +214,41 @@ class PersistentStore {
                                  std::size_t slot_index,
                                  bool dirty);
     static bool IsShardDirtyBitSet(const inode_block_cache_shard& shard, std::size_t slot_index);
-    static std::size_t InodeCacheShardIndex(uint32_t block_id);
-    static std::size_t InodeCacheSlotIndex(uint32_t block_id);
+    static std::size_t InodeCacheShardIndex(uint64_t block_id);
+    static std::size_t InodeCacheSlotIndex(uint64_t block_id);
     bool IsKnownBlockType(uint16_t block_type) const;
-    static uint32_t InodeBlockIdFromTicket(uint64_t ticket);
-    static uint32_t InodeSlotFromTicket(uint64_t ticket);
-    static uint32_t InodePhysicalBlockId(uint32_t inode_block_id);
-    static uint32_t DirectoryPhysicalBlockId(uint32_t directory_block_id);
-    static uint32_t MaxLogicalInodeBlockId(uint32_t physical_block_count);
-    static uint32_t MaxLogicalDirectoryBlockId(uint32_t physical_block_count);
+    static uint64_t InodeBlockIdFromTicket(uint64_t ticket);
+    static uint64_t InodeSlotFromTicket(uint64_t ticket);
+    static uint64_t InodePhysicalBlockId(uint64_t inode_block_id);
+    static uint64_t DirectoryPhysicalBlockId(uint64_t directory_block_id);
+    static uint64_t MaxLogicalInodeBlockId(uint64_t physical_block_count);
+    static uint64_t MaxLogicalDirectoryBlockId(uint64_t physical_block_count);
 
-    static bool IsSlotUsed(const inode_block_header& header, uint32_t slot);
-    static void SetSlotUsed(inode_block_header& header, uint32_t slot, bool used);
+    static bool IsSlotUsed(const inode_block_header& header, uint64_t slot);
+    static void SetSlotUsed(inode_block_header& header, uint64_t slot, bool used);
     static void BuildCommonHeader(metadata_common_block_header& out,
                                   metadata_block_type block_type,
-                                  uint32_t block_id,
-                                  uint32_t payload_bytes,
+                                  uint64_t block_id,
+                                  uint64_t payload_bytes,
                                   uint64_t sequence,
                                   uint64_t owner_inode_id,
-                                  uint32_t next_block_id,
-                                  uint32_t flags);
+                                  uint64_t next_block_id,
+                                  uint64_t flags);
 
+    int heads_fd_ = -1;
+    uint64_t next_head_ = 1;
+    mutable uint64_t head_page_ = UINT64_MAX;
+    mutable bool head_dirty_ = false;
+    mutable metadata_block_bytes head_image_{};
+    bool FlushHeadPage() const;
+    bool LoadHeadPage(uint64_t page, bool create) const;
     int fd_;
     std::string path_;
-    std::atomic<uint32_t> next_alloc_block_;
-    std::atomic<uint32_t> next_directory_block_;
+    std::atomic<uint64_t> next_alloc_block_;
+    std::atomic<uint64_t> next_directory_block_;
     uint64_t sequence_;
     std::atomic<uint64_t> next_inode_ticket_;
-    std::atomic<uint32_t> highest_initialized_inode_block_;
+    std::atomic<uint64_t> highest_initialized_inode_block_;
     std::atomic<uint64_t> inode_alloc_epoch_;
     std::atomic<uint64_t> l0_epoch_;
     std::atomic<bool> l0_cache_enabled_;

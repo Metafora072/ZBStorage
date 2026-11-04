@@ -248,6 +248,8 @@ MdsConfig MdsConfig::LoadFromFile(const std::string& path, std::string* error) {
             cfg.namespace_backend = ToLower(value);
         } else if (key == "LHM_STORE_FILE") {
             cfg.lhm_store_file = value;
+        } else if (key == "LHM_STORE_MODE") {
+            cfg.lhm_store_mode = value;
         } else if (key == "LHM_BULK_MANIFEST") {
             cfg.lhm_bulk_manifest = value;
         } else if (key == "SCHEDULER_ADDR") {
@@ -400,6 +402,11 @@ MdsConfig MdsConfig::LoadFromFile(const std::string& path, std::string* error) {
     }
     if (cfg.namespace_backend != "rocksdb" && cfg.namespace_backend != "lhm") {
         if (error) *error = "NAMESPACE_BACKEND must be rocksdb or lhm";
+        return {};
+    }
+    if ((cfg.lhm_store_mode != "create" && cfg.lhm_store_mode != "reopen") ||
+        (cfg.lhm_store_mode == "reopen" && (!cfg.lhm_bulk_manifest.empty() || cfg.namespace_backend != "lhm"))) {
+        if(error) *error="LHM_STORE_MODE must be create or reopen; reopen excludes startup bulk import";
         return {};
     }
     if (!cfg.lhm_bulk_manifest.empty() && cfg.namespace_backend != "lhm") {

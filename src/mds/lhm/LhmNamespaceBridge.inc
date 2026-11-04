@@ -7,6 +7,7 @@ template<class F> int checked(zb_lhm_context* ctx, F f) {
 bool parse_service_path(const char* path, std::string& out) {
     if (!path || path[0] != '/') return false;
     auto parsed = MasstreeLHM::PathKey::parse_absolute_path(path);
+    if(parsed.components.size()>4096) return false;
     for (const auto& name : parsed.components)
         if (name.size() > 64 || name == "." || name == "..") return false;
     out = parsed.normalized_path;
@@ -21,7 +22,7 @@ int lookup_checked(zb_lhm_context* ctx, const std::string& path,
     MasstreeLHM::inode_disk inode{};
     const uint64_t id = path=="/" ? ctx->ns.root_inode_id()
         : MasstreeLHM::entry_is_directory(entry) ? (uint64_t{1}<<63)|entry.ref.block_id
-        : (uint64_t(entry.ref.block_id)<<32)|entry.ref.offset;
+        : (uint64_t(entry.ref.block_id)<<16)|entry.ref.offset;
     if (!ctx->ns.read_inode_by_id(id,inode) || !zb::mds::lhm_codec::Decode(inode,out))
         return ZB_LHM_ERROR;
     if (out.inode_id == ctx->ns.root_inode_id()) out.inode_id = 1;
@@ -154,7 +155,7 @@ int zb_lhm_readdir_checked(zb_lhm_context* ctx,const char* path,const char* afte
             // Read by encoded address; no per-child path traversal.
             uint64_t id=MasstreeLHM::entry_is_directory(entry.entry)
                 ? (uint64_t{1}<<63)|entry.entry.ref.block_id
-                : (uint64_t(entry.entry.ref.block_id)<<32)|entry.entry.ref.offset;
+                : (uint64_t(entry.entry.ref.block_id)<<16)|entry.entry.ref.offset;
             MasstreeLHM::inode_disk inode{};
             zb_lhm_full_inode full{};
             if (!ctx->ns.read_inode_by_id(id,inode) || !zb::mds::lhm_codec::Decode(inode,full)) return ZB_LHM_ERROR;

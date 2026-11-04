@@ -13,14 +13,33 @@
 #include <thread>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/file.h>
 
 relaxed_atomic<mrcu_epoch_type> globalepoch(1);
 relaxed_atomic<mrcu_epoch_type> active_epoch(1);
 volatile bool recovering = false;
 kvtimestamp_t initial_timestamp;
 
-struct zb_lhm_context { MasstreeLHM::LhmNamespace ns; };
+struct zb_lhm_context {
+    MasstreeLHM::LhmNamespace ns;
+    std::string path;
+    int lock_fd=-1;
+    ~zb_lhm_context() { if(lock_fd>=0) ::close(lock_fd); }
+};
 namespace {
+void Error(char* out,size_t n,const std::string& message) {
+    if(out && n) { std::strncpy(out,message.c_str(),n-1); out[n-1]=0; }
+}
+void SyncFile(const std::string& path, bool directory=false) {
+    int fd=::open(path.c_str(),O_RDONLY|(directory?O_DIRECTORY:0));
+    if(fd<0) throw std::runtime_error("open for sync failed: "+path);
+    int rc=::fsync(fd); ::close(fd);
+    if(rc) throw std::runtime_error("fsync failed: "+path);
+}
+void LockStore(zb_lhm_context& ctx,const std::string& path) {
+    ctx.path=path; ctx.lock_fd=::open(path.c_str(),O_RDWR);
+    if(ctx.lock_fd<0 || ::flock(ctx.lock_fd,LOCK_EX|LOCK_NB)) throw std::runtime_error("store is already open or inaccessible");
+}
 // One module-owned worker and upstream threadinfo for the module lifetime.
 // Multiple contexts/caller threads are serialized; no per-request threadinfo leaks.
 class Worker {
@@ -88,6 +107,7 @@ zb_lhm_context* zb_lhm_open(const char* file) {
         ::close(fd);
         return worker().run([path](threadinfo& ti) -> zb_lhm_context* {
             auto ctx = std::make_unique<zb_lhm_context>();
+            LockStore(*ctx,path);
             ctx->ns.initialize(ti, path);
             MasstreeLHM::inode_disk root{};
             if (!ctx->ns.read_inode_by_id(ctx->ns.root_inode_id(), root)) {
@@ -107,9 +127,40 @@ zb_lhm_context* zb_lhm_open(const char* file) {
         });
     } catch (...) { return nullptr; }
 }
+zb_lhm_context* zb_lhm_reopen(const char* file,char* error,size_t size) {
+    Error(error,size,"");
+    if(!file || !*file) { Error(error,size,"missing store path"); return nullptr; }
+    try {
+        const auto path=std::filesystem::absolute(file).string();
+        return worker().run([&](threadinfo& ti)->zb_lhm_context* {
+            auto ctx=std::make_unique<zb_lhm_context>(); LockStore(*ctx,path);
+            // Validate before invalidation. No service operations run until the
+            // clean snapshot has been removed durably.
+            try {
+                ctx->ns.reopen_snapshot(path,path+".snapshot",ti);
+                if(::unlink((path+".snapshot").c_str())) throw std::runtime_error("cannot invalidate clean snapshot");
+                SyncFile(std::filesystem::path(path).parent_path().string(),true);
+                return ctx.release();
+            } catch(...) { ctx->ns.destroy(ti); throw; }
+        });
+    } catch(const std::exception& e) { Error(error,size,e.what()); return nullptr; }
+}
+int zb_lhm_close_checked(zb_lhm_context* ctx,char* error,size_t size) {
+    Error(error,size,""); if(!ctx) return 1;
+    try { return worker().run([&](threadinfo& ti) {
+        bool ok=true;
+        try {
+            auto temp=ctx->path+".snapshot.tmp";
+            ctx->ns.save_snapshot(temp,ti); SyncFile(temp);
+            if(::rename(temp.c_str(),(ctx->path+".snapshot").c_str())) throw std::runtime_error("snapshot publication failed");
+            SyncFile(std::filesystem::path(ctx->path).parent_path().string(),true);
+        } catch(const std::exception& e) { ok=false; Error(error,size,e.what()); ::unlink((ctx->path+".snapshot").c_str()); }
+        ctx->ns.destroy(ti); delete ctx; return ok?1:0;
+    }); } catch(const std::exception& e) { Error(error,size,e.what()); return 0; }
+}
 void zb_lhm_close(zb_lhm_context* ctx) {
-    if (!ctx) return;
-    try { worker().run([ctx](threadinfo& ti) { ctx->ns.destroy(ti); delete ctx; }); } catch (...) {}
+    char error[512]{};
+    if(!zb_lhm_close_checked(ctx,error,sizeof(error))) std::fprintf(stderr,"LHM close: %s\n",error);
 }
 int zb_lhm_create(zb_lhm_context* ctx, const char* path, int directory) {
     if (!path || path[0] != '/') return 0;
@@ -238,3 +289,5 @@ int zb_lhm_update_full(zb_lhm_context* ctx, const zb_lhm_full_inode* attr) {
 #include "LhmScanBridge.inc"
 
 #include "LhmBulkBridge.inc"
+
+#include "LhmStreamBridge.inc"

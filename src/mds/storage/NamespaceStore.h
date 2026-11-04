@@ -15,6 +15,10 @@ struct NamespaceStatus {
     bool ok() const { return code == zb::rpc::MDS_OK; }
 };
 
+struct NamespaceImportResult {
+    uint64_t root_inode_id=0, files=0, directories=0, processed_records=0, error_line=0;
+};
+
 struct SubtreeScanOptions {
     bool files_only = true;
     // Bounds traversal steps per Next, including empty directories. Not a time
@@ -57,6 +61,10 @@ public:
 class NamespaceStore {
 public:
     virtual ~NamespaceStore() = default;
+    virtual NamespaceStatus ImportManifest(const std::string&, const std::string&,
+        uint64_t, NamespaceImportResult*) {
+        return {zb::rpc::MDS_INVALID_ARGUMENT, "stream import unsupported by this backend"};
+    }
     virtual bool ResolvePath(const std::string& path, uint64_t* inode_id,
                              zb::rpc::InodeAttr* attr, std::string* error) const = 0;
     virtual bool GetInode(uint64_t inode_id, zb::rpc::InodeAttr* attr,

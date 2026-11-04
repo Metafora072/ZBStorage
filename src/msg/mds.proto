@@ -812,7 +812,22 @@ message GetMasstreeNamespaceStatsReply {
   string optical_layout_version = 18;
 }
 
+message ImportNamespaceRequest {
+  string target_path = 1;
+  string manifest_path = 2; // server-local manifest; trusted administration only
+  uint64 memory_budget_bytes = 3; // parser workspace, excluding indexes/caches
+}
+message ImportNamespaceReply {
+  MdsStatus status = 1;
+  uint64 root_inode_id = 2;
+  uint64 files = 3;
+  uint64 directories = 4;
+  uint64 processed_records = 5;
+  uint64 error_line = 6;
+}
+
 service MdsService {
+  rpc ImportNamespace(ImportNamespaceRequest) returns (ImportNamespaceReply);
   rpc AllocateAvailableImageId(AllocateAvailableImageIdRequest) returns (AllocateAvailableImageIdReply);
   rpc AllocateAvailableDiscId(AllocateAvailableDiscIdRequest) returns (AllocateAvailableDiscIdReply);
   rpc ReportFilesPackedToImage(ReportFilesPackedToImageRequest) returns (SimpleArchiveReportReply);

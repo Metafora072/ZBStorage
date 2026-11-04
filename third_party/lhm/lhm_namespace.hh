@@ -46,7 +46,7 @@ class LhmNamespace {
         uint64_t id = 0, parent_id = 0;
         inode_ref ref{};
         bool directory = false;
-        uint32_t file_index_id = 0;
+        uint64_t file_index_id = 0;
     };
     std::map<uint64_t, PendingCreate> pending_creates_;
     std::vector<PendingCreate> canceled_files_, canceled_directories_;
@@ -58,6 +58,7 @@ class LhmNamespace {
     using value_type = MasstreeDirectoryIndex::value_type;
 
     #include "namespace_bulk_build.inc"
+    #include "namespace_snapshot.inc"
 
     void initialize(threadinfo& ti, const std::string& backing_file = {}) {
         directory_index_.initialize(ti);
@@ -103,13 +104,13 @@ class LhmNamespace {
             ok = directory_blocks_.read_directory_inode(root_directory_head_block_id_, out);
         } else if (id & (uint64_t{1} << 63)) {
             const uint64_t head = id & ~(uint64_t{1} << 63);
-            if (!head || head > 0x7fffffffU || !persistent_store_.DirectoryAddressMayExist(head)) return false;
+            if (!head || !persistent_store_.DirectoryAddressMayExist(head)) return false;
             expected_type = static_cast<uint8_t>(inode_type::directory);
-            ok = directory_blocks_.read_directory_inode(static_cast<uint32_t>(head), out);
+            ok = directory_blocks_.read_directory_inode(static_cast<uint64_t>(head), out);
         } else {
-            const uint32_t block = static_cast<uint32_t>(id >> 32);
-            const uint32_t slot = static_cast<uint32_t>(id);
-            if (!block || block > 0x7fffffffU || slot >= kInodesPerBlock) return false;
+            const uint64_t block = static_cast<uint64_t>(id >> 16);
+            const uint32_t slot = static_cast<uint32_t>(id & 0xffffULL);
+            if (!block || block > kMaxLogicalBlock || slot >= kInodesPerBlock) return false;
             if (!persistent_store_.InodeAddressMayExist(make_inode_ref(block,slot))) return false;
             ok = persistent_store_.ReadInode(make_inode_ref(block, slot), out);
         }
@@ -137,7 +138,7 @@ class LhmNamespace {
         auto& pool = directory ? canceled_directories_ : canceled_files_;
         if (!pool.empty()) { pending = std::move(pool.back()); pool.pop_back(); }
         else if (directory) {
-            uint32_t head = 0, tail = 0;
+            uint64_t head = 0, tail = 0;
             if (!allocate_directory_blocks(head, tail)) return false;
             pending.ref = make_inode_ref(head, 0);
             pending.id = packed_directory_inode_id(head);
@@ -249,8 +250,8 @@ class LhmNamespace {
             return directory_blocks_.write_directory_inode(root_directory_head_block_id_, current) &&
                    persistent_store_.WriteInode(root_persistent_ref_, current);
         if (id & (uint64_t{1} << 63))
-            return directory_blocks_.write_directory_inode(static_cast<uint32_t>(id), current);
-        return persistent_store_.WriteInode(make_inode_ref(id >> 32, static_cast<uint32_t>(id)), current);
+            return directory_blocks_.write_directory_inode((id & ~(uint64_t{1} << 63)), current);
+        return persistent_store_.WriteInode(make_inode_ref(id >> 16, static_cast<uint32_t>(id & 0xffffULL)), current);
     }
 
     size_t pending_create_count() const { return pending_creates_.size(); }
@@ -300,10 +301,10 @@ class LhmNamespace {
                    persistent_store_.WriteInode(root_persistent_ref_, inode);
         }
         if (id & (uint64_t{1} << 63)) {
-            return directory_blocks_.write_directory_inode(static_cast<uint32_t>(id), inode);
+            return directory_blocks_.write_directory_inode((id & ~(uint64_t{1} << 63)), inode);
         }
         return persistent_store_.WriteInode(
-            make_inode_ref(static_cast<uint32_t>(id >> 32), static_cast<uint32_t>(id)), inode);
+            make_inode_ref(static_cast<uint64_t>(id >> 16), static_cast<uint32_t>(id & 0xffffULL)), inode);
     }
 
     const std::string& persistence_backing_file() const {
@@ -399,7 +400,7 @@ class LhmNamespace {
         }
 
         if (entry_is_directory(out)) {
-            const uint32_t head_block_id =
+            const uint64_t head_block_id =
                 path == "/" ? root_directory_head_block_id_ : out.ref.block_id;
             if (head_block_id == 0) {
                 return false;
@@ -463,7 +464,7 @@ class LhmNamespace {
         if (!lookup_directory(path, out, ti)) {
             return false;
         }
-        const uint32_t head_block_id =
+        const uint64_t head_block_id =
             path == "/" ? root_directory_head_block_id_ : out.ref.block_id;
         if (head_block_id == 0) {
             return false;
@@ -631,9 +632,9 @@ class LhmNamespace {
             } else { results.clear(); return false; }
         }
 
-        uint32_t head = 0;
-        uint32_t tail = 0;
-        uint32_t file_index_id = 0;
+        uint64_t head = 0;
+        uint64_t tail = 0;
+        uint64_t file_index_id = 0;
         if (!directory_block_refs_for_root(directory_root, head, tail)) {
             return false;
         }
@@ -663,7 +664,7 @@ class LhmNamespace {
     // never Masstree node pointers. File buffers are released before descending,
     // so memory is one bucket plus O(depth) frames and path hashes.
     struct subtree_scan_frame {
-        uint32_t head = 0, file_index_id = 0;
+        uint64_t head = 0, file_index_id = 0;
         bool files_done = false, have_child = false;
         uint64_t last_child = 0;
         DirectoryBlockStore::file_scan_cursor files;
@@ -681,7 +682,7 @@ class LhmNamespace {
         const node_type* root = nullptr;
         if (!locate_directory_root(cursor.location, root, ti)) return false;
         subtree_scan_frame frame;
-        uint32_t tail = 0;
+        uint64_t tail = 0;
         if (!directory_block_refs_for_root(root, frame.head, tail)
             || !file_index_id_for_root(root, frame.file_index_id)) return false;
         cursor.stack.push_back(std::move(frame));
@@ -706,14 +707,14 @@ class LhmNamespace {
             cursor.bucket_reads += frame.files.bucket_reads - before;
             frame.files_done = done;
             if (!entry_found) return true;
-            const uint64_t id = (uint64_t(item.file_ref.block_id) << 32) | item.file_ref.offset;
+            const uint64_t id = (uint64_t(item.file_ref.block_id) << 16) | item.file_ref.offset;
             if (!read_inode_by_id(id, inode) || inode.type != 1) return false;
             ++cursor.file_entries;
             found = true;
             return true;
         }
         const node_type* root = nullptr;
-        uint32_t head = 0, tail = 0;
+        uint64_t head = 0, tail = 0;
         if (!locate_directory_root(cursor.location, root, ti)
             || !directory_block_refs_for_root(root, head, tail) || head != frame.head) return false;
         uint64_t child_hash = 0;
@@ -962,9 +963,9 @@ class LhmNamespace {
             out = DirectoryBlockStore::file_index_debug_info{};
             return false;
         }
-        uint32_t head = 0;
-        uint32_t tail = 0;
-        uint32_t file_index_id = 0;
+        uint64_t head = 0;
+        uint64_t tail = 0;
+        uint64_t file_index_id = 0;
         if (!directory_block_refs_for_root(root, head, tail)) {
             out = DirectoryBlockStore::file_index_debug_info{};
             return false;
@@ -1000,9 +1001,9 @@ class LhmNamespace {
     std::atomic<uint64_t> transient_inode_cursor_{1};
     inode_ref root_persistent_ref_ = make_inode_ref(0, 0);
     bool root_persistent_ref_valid_ = false;
-    uint32_t root_directory_head_block_id_ = 0;
-    uint32_t root_directory_tail_block_id_ = 0;
-    uint32_t root_directory_file_index_id_ = 0;
+    uint64_t root_directory_head_block_id_ = 0;
+    uint64_t root_directory_tail_block_id_ = 0;
+    uint64_t root_directory_file_index_id_ = 0;
 
     using single_component_key = MasstreeDirectoryIndex::single_component_key;
 
@@ -1086,10 +1087,10 @@ class LhmNamespace {
     }
 
     static uint64_t packed_inode_id(const inode_ref& ref) {
-        return (static_cast<uint64_t>(ref.block_id) << 32) | static_cast<uint64_t>(ref.offset);
+        return (static_cast<uint64_t>(ref.block_id) << 16) | static_cast<uint64_t>(ref.offset);
     }
 
-    static uint64_t packed_directory_inode_id(uint32_t head_block_id) {
+    static uint64_t packed_directory_inode_id(uint64_t head_block_id) {
         return (uint64_t{1} << 63) | static_cast<uint64_t>(head_block_id);
     }
 
@@ -1098,7 +1099,7 @@ class LhmNamespace {
     }
 
     static inode_disk make_embedded_directory_inode(uint64_t inode_id,
-                                                    uint32_t head_block_id) {
+                                                    uint64_t head_block_id) {
         inode_disk inode{};
         const uint64_t ts = now_ns();
         inode.inode_id = inode_id;
@@ -1136,8 +1137,8 @@ class LhmNamespace {
         if (ticket == 0) {
             ticket = transient_inode_cursor_.fetch_add(1, std::memory_order_relaxed);
         }
-        out_ref.block_id = static_cast<uint32_t>(ticket >> 32);
-        out_ref.offset = static_cast<uint32_t>(ticket & 0xffffffffULL);
+        out_ref.block_id = static_cast<uint64_t>(ticket >> 16);
+        out_ref.offset = static_cast<uint32_t>(ticket & 0xffffULL);
         return true;
     }
 
@@ -1197,7 +1198,7 @@ class LhmNamespace {
         root.inode_id = packed_inode_id(root_slot);
         root.parent_inode_id = 0;
         inode_ref root_dir_head = make_inode_ref(0, 0);
-        if (!persistent_store_.CreateDirectoryChain(root.inode_id, root_dir_head)) {
+        if (!persistent_store_.CreateDirectoryChain(root.inode_id, root_dir_head, true)) {
             return false;
         }
         root.primary_ref = root_dir_head;
@@ -1250,14 +1251,14 @@ class LhmNamespace {
         return resolve_directory_persistent_ref(parent_path(parsed.normalized_path), out, ti);
     }
 
-    bool allocate_directory_blocks(uint32_t& head_block_id, uint32_t& tail_block_id) {
+    bool allocate_directory_blocks(uint64_t& head_block_id, uint64_t& tail_block_id) {
         head_block_id = 0;
         tail_block_id = 0;
         if (!persistence_available_ || !persistent_store_.IsOpen()) {
             return false;
         }
         inode_ref head_ref = make_inode_ref(0, 0);
-        if (!persistent_store_.CreateDirectoryChain(0, head_ref)) {
+        if (!persistent_store_.CreateDirectoryChain(0, head_ref, true)) {
             return false;
         }
         head_block_id = head_ref.block_id;
@@ -1265,8 +1266,8 @@ class LhmNamespace {
         return true;
     }
 
-    bool directory_block_refs_for_root(node_type* root, uint32_t& head_block_id,
-                                       uint32_t& tail_block_id,
+    bool directory_block_refs_for_root(node_type* root, uint64_t& head_block_id,
+                                       uint64_t& tail_block_id,
                                        directory_meta** meta_out = nullptr) {
         if (meta_out != nullptr) {
             *meta_out = nullptr;
@@ -1291,8 +1292,8 @@ class LhmNamespace {
         return true;
     }
 
-    bool directory_block_refs_for_root(const node_type* root, uint32_t& head_block_id,
-                                       uint32_t& tail_block_id) const {
+    bool directory_block_refs_for_root(const node_type* root, uint64_t& head_block_id,
+                                       uint64_t& tail_block_id) const {
         if (root == directory_index_.root()) {
             head_block_id = root_directory_head_block_id_;
             tail_block_id = root_directory_tail_block_id_;
@@ -1310,7 +1311,7 @@ class LhmNamespace {
         return true;
     }
 
-    bool file_index_id_for_root(node_type* root, uint32_t& file_index_id) {
+    bool file_index_id_for_root(node_type* root, uint64_t& file_index_id) {
         file_index_id = 0;
         if (root == directory_index_.root()) {
             file_index_id = root_directory_file_index_id_;
@@ -1327,7 +1328,7 @@ class LhmNamespace {
         return true;
     }
 
-    bool file_index_id_for_root(const node_type* root, uint32_t& file_index_id) const {
+    bool file_index_id_for_root(const node_type* root, uint64_t& file_index_id) const {
         file_index_id = 0;
         if (root == directory_index_.root()) {
             file_index_id = root_directory_file_index_id_;
@@ -1347,9 +1348,9 @@ class LhmNamespace {
     bool insert_dentry_on_directory_root(node_type* directory_root,
                                          const DirectoryBlockStore::entry& item,
                                          bool overwrite_existing) {
-        uint32_t head = 0;
-        uint32_t tail = 0;
-        uint32_t file_index_id = 0;
+        uint64_t head = 0;
+        uint64_t tail = 0;
+        uint64_t file_index_id = 0;
         directory_meta* meta = nullptr;
         if (!directory_block_refs_for_root(directory_root, head, tail, &meta)) {
             return false;
@@ -1367,9 +1368,9 @@ class LhmNamespace {
 
     bool remove_dentry_from_directory_root(node_type* directory_root, uint64_t component_hash,
                                            const std::string& name) {
-        uint32_t head = 0;
-        uint32_t tail = 0;
-        uint32_t file_index_id = 0;
+        uint64_t head = 0;
+        uint64_t tail = 0;
+        uint64_t file_index_id = 0;
         directory_meta* meta = nullptr;
         if (!directory_block_refs_for_root(directory_root, head, tail, &meta)) {
             return false;
@@ -1440,8 +1441,8 @@ class LhmNamespace {
     bool create_directory_on_parent_root(const ParsedPath& parsed, node_type* parent_root,
                                          inode_ref ref, threadinfo& ti) {
         (void) ref;
-        uint32_t head_block_id = 0;
-        uint32_t tail_block_id = 0;
+        uint64_t head_block_id = 0;
+        uint64_t tail_block_id = 0;
         if (!allocate_directory_blocks(head_block_id, tail_block_id)) {
             return false;
         }
@@ -1482,7 +1483,8 @@ class LhmNamespace {
         inode_disk inode{};
         const uint64_t ts = now_ns();
         inode.inode_id = packed_inode_id(persistent_ref);
-        inode.parent_inode_id = packed_inode_id(parent_ref);
+        inode.parent_inode_id = (parent_ref.block_id == root_persistent_ref_.block_id && parent_ref.offset == root_persistent_ref_.offset)
+            ? root_inode_id() : packed_directory_inode_id(parent_ref.block_id);
         inode.primary_ref = persistent_ref;
         inode.aux_ref = make_inode_ref(0, 0);
         inode.ctime_ns = ts;
@@ -1550,7 +1552,8 @@ class LhmNamespace {
         if (!persistent_store_.ReadInode(moved_entry.ref, inode)) {
             return false;
         }
-        inode.parent_inode_id = packed_inode_id(parent_ref);
+        inode.parent_inode_id = (parent_ref.block_id == root_persistent_ref_.block_id && parent_ref.offset == root_persistent_ref_.offset)
+            ? root_inode_id() : packed_directory_inode_id(parent_ref.block_id);
         inode.mtime_ns = now_ns();
         inode.stable_version = inode.stable_version + 1;
         inode.generation = inode.generation + 1;
@@ -1593,9 +1596,9 @@ class LhmNamespace {
         }
 
         DirectoryBlockStore::entry dentry;
-        uint32_t head = 0;
-        uint32_t tail = 0;
-        uint32_t file_index_id = 0;
+        uint64_t head = 0;
+        uint64_t tail = 0;
+        uint64_t file_index_id = 0;
         if (!directory_block_refs_for_root(parent_root, head, tail)) {
             return false;
         }
@@ -1800,10 +1803,10 @@ class LhmNamespace {
         if (meta == nullptr) {
             return false;
         }
-        const uint32_t moved_head = meta->head_block_id;
-        const uint32_t moved_tail = meta->tail_block_id;
+        const uint64_t moved_head = meta->head_block_id;
+        const uint64_t moved_tail = meta->tail_block_id;
         const uint16_t moved_flags = meta->flags;
-        const uint32_t moved_file_index_id = meta->file_index_id;
+        const uint64_t moved_file_index_id = meta->file_index_id;
         if (old_parsed.components.back() != new_parsed.components.back()) {
             if (!directory_blocks_.write_directory_self_name(moved_head,
                                                              new_parsed.hashes.back(),
@@ -1891,10 +1894,10 @@ class LhmNamespace {
         if (meta == nullptr) {
             return false;
         }
-        const uint32_t moved_head = meta->head_block_id;
-        const uint32_t moved_tail = meta->tail_block_id;
+        const uint64_t moved_head = meta->head_block_id;
+        const uint64_t moved_tail = meta->tail_block_id;
         const uint16_t moved_flags = meta->flags;
-        const uint32_t moved_file_index_id = meta->file_index_id;
+        const uint64_t moved_file_index_id = meta->file_index_id;
         if (old_parsed.components.back() != new_parsed.components.back()) {
             if (!directory_blocks_.write_directory_self_name(moved_head,
                                                              new_parsed.hashes.back(),
@@ -1947,9 +1950,9 @@ class LhmNamespace {
         }
 
         DirectoryBlockStore::entry dentry;
-        uint32_t head = 0;
-        uint32_t tail = 0;
-        uint32_t file_index_id = 0;
+        uint64_t head = 0;
+        uint64_t tail = 0;
+        uint64_t file_index_id = 0;
         if (!directory_block_refs_for_root(parent_root, head, tail)) {
             return false;
         }
@@ -1996,9 +1999,9 @@ class LhmNamespace {
             return true;
         }
 
-        uint32_t head = 0;
-        uint32_t tail = 0;
-        uint32_t file_index_id = 0;
+        uint64_t head = 0;
+        uint64_t tail = 0;
+        uint64_t file_index_id = 0;
         if (!directory_block_refs_for_root(parent_root_const, head, tail)) {
             return false;
         }
@@ -2131,10 +2134,10 @@ class value_print<MasstreeLHM::route_value> {
   public:
     static void print(MasstreeLHM::route_value value, FILE* f, const char* prefix,
                       int indent, Str key, kvtimestamp_t, char* suffix) {
-        fprintf(f, "%s%*s%.*s = {kind=%s, ref=(block=%" PRIu32 ", offset=%" PRIu32 ")}%s\n",
+        fprintf(f, "%s%*s%.*s = {kind=%s, ref=(block=%" PRIu64 ", offset=%" PRIu64 ")}%s\n",
                 prefix, indent, "", key.len, key.s,
                 MasstreeLHM::entry_kind_name(value.kind),
-                value.ref.block_id, value.ref.offset, suffix);
+                uint64_t(value.ref.block_id), uint64_t(value.ref.offset), suffix);
     }
 };
 
@@ -2144,10 +2147,10 @@ class value_print<MasstreeLHM::namespace_entry> {
     static void print(MasstreeLHM::namespace_entry value, FILE* f, const char* prefix,
                       int indent, Str key, kvtimestamp_t, char* suffix) {
         std::string name = MasstreeLHM::entry_name(value);
-        fprintf(f, "%s%*s%.*s = {kind=%s, name=%s, ref=(block=%" PRIu32 ", offset=%" PRIu32 ")}%s\n",
+        fprintf(f, "%s%*s%.*s = {kind=%s, name=%s, ref=(block=%" PRIu64 ", offset=%" PRIu64 ")}%s\n",
                 prefix, indent, "", key.len, key.s,
                 MasstreeLHM::entry_kind_name(value.kind), name.c_str(),
-                value.ref.block_id, value.ref.offset, suffix);
+                uint64_t(value.ref.block_id), uint64_t(value.ref.offset), suffix);
     }
 };
 

@@ -4,6 +4,10 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <filesystem>
+#include <charconv>
+#include <stdexcept>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -14,6 +18,12 @@
 namespace MasstreeLHM {
 
 namespace {
+
+struct UndoWriteResult {
+    BatchUndo* undo;
+    bool ok=false;
+    ~UndoWriteResult() { if(undo && !ok) undo->Poison(); }
+};
 
 static constexpr uint64_t kMetadataMagic = 0x4C484D31u;  // "LHM1"
 static constexpr uint16_t kLayoutVersion = 2;
@@ -50,10 +60,11 @@ bool pread_all(int fd, void* buf, size_t bytes, off_t off) {
     return true;
 }
 
-bool pwrite_all(int fd, const void* buf, size_t bytes, off_t off) {
+bool pwrite_all(int fd, const void* buf, size_t bytes, off_t off, uint64_t* calls=nullptr) {
     const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
     size_t done = 0;
     while (done < bytes) {
+        if(calls) ++*calls;
         ssize_t n = ::pwrite(fd, p + done, bytes - done, off + done);
         if (n > 0) {
             done += static_cast<size_t>(n);
@@ -70,8 +81,9 @@ bool pwrite_all(int fd, const void* buf, size_t bytes, off_t off) {
     return true;
 }
 
-off_t block_offset(uint64_t block_id) {
-    return static_cast<off_t>(block_id) * static_cast<off_t>(kMetadataBlockBytes);
+std::string store_parent(const std::string& path) {
+    const auto parent=std::filesystem::path(path).parent_path();
+    return parent.empty()?std::string("."):parent.string();
 }
 
 uint64_t monotonic_raw_ns() {
@@ -98,6 +110,27 @@ std::size_t read_latency_bucket(uint64_t duration_ns) {
 
 thread_local PersistentStore::inode_chunk_cache PersistentStore::tls_inode_chunk_{};
 thread_local PersistentStore::l0_tls_handle PersistentStore::tls_l0_handle_{};
+
+struct PersistentStore::bulk_write_state {
+    static constexpr size_t kBufferBytes = 4 * 1024 * 1024;
+    struct buffer {
+        uint64_t first_page = 0;
+        std::vector<uint8_t> bytes;
+    };
+    BulkReservation reservation;
+    uint64_t received[3]{};
+    buffer buffers[3];
+    bool failed = false;
+};
+
+struct PersistentStore::segment_state {
+    int fd=-1, direct_flags=0;
+    uint64_t bytes=0;
+    mutable std::atomic<uint64_t> dirty_epoch{0}, synced_epoch{0};
+    uint64_t next_writeback=0, pending_offset=0, pending_bytes=0;
+    bool writeback_initialized=false, writeback_supported=true;
+    ~segment_state() { if(fd>=0) ::close(fd); }
+};
 
 PersistentStore::PersistentStore()
     : fd_(-1), next_alloc_block_(1), next_directory_block_(1), sequence_(1),
@@ -132,123 +165,372 @@ PersistentStore::~PersistentStore() {
 }
 
 bool PersistentStore::OpenOrCreate(const std::string& path, bool from_snapshot) {
-    Close();
-    ResetStats();
-    // 当前阶段统一采用 direct I/O，绕过页缓存。
-    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_DIRECT, 0644);
-    if (fd < 0) {
-        return false;
-    }
-
-    fd_ = fd;
-    path_ = path;
-    next_alloc_block_.store(1, std::memory_order_relaxed);
-    next_directory_block_.store(1, std::memory_order_relaxed);
-    sequence_ = 1;
-    next_inode_ticket_.store(0, std::memory_order_relaxed);
-    highest_initialized_inode_block_.store(0, std::memory_order_relaxed);
-    inode_alloc_epoch_.fetch_add(1, std::memory_order_relaxed);
-    l0_epoch_.fetch_add(1, std::memory_order_relaxed);
-    ResetAllL0Buffers();
-    ResetInodeCache();
-
-    struct stat st;
-    if (::fstat(fd_, &st) != 0) {
-        Close();
-        return false;
-    }
-
-    heads_fd_=::open((path+".heads").c_str(),O_RDWR|O_DIRECT|(st.st_size==0 ? O_CREAT|O_EXCL : 0),0600);
-    if(heads_fd_<0) { Close(); return false; }
-    next_head_=1; head_page_=UINT64_MAX; head_dirty_=false;
-    if (st.st_size == 0) {
-        if (!InitializeFreshStore()) {
-            Close();
-            return false;
+    Close(); ResetStats(); bulk_stats_={}; path_=path;
+    try {
+        int fd=::open(path.c_str(),O_RDWR|O_CREAT|O_DIRECT|O_CLOEXEC,0644);
+        if(fd<0 || !AddSegment(0,0,fd)) { Close(); return false; }
+        struct stat st{};
+        if(::fstat(fd_,&st) || !S_ISREG(st.st_mode) || st.st_size<0) { Close(); return false; }
+        const bool fresh=st.st_size==0;
+        if(fresh) {
+            segment_bytes_=kDefaultSegmentBytes;
+#ifdef ZB_LHM_TESTING
+            if(const char* value=std::getenv("ZB_LHM_TEST_SEGMENT_BYTES")) {
+                uint64_t requested=0;
+                const auto end=value+std::strlen(value);
+                const auto parsed=std::from_chars(value,end,requested);
+                if(parsed.ec!=std::errc{} || parsed.ptr!=end || !ValidSegmentBytes(requested)) {
+                    Close(); return false;
+                }
+                segment_bytes_=requested;
+            }
+#endif
+            // A fresh database must not adopt any leftover data segment.
+            const std::filesystem::path anchor(path);
+            const auto parent=anchor.has_parent_path()?anchor.parent_path():std::filesystem::path(".");
+            for(const auto& item:std::filesystem::directory_iterator(parent)) {
+                const auto name=item.path().filename().string();
+                for(unsigned kind=0;kind<3;++kind) {
+                    const auto prefix=std::filesystem::path(SegmentBasePath(path,kind)).filename().string()+".part";
+                    if(name.compare(0,prefix.size(),prefix)==0) { Close(); return false; }
+                }
+            }
+            for(unsigned kind=0;kind<3;++kind) {
+                if(kind) {
+                    int side=::open(SegmentPath(path,kind,0).c_str(),O_RDWR|O_CREAT|O_EXCL|O_DIRECT|O_CLOEXEC|O_NOFOLLOW,0600);
+                    if(side<0 || !AddSegment(kind,0,side)) { Close(); return false; }
+                    MarkFileDirty(kind);
+                }
+            }
+            segment_directory_dirty_.store(true);
+            if(!InitializeFreshStore()) { Close(); return false; }
+            return true;
         }
-        return true;
-    }
-
-    if (from_snapshot) {
+        // Read page zero before interpreting any later address. Legacy stores
+        // are rejected without creating or opening their other files.
         superblock_payload sb{};
-        if (!ReadSuperblock(sb) || sb.metadata_block_bytes != kMetadataBlockBytes) { Close(); return false; }
+        if(!ReadSuperblock(sb) || sb.metadata_block_bytes!=kMetadataBlockBytes ||
+           !(sb.flags & kSuperblockFlagSplitFiles) || !(sb.flags & kSuperblockFlagSegmentedFiles) ||
+           sb.segment_layout_version!=1 || !ValidSegmentBytes(sb.segment_bytes)) { Close(); return false; }
+        segment_bytes_=sb.segment_bytes;
+        const auto layout=ScanSegmentLayout(path,segment_bytes_);
+        for(const auto& item:layout.segments) {
+            if(item.kind==0 && item.index==0) continue;
+            int side=::open(SegmentPath(path,unsigned(item.kind),item.index).c_str(),O_RDWR|O_DIRECT|O_CLOEXEC);
+            if(side<0 || !AddSegment(unsigned(item.kind),item.index,side)) { Close(); return false; }
+        }
+        const auto opened=CurrentSegmentLayout();
+        ValidateSegmentFiles(path,opened);
+        if(!(opened==layout)) { Close(); return false; }
+        if(from_snapshot) return true;
+        if(!RecomputeNextAllocBlock()) { Close(); return false; }
         return true;
-    }
-    if (!RecomputeNextAllocBlock()) {
-        Close();
-        return false;
-    }
-    return true;
+    } catch(...) { Close(); return false; }
 }
 
 void PersistentStore::SaveAllocation(SnapshotWriter& out) const {
+    if (bulk_write_) throw std::runtime_error("cannot snapshot unfinished template writes");
+    const auto layout=CurrentSegmentLayout();
+    ValidateSegmentFiles(path_,layout);
+    WriteSegmentLayout(out,layout);
     out.u64(next_alloc_block_.load()); out.u64(next_directory_block_.load());
     out.u64(sequence_); out.u64(next_inode_ticket_.load());
     out.u64(highest_initialized_inode_block_.load()); out.u64(next_head_);
-    struct stat st{}; if(::fstat(heads_fd_,&st)) throw std::runtime_error("head store stat failed");
-    out.u64(st.st_dev); out.u64(st.st_ino); out.u64(st.st_size);
 }
 void PersistentStore::LoadAllocation(SnapshotReader& in) {
-    auto blocks=in.u64(), dirs=in.u64(); auto seq=in.u64(), tickets=in.u64(); auto high=in.u64();
+    const auto layout=ReadSegmentLayout(in);
+    if(layout.segment_bytes!=segment_bytes_) throw std::runtime_error("snapshot segment size differs from superblock");
+    ValidateSegmentFiles(path_,layout);
+    const auto actual=CurrentSegmentLayout();
+    if(!(layout==actual)) throw std::runtime_error("snapshot segment inventory differs from store");
+    auto blocks=in.u64(), dirs=in.u64(); auto seq=in.u64(), tickets=in.u64(), high=in.u64(), heads=in.u64();
     if (!blocks || !dirs || !seq || !tickets || !high || dirs>(kMaxLogicalBlock+1) ||
-        high>kMaxLogicalBlock || tickets>uint64_t(kMaxLogicalBlock)*kInodesPerBlock)
+        high>kMaxLogicalBlock || tickets>uint64_t(kMaxLogicalBlock)*kInodesPerBlock ||
+        !heads || heads>kCompactHeadTag || dirs-1>layout.logical_bytes[2]/kMetadataBlockBytes ||
+        layout.logical_bytes[0]<kMetadataBlockBytes || blocks!=layout.logical_bytes[0]/kMetadataBlockBytes || high>=blocks ||
+        (heads-1+30)/31!=layout.logical_bytes[1]/kMetadataBlockBytes)
         throw std::runtime_error("invalid snapshot allocation state");
-    auto heads=in.u64(); auto dev=in.u64(),ino=in.u64(),bytes=in.u64(); struct stat st{};
-    if(!heads || heads>kCompactHeadTag || ::fstat(heads_fd_,&st) || dev!=uint64_t(st.st_dev) ||
-       ino!=uint64_t(st.st_ino) || bytes!=uint64_t(st.st_size)) throw std::runtime_error("head store/snapshot mismatch");
     next_head_=heads;
     next_alloc_block_.store(blocks); next_directory_block_.store(dirs); sequence_=seq;
     next_inode_ticket_.store(tickets); highest_initialized_inode_block_.store(high);
+    clean_snapshot_loaded_.store(true, std::memory_order_relaxed);
 }
 
 void PersistentStore::Close() {
-    if(heads_fd_>=0) { FlushHeadPage(); ::fsync(heads_fd_); ::close(heads_fd_); heads_fd_=-1; }
-    head_page_=UINT64_MAX; head_dirty_=false; next_head_=1;
-    if (fd_ >= 0) {
-        if (l0_cache_enabled_.load(std::memory_order_relaxed)) {
-            (void) FlushAllL0Buffers();
-        }
-        (void) FlushInodeCache();
-        if (::fsync(fd_) == 0) {
-            stats_fsync_ops_.fetch_add(1, std::memory_order_relaxed);
-        }
-        ::close(fd_);
-        fd_ = -1;
+    // Incomplete buffers contain only uncommitted new pages. Recovery owns the
+    // journal and newly published segments after all cached state is discarded.
+    if(bulk_write_) {
+        bulk_write_.reset(); ResetAllL0Buffers(); ResetInodeCache(); head_dirty_=false;
     }
-    l0_epoch_.fetch_add(1, std::memory_order_relaxed);
-    ResetAllL0Buffers();
-    ResetInodeCache();
-    path_.clear();
-    next_alloc_block_.store(1, std::memory_order_relaxed);
-    next_directory_block_.store(1, std::memory_order_relaxed);
-    sequence_ = 1;
-    next_inode_ticket_.store(0, std::memory_order_relaxed);
-    highest_initialized_inode_block_.store(0, std::memory_order_relaxed);
-    inode_alloc_epoch_.fetch_add(1, std::memory_order_relaxed);
+    clean_snapshot_loaded_.store(false);
+    if(fd_>=0) {
+        if(l0_cache_enabled_.load()) (void)FlushAllL0Buffers();
+        (void)FlushInodeCache();
+    }
+    if(heads_fd_>=0) (void)FlushHeadPage();
+    for(unsigned kind=0;kind<3;++kind) {
+        if(!segments_[kind].empty()) (void)SyncFileIfDirty(kind);
+        segments_[kind].clear(); logical_file_bytes_[kind].store(0);
+    }
+    if(segment_directory_dirty_.exchange(false) && !path_.empty()) {
+        int parent=::open(store_parent(path_).c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+        if(parent>=0) { (void)::fsync(parent); ::close(parent); }
+    }
+    fd_=heads_fd_=buckets_fd_=-1; buffered_mode_=false; segment_bytes_=kDefaultSegmentBytes;
+    head_page_=UINT64_MAX; head_dirty_=false; next_head_=1;
+    batch_undo_.reset();
+    l0_epoch_.fetch_add(1); ResetAllL0Buffers(); ResetInodeCache(); path_.clear();
+    next_alloc_block_.store(1); next_directory_block_.store(1); sequence_=1;
+    next_inode_ticket_.store(0); highest_initialized_inode_block_.store(0);
+    inode_alloc_epoch_.fetch_add(1);
 }
 
 bool PersistentStore::IsOpen() const {
     return fd_ >= 0;
 }
 
-bool PersistentStore::Sync() {
-    if(heads_fd_<0 || !FlushHeadPage() || ::fsync(heads_fd_)) return false;
-    if (!IsOpen()) {
-        return false;
-    }
-    if (l0_cache_enabled_.load(std::memory_order_relaxed)) {
-        if (!FlushAllL0Buffers()) {
-            return false;
+void PersistentStore::BeginBatchUndo(bool service) {
+    if (!IsOpen() || batch_undo_ || head_dirty_)
+        throw std::runtime_error("batch undo requires a newly reopened clean store");
+    batch_undo_ = BatchUndo::Begin(path_, highest_initialized_inode_block_.load(),
+                                 next_directory_block_.load(),service);
+}
+
+PersistentStore::BulkReservation PersistentStore::ReserveTemplateBlocks(
+    uint64_t inode_pages, uint64_t bucket_pages, uint64_t head_count) {
+    if (!IsOpen() || heads_fd_ < 0 || buckets_fd_ < 0 || !batch_undo_ || bulk_write_ ||
+        !clean_snapshot_loaded_.load(std::memory_order_relaxed))
+        throw std::runtime_error("template reservation requires a clean reopened batch store");
+    std::lock_guard<std::mutex> guard(inode_alloc_mu_);
+    const uint64_t high = highest_initialized_inode_block_.load();
+    const uint64_t tickets = next_inode_ticket_.load();
+    const uint64_t bucket_first = next_directory_block_.load();
+    if (high > kMaxLogicalBlock || tickets > kMaxLogicalBlock * kInodesPerBlock ||
+        !bucket_first || bucket_first > kMaxLogicalBlock + 1 ||
+        !next_head_ || next_head_ > kCompactHeadTag || !sequence_)
+        throw std::runtime_error("invalid template allocation baseline");
+
+    BulkReservation r;
+    r.inode_first = std::max(high, (tickets + kInodesPerBlock - 1) / kInodesPerBlock) + 1;
+    r.bucket_first = bucket_first;
+    r.head_first = ((next_head_ - 1 + 30) / 31) * 31 + 1;
+    if (inode_pages > kMaxLogicalBlock - (r.inode_first - 1) ||
+        bucket_pages > kMaxLogicalBlock - (r.bucket_first - 1) ||
+        !head_count || r.head_first >= kCompactHeadTag ||
+        head_count > kCompactHeadTag - r.head_first)
+        throw std::runtime_error("template allocation exceeds reference range");
+    r.inode_pages = inode_pages;
+    r.bucket_pages = bucket_pages;
+    r.head_count = head_count;
+    r.head_pages = (head_count + 30) / 31;
+    r.sequence_base = sequence_;
+    // Each count is already bounded by the 47-bit reference representation.
+    const uint64_t sequence_count = inode_pages + bucket_pages + head_count;
+    if (sequence_count > std::numeric_limits<uint64_t>::max() - sequence_)
+        throw std::runtime_error("template sequence range exhausted");
+
+    const uint64_t main_bytes=LogicalFileBytes(0), head_bytes=LogicalFileBytes(1), bucket_bytes=LogicalFileBytes(2);
+    if(main_bytes<kMetadataBlockBytes || main_bytes%kMetadataBlockBytes || head_bytes%kMetadataBlockBytes || bucket_bytes%kMetadataBlockBytes)
+        throw std::runtime_error("invalid template store file lengths");
+    const uint64_t head_start_page = (r.head_first - 1) / 31;
+    if(head_start_page!=head_bytes/kMetadataBlockBytes)
+        throw std::runtime_error("compact head cursor/file length mismatch");
+    uint64_t main_pages=main_bytes/kMetadataBlockBytes;
+    if(inode_pages) main_pages=std::max(main_pages,InodePhysicalBlockId(r.inode_first+inode_pages-1)+1);
+    const uint64_t bucket_pages_total=r.bucket_first-1+bucket_pages;
+    if(r.bucket_first-1!=bucket_bytes/kMetadataBlockBytes)
+        throw std::runtime_error("bucket cursor/file length mismatch");
+    const uint64_t head_pages_total=head_start_page+r.head_pages;
+    if(main_pages>UINT64_MAX/kMetadataBlockBytes || head_pages_total>UINT64_MAX/kMetadataBlockBytes || bucket_pages_total>UINT64_MAX/kMetadataBlockBytes)
+        throw std::runtime_error("template logical allocation overflow");
+
+    // Flush ordinary caches before changing the open-file description's I/O
+    // mode. The caller holds the offline store lock throughout this operation.
+    if (!Sync()) throw std::runtime_error("sync before template reservation failed");
+    auto state = std::make_unique<bulk_write_state>();
+    state->reservation = r;
+    for (auto& buffer : state->buffers) buffer.bytes.reserve(bulk_write_state::kBufferBytes);
+    bulk_stats_={};
+    bulk_write_ = std::move(state);
+    clean_snapshot_loaded_.store(false, std::memory_order_relaxed);
+    try {
+        if(!SetBufferedMode(true)) throw std::runtime_error("enable buffered template I/O failed");
+        if(!EnsureFileBlockCount(0,main_pages) || !EnsureFileBlockCount(1,head_pages_total) ||
+           !EnsureFileBlockCount(2,bucket_pages_total))
+            throw std::runtime_error("extend template stores failed");
+        next_alloc_block_.store(std::max(next_alloc_block_.load(), main_pages));
+        next_directory_block_.store(r.bucket_first + bucket_pages);
+        if (inode_pages) {
+            const uint64_t last_inode = r.inode_first + inode_pages - 1;
+            highest_initialized_inode_block_.store(last_inode);
+            next_inode_ticket_.store(last_inode * kInodesPerBlock);
         }
+        next_head_ = r.head_first + head_count;
+        sequence_ += sequence_count;
+        inode_alloc_epoch_.fetch_add(1, std::memory_order_relaxed);
+        l0_epoch_.fetch_add(1, std::memory_order_relaxed);
+        ResetAllL0Buffers();
+        ResetInodeCache();
+        head_page_ = UINT64_MAX;
+        head_dirty_ = false;
+        stats_allocate_block_ops_.fetch_add(inode_pages + bucket_pages + r.head_pages,
+                                             std::memory_order_relaxed);
+        BatchFault("compiled_reserved");
+        return r;
+    } catch (...) {
+        bulk_write_->failed = true;
+        throw;
     }
-    if (!FlushInodeCache()) {
-        return false;
+}
+
+void PersistentStore::FlushTemplateBuffer(unsigned file_kind) {
+    auto& buffer=bulk_write_->buffers[file_kind];
+    if(buffer.bytes.empty()) return;
+    const uint64_t pages=buffer.bytes.size()/kMetadataBlockBytes;
+    uint64_t done=0;
+    while(done<pages) {
+        const uint64_t page=buffer.first_page+done, index=SegmentIndex(page);
+        const uint64_t local_page=page%(segment_bytes_/kMetadataBlockBytes);
+        const uint64_t count=std::min(pages-done,segment_bytes_/kMetadataBlockBytes-local_page);
+        const int fd=FileDescriptor(file_kind,index);
+        if(fd<0) throw std::runtime_error("template segment is missing");
+        for(uint64_t i=0;i<count;++i)
+            if(!batch_undo_->BeforeWrite(file_kind,fd,page+i))
+                throw std::runtime_error("template undo guard failed: "+batch_undo_->error());
+        const uint64_t bytes=count*kMetadataBlockBytes;
+        const uint64_t start=monotonic_raw_ns();
+        const bool ok=pwrite_all(fd,buffer.bytes.data()+done*kMetadataBlockBytes,size_t(bytes),SegmentOffset(page),&bulk_stats_.write_calls);
+        bulk_stats_.write_ns+=monotonic_raw_ns()-start;
+        MarkFileDirty(file_kind,index);
+        if(!ok) throw std::runtime_error("buffered template segment write failed");
+        bulk_stats_.write_bytes+=bytes;
+        auto* segment=Segment(file_kind,index);
+        if(!segment->writeback_initialized) {
+            segment->writeback_initialized=true; segment->next_writeback=uint64_t(SegmentOffset(page));
+        }
+        AdvanceTemplateWriteback(file_kind,index,uint64_t(SegmentOffset(page))+bytes);
+        done+=count;
     }
-    stats_sync_ops_.fetch_add(1, std::memory_order_relaxed);
-    if (::fsync(fd_) != 0) {
-        return false;
+    stats_block_write_ops_.fetch_add(pages,std::memory_order_relaxed);
+    stats_bytes_written_.fetch_add(buffer.bytes.size(),std::memory_order_relaxed);
+    buffer.bytes.clear(); BatchFault("compiled_write");
+}
+
+void PersistentStore::WriteTemplateBlock(unsigned kind, uint64_t page_index,
+                                          const metadata_block_bytes& data) {
+    if (!bulk_write_ || bulk_write_->failed)
+        throw std::runtime_error("template writer is not active");
+    try {
+        const auto& r = bulk_write_->reservation;
+        const uint64_t limits[] = {r.inode_pages, r.bucket_pages, r.head_pages};
+        if (kind > 2 || page_index >= limits[kind] || page_index != bulk_write_->received[kind])
+            throw std::runtime_error("template page is outside its reserved sequence");
+        auto valid_header = [&](const metadata_common_block_header& common,
+                                metadata_block_type type, uint64_t logical) {
+            return common.magic == kMetadataMagic && common.layout_version == kLayoutVersion &&
+                common.block_type == static_cast<uint16_t>(type) && common.block_id == logical &&
+                common.payload_bytes <= kMetadataBlockBytes - kCommonBlockHeaderBytes &&
+                common.sequence >= r.sequence_base && common.sequence < sequence_;
+        };
+        if (kind < 2) {
+            metadata_common_block_header common{};
+            std::memcpy(&common, data.data(), sizeof(common));
+            const uint64_t logical = (kind ? r.bucket_first : r.inode_first) + page_index;
+            const auto type = kind ? metadata_block_type::directory_block : metadata_block_type::inode_block;
+            if (!valid_header(common, type, logical))
+                throw std::runtime_error("invalid relocated template page header");
+            if (!kind) {
+                inode_block_header header{};
+                std::memcpy(&header, data.data() + kCommonBlockHeaderBytes, sizeof(header));
+                if (header.slot_count != kInodesPerBlock || header.used_count > kInodesPerBlock)
+                    throw std::runtime_error("invalid template inode page occupancy");
+            } else {
+                directory_block_header header{};
+                std::memcpy(&header, data.data() + kCommonBlockHeaderBytes, sizeof(header));
+                if (header.used_bytes > kDirectoryBlockPayloadBytes)
+                    throw std::runtime_error("invalid template bucket payload length");
+            }
+        } else {
+            const uint64_t records = std::min<uint64_t>(31, r.head_count - page_index * 31);
+            for (uint64_t slot = 0; slot < records; ++slot) {
+                metadata_common_block_header common{};
+                directory_block_header header{};
+                const uint8_t* record = data.data() + 512 + slot * 512;
+                std::memcpy(&common, record, sizeof(common));
+                std::memcpy(&header, record + kCommonBlockHeaderBytes, sizeof(header));
+                const uint64_t logical = kCompactHeadTag | (r.head_first + page_index * 31 + slot);
+                if (!valid_header(common, metadata_block_type::directory_block, logical) ||
+                    header.entry_count || header.used_bytes > 128)
+                    throw std::runtime_error("invalid relocated compact-head record");
+            }
+        }
+        const unsigned file_kind = kind == 0 ? 0 : kind == 1 ? 2 : 1;
+        const uint64_t physical = kind == 0 ? InodePhysicalBlockId(r.inode_first + page_index) :
+            kind == 1 ? DirectoryPhysicalBlockId(r.bucket_first + page_index) :
+            (r.head_first - 1) / 31 + page_index;
+        auto& buffer = bulk_write_->buffers[file_kind];
+        // Each native page kind now has an independent contiguous file; the
+        // three buffers allow callers to interleave reads without small writes.
+        if (!buffer.bytes.empty() &&
+            (physical != buffer.first_page + buffer.bytes.size() / kMetadataBlockBytes ||
+             buffer.bytes.size() == bulk_write_state::kBufferBytes))
+            FlushTemplateBuffer(file_kind);
+        if (buffer.bytes.empty()) buffer.first_page = physical;
+        buffer.bytes.insert(buffer.bytes.end(), data.begin(), data.end());
+        ++bulk_write_->received[kind];
+    } catch (...) {
+        bulk_write_->failed = true;
+        throw;
     }
-    stats_fsync_ops_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PersistentStore::FinishTemplateWrites() {
+    if (!bulk_write_ || bulk_write_->failed)
+        throw std::runtime_error("template writer is not active");
+    try {
+        const auto& r = bulk_write_->reservation;
+        if (bulk_write_->received[0] != r.inode_pages ||
+            bulk_write_->received[1] != r.bucket_pages ||
+            bulk_write_->received[2] != r.head_pages)
+            throw std::runtime_error("template has unwritten reserved pages");
+        for(unsigned kind=0;kind<3;++kind) FlushTemplateBuffer(kind);
+        for(unsigned kind=0;kind<3;++kind) {
+            const uint64_t start=monotonic_raw_ns();
+            const bool ok=SyncFileIfDirty(kind);
+            const uint64_t elapsed=monotonic_raw_ns()-start;
+            if(kind==0) bulk_stats_.main_sync_ns+=elapsed;
+            else if(kind==1) bulk_stats_.heads_sync_ns+=elapsed;
+            else bulk_stats_.buckets_sync_ns+=elapsed;
+            if(!ok) throw std::runtime_error("sync buffered template writes failed");
+        }
+        if(!SetBufferedMode(false)) throw std::runtime_error("restore direct template I/O failed");
+        // New pages bypassed the ordinary caches. A subsequent normal create
+        // must reload its head page and allocate a fresh TLS inode range.
+        ResetAllL0Buffers();
+        ResetInodeCache();
+        head_page_ = UINT64_MAX;
+        head_dirty_ = false;
+        BatchFault("compiled_synced");
+        bulk_write_.reset();
+    } catch (...) {
+        bulk_write_->failed = true;
+        throw;
+    }
+}
+
+bool PersistentStore::Sync() {
+    if(bulk_write_ || !IsOpen() || heads_fd_<0 || buckets_fd_<0) return false;
+    if(l0_cache_enabled_.load() && !FlushAllL0Buffers()) return false;
+    if(!FlushInodeCache() || !FlushHeadPage()) return false;
+    stats_sync_ops_.fetch_add(1);
+    for(unsigned kind=0;kind<3;++kind) if(!SyncFileIfDirty(kind)) return false;
+    if(segment_directory_dirty_.load()) {
+        int parent=::open(store_parent(path_).c_str(),O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+        if(parent<0) return false;
+        int rc; do { rc=::fsync(parent); } while(rc && errno==EINTR);
+        ::close(parent); if(rc) return false;
+        segment_directory_dirty_.store(false);
+    }
     return true;
 }
 
@@ -275,7 +557,12 @@ bool PersistentStore::l0_cache_enabled() const {
 }
 
 bool PersistentStore::ReadBlock(uint64_t block_id, metadata_block_bytes& out) const {
-    if (!IsOpen()) {
+    return ReadFileBlock(0,block_id,out);
+}
+
+bool PersistentStore::ReadFileBlock(unsigned kind,uint64_t block_id,metadata_block_bytes& out) const {
+    const int data_fd=FileDescriptor(kind,SegmentIndex(block_id));
+    if (data_fd<0 || block_id>=LogicalFileBytes(kind)/kMetadataBlockBytes) {
         return false;
     }
     const uint64_t total_start_ns = monotonic_raw_ns();
@@ -284,7 +571,7 @@ bool PersistentStore::ReadBlock(uint64_t block_id, metadata_block_bytes& out) co
         return false;
     }
     const uint64_t alloc_end_ns = monotonic_raw_ns();
-    bool ok = pread_all(fd_, aligned, kMetadataBlockBytes, block_offset(block_id));
+    bool ok = pread_all(data_fd, aligned, kMetadataBlockBytes, SegmentOffset(block_id));
     const uint64_t pread_end_ns = monotonic_raw_ns();
     if (ok) {
         std::memcpy(out.data(), aligned, kMetadataBlockBytes);
@@ -324,23 +611,34 @@ bool PersistentStore::ReadBlock(uint64_t block_id, metadata_block_bytes& out) co
 }
 
 bool PersistentStore::WriteBlock(uint64_t block_id, const metadata_block_bytes& data) {
-    if (!IsOpen()) {
+    return WriteFileBlock(0,block_id,data);
+}
+
+bool PersistentStore::WriteFileBlock(unsigned kind,uint64_t block_id,const metadata_block_bytes& data) {
+    UndoWriteResult result{batch_undo_.get()};
+    if(!IsOpen() || kind>2 || bulk_write_) {
         return false;
     }
-    if (!EnsureBlockCount(block_id + 1)) {
+    clean_snapshot_loaded_.store(false, std::memory_order_relaxed);
+    if (!EnsureFileBlockCount(kind,block_id + 1)) {
         return false;
     }
+    const uint64_t index=SegmentIndex(block_id);
+    const int data_fd=FileDescriptor(kind,index);
+    if(data_fd<0 || (batch_undo_ && !batch_undo_->BeforeWrite(kind,data_fd,block_id))) return false;
     void* aligned = nullptr;
     if (!alloc_aligned_block(&aligned)) {
         return false;
     }
     std::memcpy(aligned, data.data(), kMetadataBlockBytes);
-    bool ok = pwrite_all(fd_, aligned, kMetadataBlockBytes, block_offset(block_id));
+    bool ok = pwrite_all(data_fd, aligned, kMetadataBlockBytes, SegmentOffset(block_id));
+    MarkFileDirty(kind,index);
     ::free(aligned);
+    if (ok && batch_undo_) BatchFault("data_write");
     if (ok) {
         stats_block_write_ops_.fetch_add(1, std::memory_order_relaxed);
         stats_bytes_written_.fetch_add(kMetadataBlockBytes, std::memory_order_relaxed);
-        uint64_t need = block_id + 1;
+        uint64_t need = kind==0 ? block_id+1 : 0;
         uint64_t cur = next_alloc_block_.load(std::memory_order_relaxed);
         while (cur < need
                && !next_alloc_block_.compare_exchange_weak(cur, need,
@@ -348,13 +646,14 @@ bool PersistentStore::WriteBlock(uint64_t block_id, const metadata_block_bytes& 
                                                            std::memory_order_relaxed)) {
         }
     }
-    return ok;
+    result.ok=ok; return ok;
 }
 
 bool PersistentStore::AllocateBlock(uint64_t& out_block_id) {
-    if (!IsOpen()) {
+    if (!IsOpen() || bulk_write_) {
         return false;
     }
+    clean_snapshot_loaded_.store(false, std::memory_order_relaxed);
     std::lock_guard<std::mutex> guard(inode_alloc_mu_);
     return AllocateBlockLocked(out_block_id);
 }
@@ -376,6 +675,7 @@ bool PersistentStore::ReadSuperblock(superblock_payload& out) const {
 }
 
 bool PersistentStore::WriteSuperblock(const superblock_payload& payload) {
+    if (bulk_write_) return false;
     metadata_block_bytes block{};
     auto* common = reinterpret_cast<metadata_common_block_header*>(block.data());
     BuildCommonHeader(*common, metadata_block_type::superblock, 0,
@@ -402,6 +702,7 @@ bool PersistentStore::ReadCheckpoint(uint64_t block_id, checkpoint_payload& out)
 }
 
 bool PersistentStore::WriteCheckpoint(uint64_t block_id, const checkpoint_payload& payload) {
+    if (bulk_write_) return false;
     metadata_block_bytes block{};
     auto* common = reinterpret_cast<metadata_common_block_header*>(block.data());
     BuildCommonHeader(*common, metadata_block_type::checkpoint, block_id,
@@ -429,6 +730,7 @@ bool PersistentStore::ReadAllocatorState(uint64_t block_id, allocator_state_payl
 
 bool PersistentStore::WriteAllocatorState(uint64_t block_id,
                                           const allocator_state_payload& payload) {
+    if (bulk_write_) return false;
     metadata_block_bytes block{};
     auto* common = reinterpret_cast<metadata_common_block_header*>(block.data());
     BuildCommonHeader(*common, metadata_block_type::allocator_state, block_id,
@@ -471,9 +773,10 @@ bool PersistentStore::ReadInodeBlockForRefDirect(const inode_ref& ref,
 }
 
 bool PersistentStore::WriteInodeBlock(uint64_t block_id, const inode_block_image& image) {
-    if (!IsOpen()) {
+    if (!IsOpen() || bulk_write_) {
         return false;
     }
+    clean_snapshot_loaded_.store(false, std::memory_order_relaxed);
 
     const std::size_t shard_idx = InodeCacheShardIndex(block_id);
     const std::size_t slot_idx = InodeCacheSlotIndex(block_id);
@@ -495,9 +798,10 @@ bool PersistentStore::WriteInodeBlock(uint64_t block_id, const inode_block_image
 }
 
 bool PersistentStore::AllocateInodeSlot(inode_ref& out_ref) {
-    if (!IsOpen()) {
+    if (!IsOpen() || bulk_write_) {
         return false;
     }
+    clean_snapshot_loaded_.store(false, std::memory_order_relaxed);
     uint64_t begin = 0;
     uint64_t end = 0;
     if (!AcquireInodeTicketRange(begin, end)) {
@@ -552,9 +856,10 @@ bool PersistentStore::WriteInode(const inode_ref& ref, const inode_disk& inode) 
     if (ref.offset >= kInodesPerBlock) {
         return false;
     }
-    if (!IsOpen()) {
+    if (!IsOpen() || bulk_write_) {
         return false;
     }
+    clean_snapshot_loaded_.store(false, std::memory_order_relaxed);
 
     if (l0_cache_enabled_.load(std::memory_order_relaxed)) {
         l0_thread_buffer* l0 = GetOrCreateL0ThreadBuffer();
@@ -631,22 +936,31 @@ bool PersistentStore::WriteInode(const inode_ref& ref, const inode_disk& inode) 
 
 bool PersistentStore::FlushHeadPage() const {
     if(!head_dirty_) return true;
+    UndoWriteResult result{batch_undo_.get()};
+    if(!EnsureFileBlockCount(1,head_page_+1)) return false;
+    const uint64_t index=SegmentIndex(head_page_);
+    const int fd=FileDescriptor(1,index);
+    if(fd<0 || (batch_undo_ && !batch_undo_->BeforeWrite(1,fd,head_page_))) return false;
     void* aligned=nullptr; if(!alloc_aligned_block(&aligned)) return false;
     std::memcpy(aligned,head_image_.data(),kMetadataBlockBytes);
-    bool ok=pwrite_all(heads_fd_,aligned,kMetadataBlockBytes,block_offset(head_page_));
-    std::free(aligned); if(ok) head_dirty_=false; return ok;
+    bool ok=pwrite_all(fd,aligned,kMetadataBlockBytes,SegmentOffset(head_page_));
+    MarkFileDirty(1,index);
+    if(ok && batch_undo_) BatchFault("data_write");
+    std::free(aligned); if(ok) head_dirty_=false; result.ok=ok; return ok;
 }
 bool PersistentStore::LoadHeadPage(uint64_t page,bool create) const {
     if(page==head_page_) return true;
     if(!FlushHeadPage()) return false;
-    struct stat st{}; if(::fstat(heads_fd_,&st)) return false;
+    const uint64_t total=LogicalFileBytes(1)/kMetadataBlockBytes;
     metadata_block_bytes next{};
-    if(block_offset(page)<st.st_size) {
+    if(page<total) {
+        const int fd=FileDescriptor(1,SegmentIndex(page));
+        if(fd<0) return false;
         void* aligned=nullptr; if(!alloc_aligned_block(&aligned)) return false;
-        bool ok=pread_all(heads_fd_,aligned,kMetadataBlockBytes,block_offset(page));
+        bool ok=pread_all(fd,aligned,kMetadataBlockBytes,SegmentOffset(page));
         if(ok) std::memcpy(next.data(),aligned,kMetadataBlockBytes);
         std::free(aligned); if(!ok) return false;
-    } else if(!create || block_offset(page)!=st.st_size) return false;
+    } else if(!create || page!=total) return false;
     head_image_=next; head_page_=page; head_dirty_=false; return true;
 }
 
@@ -658,7 +972,7 @@ bool PersistentStore::ReadDirectoryBlock(uint64_t block_id, directory_block_imag
         return out.common.magic==kMetadataMagic && out.common.layout_version==kLayoutVersion && out.common.block_id==block_id;
     }
     metadata_block_bytes block;
-    if (!ReadBlock(DirectoryPhysicalBlockId(block_id), block)) {
+    if (!block_id || !ReadFileBlock(2,DirectoryPhysicalBlockId(block_id), block)) {
         return false;
     }
     std::memcpy(&out, block.data(), sizeof(out));
@@ -671,6 +985,8 @@ bool PersistentStore::ReadDirectoryBlock(uint64_t block_id, directory_block_imag
 
 bool PersistentStore::WriteDirectoryBlock(uint64_t block_id,
                                           const directory_block_image& image) {
+    if (bulk_write_) return false;
+    clean_snapshot_loaded_.store(false, std::memory_order_relaxed);
     if(block_id & kCompactHeadTag) {
         const auto n=block_id & ~kCompactHeadTag;
         if(!n || n>=next_head_ || image.header.used_bytes>128 || image.header.entry_count ||
@@ -679,7 +995,7 @@ bool PersistentStore::WriteDirectoryBlock(uint64_t block_id,
     }
     metadata_block_bytes block{};
     std::memcpy(block.data(), &image, sizeof(image));
-    return WriteBlock(DirectoryPhysicalBlockId(block_id), block);
+    return block_id && WriteFileBlock(2,DirectoryPhysicalBlockId(block_id), block);
 }
 
 bool PersistentStore::ReadDirectoryInode(uint64_t head_block_id, inode_disk& out) const {
@@ -696,6 +1012,7 @@ bool PersistentStore::ReadDirectoryInode(uint64_t head_block_id, inode_disk& out
 
 bool PersistentStore::WriteDirectoryInode(uint64_t head_block_id,
                                           const inode_disk& inode) {
+    if (bulk_write_) return false;
     directory_block_image image{};
     if (!ReadDirectoryBlock(head_block_id, image)) {
         return false;
@@ -710,9 +1027,10 @@ bool PersistentStore::WriteDirectoryInode(uint64_t head_block_id,
 
 bool PersistentStore::CreateDirectoryChain(uint64_t dir_inode_id, inode_ref& out_head_ref, bool compact_head) {
     out_head_ref = make_inode_ref(0, 0);
-    if (!IsOpen()) {
+    if (!IsOpen() || bulk_write_) {
         return false;
     }
+    clean_snapshot_loaded_.store(false, std::memory_order_relaxed);
 
     std::lock_guard<std::mutex> guard(inode_alloc_mu_);
     uint64_t block_id = 0;
@@ -737,9 +1055,10 @@ bool PersistentStore::AppendDirectoryChainBlock(const inode_ref& tail_ref,
                                                 uint64_t dir_inode_id,
                                                 inode_ref& out_new_tail_ref) {
     out_new_tail_ref = make_inode_ref(0, 0);
-    if (!IsOpen() || tail_ref.block_id == 0 || tail_ref.offset != 0) {
+    if (!IsOpen() || bulk_write_ || tail_ref.block_id == 0 || tail_ref.offset != 0) {
         return false;
     }
+    clean_snapshot_loaded_.store(false, std::memory_order_relaxed);
 
     std::lock_guard<std::mutex> guard(inode_alloc_mu_);
 
@@ -848,16 +1167,134 @@ PersistentStore::stats_snapshot PersistentStore::Stats() const {
     return out;
 }
 
-bool PersistentStore::EnsureBlockCount(uint64_t block_count) {
-    off_t target_size = block_offset(block_count);
-    struct stat st;
-    if (::fstat(fd_, &st) != 0) {
-        return false;
+PersistentStore::segment_state* PersistentStore::Segment(unsigned kind,uint64_t index) const {
+    std::lock_guard<std::mutex> guard(segments_mu_);
+    return kind<3 && index<segments_[kind].size()?segments_[kind][size_t(index)].get():nullptr;
+}
+int PersistentStore::FileDescriptor(unsigned kind,uint64_t index) const {
+    const auto* segment=Segment(kind,index); return segment?segment->fd:-1;
+}
+uint64_t PersistentStore::LogicalFileBytes(unsigned kind) const {
+    return kind<3?logical_file_bytes_[kind].load(std::memory_order_acquire):0;
+}
+uint64_t PersistentStore::SegmentIndex(uint64_t page) const {
+    return page/(segment_bytes_/kMetadataBlockBytes);
+}
+off_t PersistentStore::SegmentOffset(uint64_t page) const {
+    return off_t((page%(segment_bytes_/kMetadataBlockBytes))*kMetadataBlockBytes);
+}
+bool PersistentStore::AddSegment(unsigned kind,uint64_t index,int fd) {
+    if(fd<0) return false;
+    auto entry=std::make_unique<segment_state>(); entry->fd=fd;
+    struct stat st{};
+    if(kind>2 || index!=segments_[kind].size() || ::fstat(fd,&st) || !S_ISREG(st.st_mode) ||
+       st.st_size<0 || st.st_size%kMetadataBlockBytes) return false;
+    entry->bytes=uint64_t(st.st_size); entry->direct_flags=::fcntl(fd,F_GETFL);
+    if(entry->direct_flags<0) return false;
+    entry->direct_flags|=O_DIRECT;
+    segments_[kind].push_back(std::move(entry));
+    logical_file_bytes_[kind].store(index*segment_bytes_+uint64_t(st.st_size));
+    if(!index) { if(!kind) fd_=fd; else if(kind==1) heads_fd_=fd; else buckets_fd_=fd; }
+    return true;
+}
+SegmentLayout PersistentStore::CurrentSegmentLayout() const {
+    SegmentLayout layout; layout.segment_bytes=segment_bytes_;
+    std::lock_guard<std::mutex> guard(segments_mu_);
+    for(unsigned kind=0;kind<3;++kind) {
+        layout.logical_bytes[kind]=logical_file_bytes_[kind].load();
+        for(size_t index=0;index<segments_[kind].size();++index) {
+            struct stat st{};
+            if(::fstat(segments_[kind][index]->fd,&st) || !S_ISREG(st.st_mode) || st.st_size<0)
+                throw std::runtime_error("cannot stat data segment");
+            layout.segments.push_back({kind,uint64_t(index),uint64_t(st.st_dev),uint64_t(st.st_ino),uint64_t(st.st_size)});
+        }
     }
-    if (st.st_size >= target_size) {
-        return true;
+    ValidateSegmentLayout(layout); return layout;
+}
+bool PersistentStore::SetBufferedMode(bool enabled) {
+    std::lock_guard<std::mutex> guard(segments_mu_);
+    buffered_mode_=enabled;
+    for(auto& group:segments_) for(auto& segment:group)
+        if(::fcntl(segment->fd,F_SETFL,enabled?(segment->direct_flags&~O_DIRECT):segment->direct_flags)) return false;
+    return true;
+}
+void PersistentStore::MarkFileDirty(unsigned kind,uint64_t index) const {
+    if(auto* segment=Segment(kind,index)) segment->dirty_epoch.fetch_add(1,std::memory_order_release);
+}
+bool PersistentStore::SyncFileIfDirty(unsigned kind) const {
+    std::lock_guard<std::mutex> guard(segments_mu_);
+    if(kind>2 || segments_[kind].empty()) return false;
+    for(const auto& segment:segments_[kind]) {
+        const auto target=segment->dirty_epoch.load(std::memory_order_acquire);
+        if(target==segment->synced_epoch.load(std::memory_order_acquire)) continue;
+        int rc; do { rc=::fsync(segment->fd); } while(rc && errno==EINTR);
+        if(rc) return false;
+        segment->synced_epoch.store(target,std::memory_order_release);
+        stats_fsync_ops_.fetch_add(1,std::memory_order_relaxed);
     }
-    return ::ftruncate(fd_, target_size) == 0;
+    return true;
+}
+bool PersistentStore::EnsureBlockCount(uint64_t count) { return EnsureFileBlockCount(0,count); }
+bool PersistentStore::EnsureFileBlockCount(unsigned kind,uint64_t count) const {
+    UndoWriteResult result{batch_undo_.get()};
+    if(kind>2 || count>uint64_t(std::numeric_limits<int64_t>::max())/kMetadataBlockBytes) return false;
+    try {
+        std::lock_guard<std::mutex> guard(segments_mu_);
+        if(segments_[kind].empty()) return false;
+        const uint64_t bytes=count*kMetadataBlockBytes;
+        if(bytes<=logical_file_bytes_[kind].load()) { result.ok=true; return true; }
+        const uint64_t needed=bytes/segment_bytes_+(bytes%segment_bytes_!=0);
+        for(uint64_t index=segments_[kind].size()-1;index<needed;++index) {
+            if(index==segments_[kind].size()) {
+                const int flags=buffered_mode_?0:O_DIRECT;
+                int fd=batch_undo_?batch_undo_->CreateSegment(kind,index,flags):
+                    ::open(SegmentPath(path_,kind,index).c_str(),O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW|flags,0600);
+                if(fd<0 || !const_cast<PersistentStore*>(this)->AddSegment(kind,index,fd)) return false;
+                segment_directory_dirty_.store(true);
+            }
+            auto& segment=*segments_[kind][size_t(index)];
+            const uint64_t wanted=std::min(segment_bytes_,bytes-index*segment_bytes_);
+            if(wanted>segment.bytes) {
+                int rc; do { rc=::ftruncate(segment.fd,off_t(wanted)); } while(rc && errno==EINTR);
+                if(rc) return false;
+                segment.bytes=wanted; segment.dirty_epoch.fetch_add(1,std::memory_order_release);
+            }
+            logical_file_bytes_[kind].store(index*segment_bytes_+segment.bytes,std::memory_order_release);
+        }
+        result.ok=true; return true;
+    } catch(...) { return false; }
+}
+
+void PersistentStore::AdvanceTemplateWriteback(unsigned kind,uint64_t index,uint64_t end_offset) {
+    const uint64_t window=std::min<uint64_t>(128ULL*1024*1024,segment_bytes_);
+    auto* segment=Segment(kind,index);
+    if(!segment) throw std::runtime_error("template writeback segment is missing");
+    const int fd=segment->fd;
+    auto sync_range=[&](uint64_t offset,uint64_t bytes,unsigned flags,bool wait) {
+        const uint64_t start=monotonic_raw_ns();
+        int rc; do { rc=::sync_file_range(fd,off_t(offset),off_t(bytes),flags); } while(rc && errno==EINTR);
+        ++bulk_stats_.writeback_calls;
+        if(wait) bulk_stats_.writeback_wait_ns+=monotonic_raw_ns()-start;
+        if(rc && (errno==ENOSYS || errno==EOPNOTSUPP || errno==EINVAL)) { segment->writeback_supported=false; return; }
+        if(rc) throw std::runtime_error("template incremental writeback failed");
+    };
+    while(end_offset-segment->next_writeback>=window) {
+        if(segment->writeback_supported && segment->pending_bytes)
+            sync_range(segment->pending_offset,segment->pending_bytes,
+                SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER,true);
+        segment->pending_bytes=0;
+        if(segment->writeback_supported) {
+            sync_range(segment->next_writeback,window,SYNC_FILE_RANGE_WRITE,false);
+            if(segment->writeback_supported) { segment->pending_offset=segment->next_writeback; segment->pending_bytes=window; }
+        }
+        if(!segment->writeback_supported) {
+            const uint64_t start=monotonic_raw_ns();
+            int rc; do { rc=::fdatasync(fd); } while(rc && errno==EINTR);
+            ++bulk_stats_.writeback_calls; bulk_stats_.writeback_wait_ns+=monotonic_raw_ns()-start;
+            if(rc) throw std::runtime_error("template writeback fallback failed");
+        }
+        segment->next_writeback+=window;
+    }
 }
 
 bool PersistentStore::InitializeFreshStore() {
@@ -871,7 +1308,8 @@ bool PersistentStore::InitializeFreshStore() {
     sb.latest_checkpoint_seq = 0;
     sb.fs_uuid_hi = 0;
     sb.fs_uuid_lo = 0;
-    sb.flags = 0;
+    sb.flags = kSuperblockFlagSplitFiles | kSuperblockFlagSegmentedFiles;
+    sb.segment_layout_version=1; sb.segment_bytes=segment_bytes_;
     if (!WriteSuperblock(sb)) {
         return false;
     }
@@ -885,14 +1323,7 @@ bool PersistentStore::InitializeFreshStore() {
 }
 
 bool PersistentStore::RecomputeNextAllocBlock() {
-    struct stat st;
-    if (::fstat(fd_, &st) != 0) {
-        return false;
-    }
-    if (st.st_size < 0) {
-        return false;
-    }
-    uint64_t bytes = static_cast<uint64_t>(st.st_size);
+    const uint64_t bytes=LogicalFileBytes(0);
     uint64_t blocks = (bytes + kMetadataBlockBytes - 1) / kMetadataBlockBytes;
     if (blocks == 0) {
         next_alloc_block_.store(1, std::memory_order_relaxed);
@@ -962,11 +1393,11 @@ bool PersistentStore::RecomputeLinearInodeCursor() {
 
 bool PersistentStore::RecomputeNextDirectoryBlock() {
     uint64_t highest_directory_block = 0;
-    const uint64_t total_blocks = next_alloc_block_.load(std::memory_order_relaxed);
+    const uint64_t total_blocks=LogicalFileBytes(2)/kMetadataBlockBytes;
     const uint64_t max_directory_block = MaxLogicalDirectoryBlockId(total_blocks);
     for (uint64_t b = 1; b <= max_directory_block; ++b) {
         metadata_block_bytes raw;
-        if (!ReadBlock(DirectoryPhysicalBlockId(b), raw)) {
+        if (!ReadFileBlock(2,DirectoryPhysicalBlockId(b), raw)) {
             continue;
         }
         const auto* common =
@@ -999,7 +1430,7 @@ bool PersistentStore::AllocateDirectoryBlockLocked(uint64_t& out_block_id) {
     if(out_block_id>kMaxLogicalBlock) return false;
     next_directory_block_.store(out_block_id + 1, std::memory_order_relaxed);
     const uint64_t physical_block_id = DirectoryPhysicalBlockId(out_block_id);
-    const bool ok = EnsureBlockCount(physical_block_id + 1);
+    const bool ok = EnsureFileBlockCount(2,physical_block_id + 1);
     if (ok) {
         stats_allocate_block_ops_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1307,22 +1738,22 @@ uint64_t PersistentStore::InodeSlotFromTicket(uint64_t ticket) {
 }
 
 uint64_t PersistentStore::InodePhysicalBlockId(uint64_t inode_block_id) {
-    return inode_block_id * 2u - 1u;
+    return inode_block_id;
 }
 
 uint64_t PersistentStore::DirectoryPhysicalBlockId(uint64_t directory_block_id) {
-    return directory_block_id * 2u;
+    return directory_block_id - 1u;
 }
 
 uint64_t PersistentStore::MaxLogicalInodeBlockId(uint64_t physical_block_count) {
-    return physical_block_count / 2u;
+    return physical_block_count ? physical_block_count-1u : 0;
 }
 
 uint64_t PersistentStore::MaxLogicalDirectoryBlockId(uint64_t physical_block_count) {
     if (physical_block_count == 0) {
         return 0;
     }
-    return (physical_block_count - 1u) / 2u;
+    return physical_block_count;
 }
 
 bool PersistentStore::IsKnownBlockType(uint16_t block_type) const {

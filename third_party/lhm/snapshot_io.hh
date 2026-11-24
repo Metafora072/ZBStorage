@@ -8,16 +8,19 @@ namespace MasstreeLHM {
 class SnapshotWriter {
     std::ofstream out_;
     uint64_t hash_ = 14695981039346656037ULL;
+    bool hashing_only_ = false;
 public:
-    explicit SnapshotWriter(const std::string& p) : out_(p, std::ios::binary|std::ios::trunc) {
-        if (!out_) throw std::runtime_error("cannot create snapshot");
+    explicit SnapshotWriter(const std::string& p) : hashing_only_(p.empty()) {
+        if(!hashing_only_) out_.open(p, std::ios::binary|std::ios::trunc);
+        if (!hashing_only_ && !out_) throw std::runtime_error("cannot create snapshot");
     }
     void u64(uint64_t n) {
         for (int i=0;i<8;++i) { unsigned char c=n&255; n>>=8;
-            out_.put(char(c)); hash_=(hash_^c)*1099511628211ULL; }
-        if (!out_) throw std::runtime_error("snapshot write failed");
+            if(!hashing_only_) out_.put(char(c)); hash_=(hash_^c)*1099511628211ULL; }
+        if (!hashing_only_ && !out_) throw std::runtime_error("snapshot write failed");
     }
-    void finish() { auto h=hash_; u64(h); out_.flush();
+    uint64_t checksum() const { return hash_; }
+    void finish() { auto h=hash_; u64(h); if(hashing_only_) return; out_.flush();
         if (!out_) throw std::runtime_error("snapshot flush failed"); out_.close(); }
 };
 class SnapshotReader {
@@ -35,6 +38,7 @@ public:
         return n;
     }
     uint32_t u32() { auto n=u64(); if(n>UINT32_MAX) throw std::runtime_error("snapshot integer overflow"); return n; }
+    uint64_t checksum() const { return hash_; }
     void finish() { auto h=hash_; if(u64()!=h || in_.get()!=EOF) throw std::runtime_error("snapshot checksum/trailer mismatch"); }
 };
 }

@@ -20,11 +20,19 @@ relaxed_atomic<mrcu_epoch_type> active_epoch(1);
 volatile bool recovering = false;
 kvtimestamp_t initial_timestamp;
 
+struct LhmContextFileLock {
+    int fd=-1;
+    ~LhmContextFileLock() { if(fd>=0) ::close(fd); }
+};
 struct zb_lhm_context {
+    // Members are destroyed in reverse order: keep ownership locked until the
+    // namespace and PersistentStore (including any exceptional flush) are gone.
+    LhmContextFileLock store_lock, runner_lock;
     MasstreeLHM::LhmNamespace ns;
     std::string path;
-    int lock_fd=-1;
-    ~zb_lhm_context() { if(lock_fd>=0) ::close(lock_fd); }
+    // Set only by the exclusive, recoverable offline batch entry point.
+    std::string batch_manifest_sha256;
+    bool runtime = false, dirty = false, failed = false;
 };
 namespace {
 void Error(char* out,size_t n,const std::string& message) {
@@ -37,8 +45,8 @@ void SyncFile(const std::string& path, bool directory=false) {
     if(rc) throw std::runtime_error("fsync failed: "+path);
 }
 void LockStore(zb_lhm_context& ctx,const std::string& path) {
-    ctx.path=path; ctx.lock_fd=::open(path.c_str(),O_RDWR);
-    if(ctx.lock_fd<0 || ::flock(ctx.lock_fd,LOCK_EX|LOCK_NB)) throw std::runtime_error("store is already open or inaccessible");
+    ctx.path=path; ctx.store_lock.fd=::open(path.c_str(),O_RDWR);
+    if(ctx.store_lock.fd<0 || ::flock(ctx.store_lock.fd,LOCK_EX|LOCK_NB)) throw std::runtime_error("store is already open or inaccessible");
 }
 // One module-owned worker and upstream threadinfo for the module lifetime.
 // Multiple contexts/caller threads are serialized; no per-request threadinfo leaks.
@@ -91,9 +99,63 @@ void export_inode(zb_lhm_context* ctx, const MasstreeLHM::inode_disk& in, zb_lhm
 uint64_t native_id(zb_lhm_context* ctx, uint64_t id) {
     return id == 1 ? ctx->ns.root_inode_id() : id;
 }
-template<class F> int call(zb_lhm_context* ctx, F f) {
+bool ContextUsable(zb_lhm_context* ctx) {
+    if(ctx->runtime && ctx->ns.batch_undo() && ctx->ns.batch_undo()->failed()) ctx->failed=true;
+    return !ctx->failed;
+}
+void FailRuntime(zb_lhm_context* ctx) {
+    if(!ctx->runtime) return;
+    ctx->failed=true;
+    if(ctx->ns.batch_undo()) ctx->ns.batch_undo()->Poison();
+}
+template<class F> int call(zb_lhm_context* ctx, F f, bool mutation=false) {
     if (!ctx) return 0;
-    try { return worker().run(f) ? 1 : 0; } catch (...) { return 0; }
+    try { return worker().run([&](threadinfo& ti) {
+        if(!ContextUsable(ctx) || (mutation && ctx->ns.shared_readonly())) return false;
+        try {
+            const bool ok=f(ti);
+            // Boolean legacy calls also report ordinary validation failures.
+            // The store poisons undo on physical write errors; those fail closed.
+            if(ctx->runtime && mutation) ctx->dirty=true;
+            return ok && ContextUsable(ctx);
+        } catch(...) { if(mutation) FailRuntime(ctx); throw; }
+    }) ? 1 : 0; } catch (...) { return 0; }
+}
+void RuntimeRunnerLock(zb_lhm_context& ctx,const std::string& path) {
+    ctx.runner_lock.fd=::open((path+".batch-runner.lock").c_str(),O_RDWR|O_CREAT,0600);
+    if(ctx.runner_lock.fd<0 || ::flock(ctx.runner_lock.fd,LOCK_SH|LOCK_NB))
+        throw std::runtime_error("offline batch runner owns the store");
+}
+void StartRuntime(zb_lhm_context& ctx,threadinfo& ti,bool initial) {
+    if(initial) {
+        const auto temp=ctx.path+".snapshot.tmp";
+        ctx.ns.save_snapshot(temp,ti); SyncFile(temp);
+        if(::rename(temp.c_str(),(ctx.path+".snapshot").c_str())) throw std::runtime_error("initial checkpoint publication failed");
+        SyncFile(std::filesystem::path(ctx.path).parent_path().string(),true);
+    }
+    ctx.runtime=true; ctx.ns.begin_batch_undo(true);
+    MasstreeLHM::BatchFault("service_started");
+}
+int RuntimeCheckpoint(zb_lhm_context& ctx,threadinfo& ti,bool closing) {
+    if(!ctx.runtime || !ContextUsable(&ctx)) throw std::runtime_error("LHM session failed; restart to recover");
+    if(ctx.ns.pending_create_count()) return ZB_LHM_BUSY;
+    if(ctx.dirty) {
+        ctx.ns.advance_checkpoint_sequence();
+        const auto temp=ctx.path+".snapshot.tmp";
+        ctx.ns.save_snapshot(temp,ti); SyncFile(temp); MasstreeLHM::BatchFault("service_snapshot");
+        ctx.ns.batch_undo()->PrepareServiceCommit(temp);
+        if(::rename(temp.c_str(),(ctx.path+".snapshot").c_str())) throw std::runtime_error("service checkpoint publication failed");
+        SyncFile(std::filesystem::path(ctx.path).parent_path().string(),true);
+        MasstreeLHM::BatchFault("service_published");
+        MasstreeLHM::BatchUndo::Recover(ctx.path);
+        ctx.ns.retire_batch_undo(); ctx.dirty=false;
+        MasstreeLHM::BatchFault("service_retired");
+        if(!closing) ctx.ns.begin_batch_undo(true);
+    } else if(closing) {
+        // With no mutations the baseline is already the final checkpoint.
+        MasstreeLHM::BatchUndo::Recover(ctx.path); ctx.ns.retire_batch_undo();
+    }
+    return ZB_LHM_OK;
 }
 }
 extern "C" {
@@ -107,6 +169,7 @@ zb_lhm_context* zb_lhm_open(const char* file) {
         ::close(fd);
         return worker().run([path](threadinfo& ti) -> zb_lhm_context* {
             auto ctx = std::make_unique<zb_lhm_context>();
+            RuntimeRunnerLock(*ctx,path);
             LockStore(*ctx,path);
             ctx->ns.initialize(ti, path);
             MasstreeLHM::inode_disk root{};
@@ -123,6 +186,8 @@ zb_lhm_context* zb_lhm_open(const char* file) {
                 !ctx->ns.replace_inode_attributes(root.inode_id, encoded)) {
                 ctx->ns.destroy(ti); return nullptr;
             }
+            try { StartRuntime(*ctx,ti,true); }
+            catch(...) { ctx->ns.destroy(ti); throw; }
             return ctx.release();
         });
     } catch (...) { return nullptr; }
@@ -133,13 +198,18 @@ zb_lhm_context* zb_lhm_reopen(const char* file,char* error,size_t size) {
     try {
         const auto path=std::filesystem::absolute(file).string();
         return worker().run([&](threadinfo& ti)->zb_lhm_context* {
-            auto ctx=std::make_unique<zb_lhm_context>(); LockStore(*ctx,path);
-            // Validate before invalidation. No service operations run until the
-            // clean snapshot has been removed durably.
+            auto ctx=std::make_unique<zb_lhm_context>();
+            // Held for the service lifetime. The offline runner holds EX across
+            // batches, including the gaps between individual main-file locks.
+            RuntimeRunnerLock(*ctx,path);
+            LockStore(*ctx,path);
+            if(MasstreeLHM::BatchUndo::Exists(path) && !MasstreeLHM::BatchUndo::IsServiceJournal(path))
+                throw std::runtime_error("unfinished offline batch; run batch recovery before ordinary reopen");
+            MasstreeLHM::BatchUndo::Recover(path);
+            // Keep the checkpoint and arm undo before exposing any service writes.
             try {
                 ctx->ns.reopen_snapshot(path,path+".snapshot",ti);
-                if(::unlink((path+".snapshot").c_str())) throw std::runtime_error("cannot invalidate clean snapshot");
-                SyncFile(std::filesystem::path(path).parent_path().string(),true);
+                StartRuntime(*ctx,ti,false);
                 return ctx.release();
             } catch(...) { ctx->ns.destroy(ti); throw; }
         });
@@ -150,13 +220,26 @@ int zb_lhm_close_checked(zb_lhm_context* ctx,char* error,size_t size) {
     try { return worker().run([&](threadinfo& ti) {
         bool ok=true;
         try {
-            auto temp=ctx->path+".snapshot.tmp";
-            ctx->ns.save_snapshot(temp,ti); SyncFile(temp);
-            if(::rename(temp.c_str(),(ctx->path+".snapshot").c_str())) throw std::runtime_error("snapshot publication failed");
-            SyncFile(std::filesystem::path(ctx->path).parent_path().string(),true);
-        } catch(const std::exception& e) { ok=false; Error(error,size,e.what()); ::unlink((ctx->path+".snapshot").c_str()); }
-        ctx->ns.destroy(ti); delete ctx; return ok?1:0;
+            if(RuntimeCheckpoint(*ctx,ti,true)!=ZB_LHM_OK)
+                throw std::runtime_error("pending reservations prevent checkpoint; restoring previous checkpoint");
+        } catch(const std::exception& e) { ok=false; Error(error,size,e.what()); FailRuntime(ctx); }
+        ctx->ns.destroy(ti);
+        if(!ok) {
+            try { MasstreeLHM::BatchUndo::Recover(ctx->path); }
+            catch(const std::exception& e) { Error(error,size,std::string("close failed; recovery pending: ")+e.what()); }
+        }
+        delete ctx; return ok?1:0;
     }); } catch(const std::exception& e) { Error(error,size,e.what()); return 0; }
+}
+int zb_lhm_checkpoint(zb_lhm_context* ctx,char* error,size_t size) {
+    Error(error,size,""); if(!ctx) { Error(error,size,"missing context"); return ZB_LHM_INVALID; }
+    try { return worker().run([&](threadinfo& ti) {
+        try {
+            const auto rc=RuntimeCheckpoint(*ctx,ti,false);
+            if(rc==ZB_LHM_BUSY) Error(error,size,"pending reservations; retry after creates finish");
+            return rc;
+        } catch(const std::exception& e) { FailRuntime(ctx); Error(error,size,e.what()); return int(ZB_LHM_ERROR); }
+    }); } catch(const std::exception& e) { Error(error,size,e.what()); return ZB_LHM_ERROR; }
 }
 void zb_lhm_close(zb_lhm_context* ctx) {
     char error[512]{};
@@ -168,7 +251,7 @@ int zb_lhm_create(zb_lhm_context* ctx, const char* path, int directory) {
         MasstreeLHM::namespace_entry entry;
         if (ctx->ns.lookup_entry(path, entry, ti)) return false;
         return directory ? ctx->ns.mkdir(path, ti) : ctx->ns.creat_file(path, ti);
-    });
+    },true);
 }
 int zb_lhm_lookup(zb_lhm_context* ctx, const char* path, zb_lhm_inode* out) {
     if (!path || path[0] != '/' || !out) return 0;
@@ -196,11 +279,11 @@ int zb_lhm_update_inode(zb_lhm_context* ctx, const zb_lhm_inode* attr) {
         uint64_t id = native_id(ctx, attr->inode_id);
         if (!ctx->ns.read_inode_by_id(id, inode) || inode.type != attr->type) return false;
         return ctx->ns.update_inode_by_id(id, attr->size, attr->mode, attr->ctime_ns, attr->mtime_ns);
-    });
+    },true);
 }
 int zb_lhm_rename(zb_lhm_context* ctx, const char* from, const char* to) {
     if (!from || !to || from[0] != '/' || to[0] != '/') return 0;
-    return call(ctx, [=](threadinfo& ti) { return ctx->ns.rename_path(from, to, ti); });
+    return call(ctx, [=](threadinfo& ti) { return ctx->ns.rename_path(from, to, ti); },true);
 }
 int zb_lhm_remove(zb_lhm_context* ctx, const char* path) {
     if (!path || path[0] != '/' || MasstreeLHM::PathKey::parse_absolute_path(path).components.empty()) return 0;
@@ -209,10 +292,10 @@ int zb_lhm_remove(zb_lhm_context* ctx, const char* path) {
         if (!ctx->ns.lookup_entry(path, entry, ti)) return false;
         if (MasstreeLHM::entry_is_directory(entry) && !ctx->ns.readdir(path, ti).empty()) return false;
         return ctx->ns.remove_path_for_test(path, ti);
-    });
+    },true);
 }
 int zb_lhm_sync(zb_lhm_context* ctx) {
-    return call(ctx, [=](threadinfo&) { return ctx->ns.sync_persistence(); });
+    return call(ctx, [=](threadinfo&) { const bool ok=ctx->ns.sync_persistence(); if(!ok) FailRuntime(ctx); return ok; });
 }
 int zb_lhm_reserve(zb_lhm_context* ctx, const char* path, uint8_t type,
                    uint64_t* token, uint64_t* id) {
@@ -223,7 +306,7 @@ int zb_lhm_reserve(zb_lhm_context* ctx, const char* path, uint8_t type,
     if (parsed.components.empty() || parsed.components.back().size() > 64) return 0;
     return call(ctx, [=](threadinfo& ti) {
         return ctx->ns.reserve_create(path, type == 2, *token, *id, ti);
-    });
+    },true);
 }
 int zb_lhm_commit(zb_lhm_context* ctx, uint64_t token, const zb_lhm_full_inode* attr) {
     if (!attr || !zb::mds::lhm_codec::Valid(*attr)) return 0;
@@ -234,7 +317,7 @@ int zb_lhm_commit(zb_lhm_context* ctx, uint64_t token, const zb_lhm_full_inode* 
         if (expected != std::string(attr->file_name, attr->name_length)) return false;
         MasstreeLHM::inode_disk inode{};
         return zb::mds::lhm_codec::Encode(*attr, inode) && ctx->ns.commit_create(token, inode, ti);
-    });
+    },true);
 }
 #ifdef ZB_LHM_TESTING
 int zb_lhm_fail_next_publish_for_test(zb_lhm_context* ctx) {
@@ -242,7 +325,7 @@ int zb_lhm_fail_next_publish_for_test(zb_lhm_context* ctx) {
 }
 #endif
 int zb_lhm_cancel(zb_lhm_context* ctx, uint64_t token) {
-    return call(ctx, [=](threadinfo&) { return ctx->ns.cancel_create(token); });
+    return call(ctx, [=](threadinfo&) { return ctx->ns.cancel_create(token); },true);
 }
 uint64_t zb_lhm_pending(zb_lhm_context* ctx) {
     if (!ctx) return 0;
@@ -280,7 +363,7 @@ int zb_lhm_update_full(zb_lhm_context* ctx, const zb_lhm_full_inode* attr) {
         // A metadata update cannot rename the object. Rename owns the name change.
         if (old.name_length != native.name_length || std::memcmp(old.file_name,native.file_name,old.name_length)) return false;
         return zb::mds::lhm_codec::Encode(native,inode) && ctx->ns.replace_inode_attributes(native.inode_id,inode);
-    });
+    },true);
 }
 
 }
@@ -291,3 +374,8 @@ int zb_lhm_update_full(zb_lhm_context* ctx, const zb_lhm_full_inode* attr) {
 #include "LhmBulkBridge.inc"
 
 #include "LhmStreamBridge.inc"
+
+#include "LhmBatchBridge.inc"
+
+#include "LhmTemplateCompiler.inc"
+#include "LhmCompiledBridge.inc"

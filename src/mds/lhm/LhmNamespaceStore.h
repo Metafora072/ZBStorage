@@ -15,6 +15,7 @@ public:
     NamespaceStatus ImportManifest(const std::string&,const std::string&,uint64_t,NamespaceImportResult*) override;
     bool ready() const { return inodes_.ready(); }
     bool Sync() { return inodes_.Sync(); }
+    bool Checkpoint(std::string* error,bool* busy = nullptr) { return inodes_.Checkpoint(error,busy); }
     bool ResolvePath(const std::string&,uint64_t*,zb::rpc::InodeAttr*,std::string*) const override;
     bool GetInode(uint64_t,zb::rpc::InodeAttr*,std::string*) const override;
     bool PutInode(uint64_t,const zb::rpc::InodeAttr&,std::string*) override;

@@ -86,6 +86,13 @@ add_library(zb_proto ${PROTO_SRCS} ${PROTO_HDRS})
 target_include_directories(zb_proto PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(zb_proto PUBLIC ${Protobuf_LIBRARIES})
 
+# Manual, serial MDS query/manifest-index tool; excluded from the default build.
+add_executable(mds_query EXCLUDE_FROM_ALL tools/mds/mds_query.cpp)
+target_include_directories(mds_query PRIVATE ${ZBSTORAGE_BRPC_INCLUDE_DIRS})
+target_link_libraries(mds_query PRIVATE zb_proto brpc-static ${GFLAGS_LIBRARY} Threads::Threads)
+get_directory_property(MDS_QUERY_BRPC_LIBS DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/third_party/brpc DEFINITION DYNAMIC_LIB)
+target_link_libraries(mds_query PRIVATE ${MDS_QUERY_BRPC_LIBS})
+
 set(REAL_NODE_SOURCES
     src/common/metrics/NodeMetricsCollector.cpp
     src/common/metrics/SchedulerMetricsClient.cpp

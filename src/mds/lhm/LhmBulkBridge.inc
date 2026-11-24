@@ -74,22 +74,24 @@ extern "C" zb_lhm_context* zb_lhm_open_bulk(const char* file, const char* manife
             auto ctx = std::make_unique<zb_lhm_context>();
             try {
                 LockStore(*ctx,path);
+                RuntimeRunnerLock(*ctx,path);
                 ctx->ns.initialize(ti, path);
                 MasstreeLHM::LhmNamespace::bulk_stats result;
                 if (!ctx->ns.build_fresh_namespace(entries, result, ti))
                     throw std::runtime_error("bulk block/index construction failed");
                 if (stats) *stats = {result.files, result.directories, result.inode_blocks, result.buckets};
+                StartRuntime(*ctx,ti,true);
                 return ctx.release();
             } catch (...) { ctx->ns.destroy(ti); throw; }
         });
     } catch (const std::exception& e) {
-        if (created) ::unlink(path.c_str());
+        if (created && !std::filesystem::exists(path+".snapshot")) ::unlink(path.c_str());
         if (error && error_size) {
             std::strncpy(error, e.what(), error_size - 1); error[error_size - 1] = 0;
         }
         return nullptr;
     } catch (...) {
-        if (created) ::unlink(path.c_str());
+        if (created && !std::filesystem::exists(path+".snapshot")) ::unlink(path.c_str());
         if (error && error_size) {
             std::strncpy(error, "unexpected bulk import failure", error_size - 1); error[error_size - 1] = 0;
         }

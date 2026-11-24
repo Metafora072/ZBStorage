@@ -6,11 +6,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "metadata_layout.hh"
 #include "snapshot_io.hh"
+#include "batch_undo.hh"
+#include "segmented_layout.hh"
 
 namespace MasstreeLHM {
 
@@ -42,7 +45,7 @@ static_assert(sizeof(directory_block_image) == kMetadataBlockBytes,
 // 3) 提供 inode slot 分配与 inode 读写；
 // 4) 提供目录块读写。
 //
-// 当前不实现崩溃恢复流程，只保留布局和最小操作能力。
+// 文件 inode、目录头和文件桶分别存放；离线批次通过 undo 保护检查点。
 class PersistentStore {
   public:
     struct stats_snapshot {
@@ -84,6 +87,42 @@ class PersistentStore {
     bool Sync();
     bool set_l0_cache_enabled(bool enabled);
     bool l0_cache_enabled() const;
+
+    // Opt-in only, immediately after loading an unchanged clean snapshot.
+    // Throws on failure. The journal remains active through all close flushes.
+    void BeginBatchUndo(bool service = false);
+    void RetireBatchUndo() { batch_undo_.reset(); }
+    void AdvanceCheckpointSequence() {
+        if(sequence_==UINT64_MAX) throw std::runtime_error("checkpoint sequence exhausted");
+        ++sequence_;
+    }
+    BatchUndo* batch_undo() const { return batch_undo_.get(); }
+
+    struct BulkReservation {
+        uint64_t inode_first = 0, bucket_first = 0, head_first = 0;
+        uint64_t inode_pages = 0, bucket_pages = 0, head_pages = 0;
+        uint64_t head_count = 0, sequence_base = 0;
+    };
+    // Exclusive offline import, immediately after loading a clean snapshot and
+    // BeginBatchUndo(). Ranges never reuse an old inode/head page's unused tail.
+    // sequence_base starts a range of inode_pages+bucket_pages+head_count values.
+    // All three calls throw on error; close and recover the journal on failure.
+    BulkReservation ReserveTemplateBlocks(uint64_t inode_pages,
+                                          uint64_t bucket_pages,
+                                          uint64_t head_count);
+    // kind: 0 inode, 1 bucket, 2 compact-head page. Each kind's zero-based index
+    // must increase from zero; each kind has its own file and write buffer.
+    void WriteTemplateBlock(unsigned kind, uint64_t page_index,
+                            const metadata_block_bytes& data);
+    // Flush/fsync buffered writes, restore O_DIRECT, then allow normal access
+    // and snapshot publication. Sync/SaveAllocation reject an unfinished import.
+    void FinishTemplateWrites();
+    struct BulkWriteStats {
+        uint64_t write_calls=0, write_bytes=0, write_ns=0;
+        uint64_t main_sync_ns=0, heads_sync_ns=0, buckets_sync_ns=0;
+        uint64_t writeback_calls=0, writeback_wait_ns=0;
+    };
+    BulkWriteStats TemplateWriteStats() const { return bulk_stats_; }
 
     // 基础块读写接口（固定 16KB）。
     bool ReadBlock(uint64_t block_id, metadata_block_bytes& out) const;
@@ -183,6 +222,23 @@ class PersistentStore {
     };
 
     bool EnsureBlockCount(uint64_t block_count);
+    struct segment_state;
+    segment_state* Segment(unsigned kind, uint64_t index) const;
+    int FileDescriptor(unsigned kind, uint64_t index = 0) const;
+    uint64_t LogicalFileBytes(unsigned kind) const;
+    uint64_t SegmentIndex(uint64_t global_page) const;
+    off_t SegmentOffset(uint64_t global_page) const;
+    bool AddSegment(unsigned kind, uint64_t index, int fd);
+    bool SetBufferedMode(bool enabled);
+    SegmentLayout CurrentSegmentLayout() const;
+    bool ReadFileBlock(unsigned kind, uint64_t block, metadata_block_bytes& out) const;
+    bool WriteFileBlock(unsigned kind, uint64_t block, const metadata_block_bytes& data);
+    bool EnsureFileBlockCount(unsigned kind, uint64_t count) const;
+    bool SyncFileIfDirty(unsigned kind) const;
+    void MarkFileDirty(unsigned kind, uint64_t index = 0) const;
+    void AdvanceTemplateWriteback(unsigned kind, uint64_t index, uint64_t end_offset);
+    struct bulk_write_state;
+    void FlushTemplateBuffer(unsigned file_kind);
     bool InitializeFreshStore();
     bool RecomputeNextAllocBlock();
     bool RecomputeLinearInodeCursor();
@@ -236,6 +292,15 @@ class PersistentStore {
                                   uint64_t flags);
 
     int heads_fd_ = -1;
+    int buckets_fd_ = -1;
+    // Segment zero retains the existing store identity and flock anchor.
+    uint64_t segment_bytes_ = kDefaultSegmentBytes;
+    mutable std::array<std::vector<std::unique_ptr<segment_state>>,3> segments_;
+    mutable std::mutex segments_mu_;
+    mutable std::array<std::atomic<uint64_t>,3> logical_file_bytes_{};
+    mutable std::atomic<bool> segment_directory_dirty_{false};
+    bool buffered_mode_ = false;
+    BulkWriteStats bulk_stats_{};
     uint64_t next_head_ = 1;
     mutable uint64_t head_page_ = UINT64_MAX;
     mutable bool head_dirty_ = false;
@@ -244,6 +309,9 @@ class PersistentStore {
     bool LoadHeadPage(uint64_t page, bool create) const;
     int fd_;
     std::string path_;
+    std::unique_ptr<BatchUndo> batch_undo_;
+    std::unique_ptr<bulk_write_state> bulk_write_;
+    std::atomic<bool> clean_snapshot_loaded_{false};
     std::atomic<uint64_t> next_alloc_block_;
     std::atomic<uint64_t> next_directory_block_;
     uint64_t sequence_;

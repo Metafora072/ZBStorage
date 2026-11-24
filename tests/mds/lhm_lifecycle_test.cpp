@@ -36,7 +36,11 @@ void Phase(const fs::path& dir,const std::string& phase) {
         auto* raw=zb_lhm_open(failure.c_str()); Check(raw,"create failure-close store");
         uint64_t token=0,pending_id=0; Check(zb_lhm_reserve(raw,"/pending",1,&token,&pending_id),"pending creation");
         Check(!zb_lhm_close_checked(raw,error,sizeof(error)),"close with pending reservation rejected");
-        Check(!zb_lhm_reopen(failure.c_str(),error,sizeof(error)),"failed close has no valid snapshot");
+        auto* recovered=zb_lhm_reopen(failure.c_str(),error,sizeof(error));
+        Check(recovered,"failed close must retain previous checkpoint");
+        zb_lhm_inode missing{};
+        Check(!zb_lhm_lookup(recovered,"/pending",&missing),"uncommitted reservation survived failed close");
+        Check(zb_lhm_close_checked(recovered,error,sizeof(error)),"close recovered empty checkpoint");
         Check(ns.Sync(),"sync");
         Check(fs::file_size(file+".heads")==3*16384,"31 heads per page including root");
     } else if(phase=="append") {
@@ -83,10 +87,8 @@ int main(int argc,char** argv) {
         fs::copy_file(snap,snap.string()+".backup");
         { std::fstream f(snap,std::ios::binary|std::ios::in|std::ios::out); f.seekg(-1,std::ios::end); char c=static_cast<char>(f.get() ^ 0x80); f.seekp(-1,std::ios::end); f.put(c); }
         run("reject"); fs::copy_file(snap.string()+".backup",snap,fs::copy_options::overwrite_existing);
-        run("verify"); run("dirty"); run("reject");
-        // The dirty phase made no writes; restore the previously verified test snapshot.
-        fs::copy_file(snap.string()+".backup",snap,fs::copy_options::overwrite_existing); run("verify");
-        std::cout<<"PASS: cross-process reopen, streaming append, attributes, compact heads, rename/delete, scan, corruption and unclean rejection\n";
+        run("verify"); run("dirty"); run("verify");
+        std::cout<<"PASS: cross-process reopen, streaming append, attributes, compact heads, rename/delete, scan, corruption and automatic unclean recovery\n";
         return 0;
     } catch(const std::exception& e) { std::cerr<<"FAIL: "<<e.what()<<'\n'; return 1; }
 }

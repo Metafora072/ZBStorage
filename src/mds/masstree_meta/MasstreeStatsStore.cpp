@@ -163,7 +163,9 @@ bool MasstreeStatsStore::LoadClusterStats(MasstreeClusterStatsRecord* record, st
         return false;
     }
 
-    const MasstreeOpticalProfile profile = MasstreeOpticalProfile::LegacyMixed();
+    // A database without cluster statistics starts with the current layout.
+    // DecodeClusterStats independently handles explicitly stored older records.
+    const MasstreeOpticalProfile profile = MasstreeOpticalProfile::Fixed();
     record->optical_layout_version = profile.layout_version;
     record->disk_node_count = 0;
     record->optical_node_count = profile.optical_node_count;

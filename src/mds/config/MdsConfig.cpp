@@ -250,6 +250,13 @@ MdsConfig MdsConfig::LoadFromFile(const std::string& path, std::string* error) {
             cfg.lhm_store_file = value;
         } else if (key == "LHM_STORE_MODE") {
             cfg.lhm_store_mode = value;
+        } else if (key == "LHM_CHECKPOINT_INTERVAL_SECONDS") {
+            if(value.empty() || value.find_first_not_of("0123456789")!=std::string::npos || value.size()>7 ||
+               std::stoull(value)>604800) {
+                if(error) *error="LHM_CHECKPOINT_INTERVAL_SECONDS must be 0..604800";
+                return {};
+            }
+            cfg.lhm_checkpoint_interval_seconds=static_cast<uint32_t>(std::stoul(value));
         } else if (key == "LHM_BULK_MANIFEST") {
             cfg.lhm_bulk_manifest = value;
         } else if (key == "SCHEDULER_ADDR") {

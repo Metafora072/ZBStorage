@@ -26,6 +26,7 @@
 #include "namespace_types.hh"
 #include "path_key.hh"
 #include "persistent_store.hh"
+#include "shared_routes.hh"
 
 #include <sys/stat.h>
 
@@ -51,6 +52,15 @@ class LhmNamespace {
     std::map<uint64_t, PendingCreate> pending_creates_;
     std::vector<PendingCreate> canceled_files_, canceled_directories_;
     uint64_t next_reservation_ = 1;
+    IndexCatalog snapshot_indexes_;
+    std::string snapshot_store_;
+    bool append_only_snapshot_ = false;
+    bool loaded_incremental_snapshot_ = false;
+    bool shared_snapshot_ = false;
+    SharedCatalog shared_catalog_;
+    std::vector<SharedRoutes> shared_routes_;
+    std::map<std::string,size_t> shared_names_;
+    uint64_t loaded_directory_hash_ = 0;
 #ifdef ZB_LHM_TESTING
     bool fail_next_publish_ = false;
 #endif
@@ -59,12 +69,55 @@ class LhmNamespace {
 
     #include "namespace_bulk_build.inc"
     #include "namespace_snapshot.inc"
+    #include "namespace_shared.inc"
+
+    // Exclusive offline batches attach protection only after loading a clean
+    // checkpoint. It remains attached through all cache flushes and shutdown.
+    void begin_batch_undo(bool service = false) { persistent_store_.BeginBatchUndo(service); }
+    void retire_batch_undo() { persistent_store_.RetireBatchUndo(); }
+    void advance_checkpoint_sequence() { persistent_store_.AdvanceCheckpointSequence(); }
+    BatchUndo* batch_undo() { return persistent_store_.batch_undo(); }
+
+    // Offline compiled import owns disjoint ranges and publishes only directory
+    // routing. Files already reside in their final inode and bucket pages.
+    PersistentStore::BulkReservation reserve_template_blocks(uint64_t inodes,
+            uint64_t buckets, uint64_t heads) {
+        if (!pending_creates_.empty() || !directory_blocks_.flush_all())
+            throw std::runtime_error("cannot reserve template ranges with pending writes");
+        return persistent_store_.ReserveTemplateBlocks(inodes, buckets, heads);
+    }
+    void write_template_block(unsigned kind, uint64_t page,
+                              const metadata_block_bytes& bytes) {
+        persistent_store_.WriteTemplateBlock(kind, page, bytes);
+    }
+    void finish_template_writes() { persistent_store_.FinishTemplateWrites(); }
+    PersistentStore::BulkWriteStats template_write_stats() const {
+        return persistent_store_.TemplateWriteStats();
+    }
+    void install_template_directory(const std::vector<uint64_t>& parent_hashes,
+            uint64_t hash, uint64_t head,
+            DirectoryBlockStore::file_index_state&& plan, threadinfo& ti) {
+        if (!batch_undo() || plan.head_block_id != head ||
+            !persistent_store_.DirectoryAddressMayExist(head))
+            throw std::runtime_error("invalid compiled directory publication");
+        ParsedPath parent; parent.normalized_path = "<compiled-template>";
+        parent.hashes = parent_hashes;
+        const node_type* parent_root = nullptr;
+        if (!locate_directory_root(parent, parent_root, ti))
+            throw std::runtime_error("compiled directory parent missing");
+        auto meta = make_directory_meta(head, head);
+        meta.file_index_id = directory_blocks_.install_bulk_file_index(std::move(plan));
+        node_type* child = nullptr;
+        if (!meta.file_index_id || !directory_index_.create_directory_layer(
+                const_cast<node_type*>(parent_root), hash, meta, child, ti))
+            throw std::runtime_error("compiled directory publication failed");
+    }
 
     void initialize(threadinfo& ti, const std::string& backing_file = {}) {
         directory_index_.initialize(ti);
         initialize_persistence_store(backing_file);
         directory_blocks_.bind(persistent_store_);
-        root_directory_file_index_id_ = directory_blocks_.create_file_index();
+        root_directory_file_index_id_ = directory_blocks_.create_file_index(root_directory_head_block_id_);
         rename_profile_enabled_ = std::getenv("LHM_RENAME_PROFILE") != nullptr;
         reset_rename_profile_stats();
     }
@@ -85,6 +138,9 @@ class LhmNamespace {
         canceled_directories_.clear();
         directory_blocks_.reset();
         directory_index_.destroy(ti);
+        snapshot_indexes_={}; snapshot_store_.clear();
+        shared_snapshot_=false; shared_catalog_={}; shared_routes_.clear(); shared_names_.clear();
+        append_only_snapshot_=loaded_incremental_snapshot_=false;
     }
 
     // Native IDs remain encoded storage addresses. Callers serialize operations.
@@ -601,6 +657,7 @@ class LhmNamespace {
     bool readdir_checked(const std::string& path, std::vector<readdir_record>& results, threadinfo& ti) const {
         ParsedPath parsed = PathKey::parse_absolute_path(path);
         results.clear();
+        if(shared_snapshot_) return shared_readdir(parsed,results);
         const node_type* directory_root = nullptr;
 
         if (parsed.normalized_path != "/") {
@@ -1981,6 +2038,8 @@ class LhmNamespace {
         if (parsed.components.empty() || parsed.hashes.empty()) {
             return false;
         }
+
+        if(shared_snapshot_) return shared_lookup(parsed,out);
 
         ParsedPath parent = parsed;
         parent.normalized_path = parent_path(parsed.normalized_path);

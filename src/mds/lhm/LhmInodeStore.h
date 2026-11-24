@@ -20,6 +20,7 @@ public:
     bool Lookup(const std::string& path, zb::rpc::InodeAttr* attr, std::string* error = nullptr) const;
     bool PutInode(const zb::rpc::InodeAttr& attr);
     bool Sync();
+    bool Checkpoint(std::string* error, bool* busy = nullptr);
     uint64_t pending() const;
     static void DecodeAttributes(const zb_lhm_full_inode&, zb::rpc::InodeAttr*);
 private:

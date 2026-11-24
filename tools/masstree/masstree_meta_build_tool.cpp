@@ -3,14 +3,19 @@
 #include "mds/storage/RocksMetaStore.h"
 
 #include <iostream>
+#include <iomanip>
+#include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
+#include <rocksdb/iterator.h>
 
 namespace {
 
 void PrintUsage() {
     std::cerr
         << "Usage:\n"
+        << "  masstree_meta_build_tool --db_path=<path> --inspect\n"
         << "  masstree_meta_build_tool --db_path=<path> --masstree_root=<dir>"
            " --namespace_id=<id> --generation_id=<id> --path_prefix=<prefix>"
            " --template_id=<id> [--template_mode=<mode>] [--inode_start=<id>] [--verify_inode_samples=<n>]"
@@ -65,6 +70,63 @@ bool ParseU32(const std::string& value, uint32_t* out) {
     }
 }
 
+std::string JsonString(const std::string& value) {
+    std::ostringstream out;
+    out << '"';
+    for (unsigned char c : value) {
+        if (c == '"' || c == '\\') out << '\\' << c;
+        else if (c < 32) out << "\\u" << std::hex << std::setw(4) << std::setfill('0') << unsigned(c);
+        else out << c;
+    }
+    out << '"';
+    return out.str();
+}
+
+std::string Cursor(const zb::mds::MasstreeOpticalClusterCursor& c) {
+    return std::to_string(c.node_index) + "," + std::to_string(c.disk_index) + "," +
+           std::to_string(c.image_index_in_disk) + "," + std::to_string(c.image_used_bytes);
+}
+
+// Offline inspection takes the same RocksDB lock as import. It also includes
+// statistics without a published route, so a controller can detect a crash
+// between statistics commit and generation publication instead of replaying it.
+bool Inspect(zb::mds::RocksMetaStore* store, std::string* error) {
+    zb::mds::MasstreeStatsStore stats_store(store);
+    zb::mds::MasstreeClusterStatsRecord stats;
+    zb::mds::MasstreeNamespaceCatalog catalog(store);
+    std::vector<zb::mds::MasstreeNamespaceRoute> routes;
+    if (!stats_store.LoadClusterStats(&stats, error) || !catalog.ListRoutes(&routes, error)) return false;
+    std::ostringstream out;
+    out << "{\"optical_layout_version\":" << stats.optical_layout_version
+        << ",\"file_count\":" << stats.total_file_count
+        << ",\"total_file_bytes\":" << JsonString(stats.total_file_bytes)
+        << ",\"total_metadata_bytes\":" << JsonString(stats.total_metadata_bytes)
+        << ",\"cursor\":" << JsonString(Cursor(stats.cursor)) << ",\"routes\":[";
+    bool first = true;
+    for (const auto& r : routes) {
+        if (!first) out << ',';
+        first = false;
+        out << "{\"namespace_id\":" << JsonString(r.namespace_id)
+            << ",\"generation_id\":" << JsonString(r.generation_id)
+            << ",\"path_prefix\":" << JsonString(r.path_prefix)
+            << ",\"manifest_path\":" << JsonString(r.manifest_path)
+            << ",\"inode_min\":" << r.inode_min << ",\"inode_max\":" << r.inode_max << '}';
+    }
+    out << "],\"namespace_stats\":{";
+    first = true;
+    const std::string prefix = "MTS/namespace/";
+    std::unique_ptr<rocksdb::Iterator> it(store->db()->NewIterator(rocksdb::ReadOptions()));
+    for (it->Seek(prefix); it->Valid() && it->key().starts_with(prefix); it->Next()) {
+        if (!first) out << ',';
+        first = false;
+        out << JsonString(it->key().ToString()) << ':' << JsonString(it->value().ToString());
+    }
+    if (!it->status().ok()) { *error = it->status().ToString(); return false; }
+    out << "}}\n";
+    std::cout << out.str();
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -81,8 +143,9 @@ int main(int argc, char* argv[]) {
     const std::string path_prefix = GetArg(args, "path_prefix");
     const std::string template_id = GetArg(args, "template_id");
     const std::string template_mode = GetArg(args, "template_mode");
-    if (db_path.empty() || masstree_root.empty() || namespace_id.empty() ||
-        generation_id.empty() || path_prefix.empty() || template_id.empty()) {
+    const bool inspect = args.find("inspect") != args.end();
+    if (db_path.empty() || (!inspect && (masstree_root.empty() || namespace_id.empty() ||
+        generation_id.empty() || path_prefix.empty() || template_id.empty()))) {
         PrintUsage();
         return 1;
     }
@@ -92,6 +155,11 @@ int main(int argc, char* argv[]) {
     if (!store.Open(db_path, &error)) {
         std::cerr << "failed to open db: " << error << "\n";
         return 1;
+    }
+
+    if (inspect) {
+        if (!Inspect(&store, &error)) { std::cerr << "inspect failed: " << error << '\n'; return 1; }
+        return 0;
     }
 
     zb::mds::MasstreeNamespaceCatalog catalog(&store);

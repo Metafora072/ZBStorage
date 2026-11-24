@@ -12,6 +12,7 @@ int zb_lhm_scan_begin(zb_lhm_context* ctx, const char* path, int files_only,
                       uint32_t work_budget, zb_lhm_scan** out) {
     if (out) *out = nullptr;
     return checked(ctx, [=](threadinfo& ti) -> int {
+        if(ctx->ns.shared_readonly()) return ZB_LHM_INVALID; // v6 first release supports Lookup/Getattr/Readdir
         std::string normalized;
         if (!out || !work_budget || (files_only != 0 && files_only != 1)
             || !parse_service_path(path, normalized)) return ZB_LHM_INVALID;

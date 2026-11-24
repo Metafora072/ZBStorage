@@ -61,6 +61,7 @@ void PrintUsage() {
         << " --inode_start=<u64>"
         << " [--source_mode=synthetic|path_list]"
         << " [--path_list_file=<path>]"
+        << " [--summarize=1 (path_list preflight; no output files)]"
         << " [--repeat_dir_prefix=<prefix>]"
         << " [--path_list_leaf_nodes_are_files=true|false]"
         << " [--file_count=<u64>]"
@@ -72,9 +73,15 @@ void PrintUsage() {
 
 int main(int argc, char** argv) {
     zb::mds::MasstreeBulkMetaGenerator::Request request;
+    bool summarize = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (const std::string value = GetFlagValue(arg, "output_root"); !value.empty()) {
+        if (const std::string value = GetFlagValue(arg, "summarize"); !value.empty()) {
+            if (!ParseBool(value, &summarize)) {
+                std::cerr << "invalid --summarize\n";
+                return 1;
+            }
+        } else if (const std::string value = GetFlagValue(arg, "output_root"); !value.empty()) {
             request.output_root = value;
         } else if (const std::string value = GetFlagValue(arg, "namespace_id"); !value.empty()) {
             request.namespace_id = value;
@@ -121,6 +128,29 @@ int main(int argc, char** argv) {
             PrintUsage();
             return 1;
         }
+    }
+
+    if (summarize) {
+        zb::mds::MasstreeBulkMetaGenerator generator;
+        zb::mds::MasstreeBulkMetaGenerator::PathListSummary summary;
+        std::string error;
+        if (request.source_mode != "path_list" ||
+            !generator.SummarizePathList(request, &summary, &error)) {
+            std::cerr << "path_list summary failed: " << error << "\n";
+            return 1;
+        }
+        std::cout << "actual_file_count=" << summary.actual_file_count << "\n"
+                  << "inode_count=" << summary.inode_count << "\n"
+                  << "dentry_count=" << summary.dentry_count << "\n"
+                  << "base_file_count=" << summary.base_file_count << "\n"
+                  << "base_dir_count=" << summary.base_dir_count << "\n"
+                  << "dir_count=" << summary.dir_count << "\n"
+                  << "repeat_count=" << summary.repeat_count << "\n"
+                  << "base_max_depth=" << summary.base_max_depth << "\n"
+                  << "max_depth=" << summary.max_depth << "\n"
+                  << "fingerprint=" << summary.fingerprint << "\n"
+                  << "repeat_dir_prefix=" << summary.repeat_dir_prefix << "\n";
+        return 0;
     }
 
     if (request.output_root.empty() || request.namespace_id.empty() || request.generation_id.empty() ||

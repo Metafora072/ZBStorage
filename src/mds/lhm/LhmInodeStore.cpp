@@ -155,5 +155,12 @@ bool LhmInodeStore::PutInode(const zb::rpc::InodeAttr& attr) {
     return Encode(attr,&raw) && zb_lhm_update_full(context_.get(),&raw);
 }
 bool LhmInodeStore::Sync() { return zb_lhm_sync(context_.get()); }
+bool LhmInodeStore::Checkpoint(std::string* error,bool* busy) {
+    char message[1024]{};
+    const int rc=zb_lhm_checkpoint(context_.get(),message,sizeof(message));
+    if(error) *error=message;
+    if(busy) *busy=rc==ZB_LHM_BUSY;
+    return rc==ZB_LHM_OK;
+}
 uint64_t LhmInodeStore::pending() const { return zb_lhm_pending(context_.get()); }
 } // namespace zb::mds

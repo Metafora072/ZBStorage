@@ -101,6 +101,40 @@ class DirectoryBlockStore {
         uint64_t max_split_moved = 0;
     };
 
+    // Pure encoder for offline templates: no allocation, IO, cache or runtime
+    // index mutation. Emit the same records and sorted tail index as append.
+    static bool build_unallocated_file_bucket(const std::vector<entry>& entries,
+                                               directory_block_image& image) {
+        image = {};
+        uint64_t needed = 0;
+        for (const auto& item : entries) {
+            if (item.kind != dentry_kind::file || item.name.empty() || item.name.size() > 64)
+                return false;
+            needed += ((sizeof(dentry_entry_header) + sizeof(file_ref_payload) + item.name.size() + 7) & ~size_t(7))
+                + sizeof(dentry_index_entry);
+        }
+        if (needed > kDirectoryBlockPayloadBytes) return false;
+        std::vector<dentry_index_entry> indexes; indexes.reserve(entries.size());
+        for (const auto& item : entries) {
+            const uint16_t offset = image.header.used_bytes;
+            dentry_entry_header h{};
+            h.component_hash = item.component_hash;
+            h.record_bytes = (sizeof(h) + sizeof(file_ref_payload) + item.name.size() + 7) & ~size_t(7);
+            h.kind = uint8_t(dentry_kind::file); h.name_length = item.name.size(); h.ref_bytes = sizeof(file_ref_payload);
+            std::memcpy(image.payload + offset, &h, sizeof(h));
+            file_ref_payload ref{}; ref.inode_block_id = item.file_ref.block_id; ref.inode_slot = item.file_ref.offset;
+            std::memcpy(image.payload + offset + sizeof(h), &ref, sizeof(ref));
+            std::memcpy(image.payload + offset + sizeof(h) + sizeof(ref), item.name.data(), item.name.size());
+            dentry_index_entry index{}; index.component_hash = item.component_hash; index.entry_offset = offset;
+            indexes.push_back(index); image.header.used_bytes += h.record_bytes;
+        }
+        std::sort(indexes.begin(), indexes.end(), [](const auto& a, const auto& b) {
+            return a.component_hash < b.component_hash;
+        });
+        image.header.entry_count = entries.size(); image.header.base_version = entries.size();
+        return store_indexes(image, indexes);
+    }
+
     struct stats_snapshot {
         uint64_t block_reads = 0;
         uint64_t block_writes = 0;
@@ -226,6 +260,44 @@ class DirectoryBlockStore {
         file_index_state* state = file_index_by_id(file_index_id);
         return state != nullptr
             && lookup_bucket_directory(*state, component_hash, std::string(), out);
+    }
+
+    // Plans retain relative bucket IDs. Only the selected bucket address is
+    // relocated; never copy a per-directory index for each instance/query.
+    bool lookup_shared(const file_index_state& state,uint64_t base,uint64_t hash,
+                       const std::string& name,entry& out) {
+        ++stats_.lookups; uint32_t slot=0;
+        if(!bucket_for_hash(state,hash,slot)) return false;
+        const auto* meta=bucket_by_id(state,slot);
+        if(!meta || !base || meta->block_id>kMaxLogicalBlock-base+1) {
+            read_failed_=true; return false;
+        }
+        directory_block_image image{};
+        if(!read_block(base+meta->block_id-1,image)) return false;
+        ++stats_.file_index_bucket_reads;
+        stats_.file_index_max_bucket_reads_per_lookup=std::max<uint64_t>(stats_.file_index_max_bucket_reads_per_lookup,1);
+        dentry_index_entry index{};
+        return find_entry_in_image(image,hash,name,index,out);
+    }
+    bool read_shared_entries(const file_index_state& state,uint64_t base,std::vector<entry>& out) {
+        out.clear();
+        for(const auto& meta:state.directory.buckets) {
+            directory_block_image image{};
+            if(!base || meta.block_id>kMaxLogicalBlock-base+1 || !read_block(base+meta.block_id-1,image)) return false;
+            if(image.header.used_bytes>sizeof(image.payload)) return false;
+            uint32_t offset=0;
+            while(offset<image.header.used_bytes) {
+                if(image.header.used_bytes-offset<sizeof(dentry_entry_header)) return false;
+                dentry_entry_header header{}; std::memcpy(&header,image.payload+offset,sizeof(header));
+                if(header.record_bytes<sizeof(header) || header.record_bytes>image.header.used_bytes-offset) return false;
+                if(!(header.flags&kDentryFlagDeleted)) {
+                    entry item; if(!decode_entry_at(image,offset,item) || item.kind!=dentry_kind::file) return false;
+                    out.push_back(std::move(item));
+                }
+                offset+=header.record_bytes;
+            }
+        }
+        return out.size()==state.directory.entry_count;
     }
 
     bool read_entries(uint64_t file_index_id, std::vector<entry>& out) {

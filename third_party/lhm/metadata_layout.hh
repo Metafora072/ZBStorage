@@ -18,6 +18,9 @@ static constexpr uint32_t kMetadataBlockBytes = 16 * 1024;
 static constexpr uint32_t kDirectoryBufferBytes = 16 * 1024;
 static constexpr uint32_t kCommonBlockHeaderBytes = 64;
 static constexpr uint32_t kInodeBytes = 256;
+// File-address layout only; the native 16 KiB page and inode codecs stay v2.
+static constexpr uint32_t kSuperblockFlagSplitFiles = 1u << 0;
+static constexpr uint32_t kSuperblockFlagSegmentedFiles = 1u << 1;
 
 enum class metadata_block_type : uint16_t {
     invalid = 0,
@@ -53,7 +56,9 @@ struct superblock_payload {
     uint64_t fs_uuid_hi;                // 文件系统 UUID 高 64 位
     uint64_t fs_uuid_lo;                // 文件系统 UUID 低 64 位
     uint32_t flags;                     // superblock 标记位
-    uint8_t reserved[28];               // 预留扩展字段，补齐到 64B
+    uint32_t segment_layout_version;    // 1: fixed-size segments, logical IDs unchanged
+    uint64_t segment_bytes;             // persisted once when creating this database
+    uint8_t reserved[16];               // 预留扩展字段，补齐到 64B
 };
 static_assert(sizeof(superblock_payload) == 64, "superblock payload must be 64B");
 

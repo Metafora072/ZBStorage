@@ -8,6 +8,7 @@ import json
 import pathlib
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
 
@@ -17,6 +18,8 @@ def main():
     p.add_argument('--build', type=pathlib.Path, required=True)
     p.add_argument('--work-dir', type=pathlib.Path, required=True)
     p.add_argument('--manifest', type=pathlib.Path, required=True)
+    p.add_argument('--batch-runner', type=pathlib.Path,
+                   help='also exercise offline batch import between MDS shutdown and reopen')
     args = p.parse_args()
     work = args.work_dir.resolve()
     work.mkdir(parents=True, exist_ok=False)
@@ -84,6 +87,14 @@ def main():
     def reopen():
         attr = rpc('Getattr', {'inode_id': saved['inode_id']})['attr']
         assert attr == saved
+        if args.batch_runner:
+            ids = set()
+            for index in (1, 2):
+                item = rpc('Lookup', {'path': f'/offline-{index:06d}/d0/f599'})['attr']
+                assert int(item['size']) == 1599 and int(item['uid']) == 42
+                assert item['inode_id'] != saved['inode_id']
+                ids.add(item['inode_id'])
+            assert len(ids) == 2
         rpc('ImportNamespace', {'target_path': '/second',
             'manifest_path': str(args.manifest.resolve()), 'memory_budget_bytes': str(1 << 20)})
         new = rpc('Lookup', {'path': '/second/d0/f599'})['attr']
@@ -93,6 +104,15 @@ def main():
         rpc('Rename', {'old_path': '/first', 'new_path': '/moved'})
 
     serve('create', create)
+    if args.batch_runner:
+        command = [sys.executable, str(args.batch_runner.resolve()), 'import',
+                   '--store', str(work / 'namespace.meta'), '--manifest', str(args.manifest.resolve()),
+                   '--library', str(args.build.resolve() / 'src/mds/lhm/libzb_lhm_bridge.so'),
+                   '--prefix', '/offline', '--copies', '2', '--expected-files', '600']
+        subprocess.run(command, check=True, timeout=60)
+        # Repeating the entire invocation must use the checkpoint receipt to skip
+        # completed batches before handing the same store/control DB back to MDS.
+        subprocess.run(command, check=True, timeout=60)
     serve('reopen', reopen)
     (work / 'rpc.json').write_text(json.dumps(evidence, ensure_ascii=False, indent=2))
     print('PASS: real MDS streaming RPC, normal close, matching-control reopen, stable attributes/IDs, append, paging and rename')

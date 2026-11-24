@@ -36,20 +36,28 @@ IMPORT_LOG="${LOG_DIR}/import_masstree_${NAMESPACE_COUNT}ns_$(date '+%Y%m%d_%H%M
 STATUS=0
 
 cleanup() {
+  local exit_status="$1"
   local stop_status=0
+  trap - EXIT
   log "[INFO] stopping demo stack"
-  if ! RUN_DIR="${RUN_DIR}" BUILD_DIR="${BUILD_DIR}" bash "${ROOT_DIR}/scripts/start_demo_stack.sh" stop; then
+  if RUN_DIR="${RUN_DIR}" BUILD_DIR="${BUILD_DIR}" bash "${ROOT_DIR}/scripts/start_demo_stack.sh" stop; then
+    :
+  else
     stop_status=$?
     log "[WARN] failed to stop demo stack cleanly (status=${stop_status})"
+    if [[ "${exit_status}" -eq 0 ]]; then
+      exit_status="${stop_status}"
+    fi
   fi
-  if [[ "${STATUS}" -ne 0 ]]; then
+  if [[ "${exit_status}" -ne 0 ]]; then
     log "[ERROR] one-click import failed, see log: ${IMPORT_LOG}"
   else
     log "[OK] one-click import completed, see log: ${IMPORT_LOG}"
   fi
+  exit "${exit_status}"
 }
 
-trap cleanup EXIT
+trap 'cleanup "$?"' EXIT
 
 log "[INFO] run_dir=${RUN_DIR}"
 log "[INFO] build_dir=${BUILD_DIR}"
@@ -86,19 +94,21 @@ if [[ -n "${PATH_LIST_FILE}" ]]; then
      "${TEMPLATE_ID}" "${PATH_LIST_FILE}" "${REPEAT_DIR_PREFIX}" "${LEAF_NODES_ARE_FILES}" | tee "${IMPORT_LOG}"; then
     :
   else
-    STATUS=${PIPESTATUS[0]:-1}
+    STATUS=$?
     exit "${STATUS}"
   fi
 fi
 
 log "[INFO] importing ${NAMESPACE_COUNT} namespaces (~${NAMESPACE_COUNT} * 1e8 files)"
-if ! RUN_DIR="${RUN_DIR}" \
+if RUN_DIR="${RUN_DIR}" \
      BUILD_DIR="${BUILD_DIR}" \
      MOUNT_POINT="${RUN_DIR}/mnt" \
      NAMESPACE_PREFIX="${NAMESPACE_PREFIX}" \
      MASSTREE_TEMPLATE_ID="${TEMPLATE_ID}" \
      MASSTREE_TEMPLATE_MODE="${TEMPLATE_MODE}" \
      bash "${ROOT_DIR}/scripts/import_masstree_demo.sh" "${NAMESPACE_COUNT}" | tee -a "${IMPORT_LOG}"; then
+  :
+else
   STATUS=$?
   exit "${STATUS}"
 fi

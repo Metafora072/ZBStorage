@@ -1,6 +1,40 @@
 #include <charconv>
 #include <set>
+#include <openssl/evp.h>
+#include <array>
 namespace {
+// Hash buffered source bytes, rather than reconstructed TSV fields. This also
+// covers line endings and a final record without a newline. The ordinary RPC
+// path does not instantiate this buffer.
+class ManifestDigestBuffer final : public std::streambuf {
+    std::streambuf* source_;
+    std::array<char, 64*1024> buffer_{};
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> digest_{EVP_MD_CTX_new(), EVP_MD_CTX_free};
+protected:
+    int_type underflow() override {
+        if(gptr() && gptr()<egptr()) return traits_type::to_int_type(*gptr());
+        const auto n=source_->sgetn(buffer_.data(),buffer_.size());
+        if(n==0) return traits_type::eof();
+        if(EVP_DigestUpdate(digest_.get(),buffer_.data(),static_cast<size_t>(n))!=1)
+            throw std::runtime_error("manifest digest update failed");
+        setg(buffer_.data(),buffer_.data(),buffer_.data()+n);
+        return traits_type::to_int_type(*gptr());
+    }
+public:
+    explicit ManifestDigestBuffer(std::streambuf* source):source_(source) {
+        if(!digest_ || EVP_DigestInit_ex(digest_.get(),EVP_sha256(),nullptr)!=1)
+            throw std::runtime_error("manifest digest initialization failed");
+    }
+    std::string finish() {
+        unsigned char bytes[EVP_MAX_MD_SIZE]; unsigned n=0;
+        if(EVP_DigestFinal_ex(digest_.get(),bytes,&n)!=1 || n!=32)
+            throw std::runtime_error("manifest digest finalization failed");
+        constexpr char hex[]="0123456789abcdef";
+        std::string result; result.reserve(64);
+        for(unsigned i=0;i<n;++i) { result+=hex[bytes[i]>>4]; result+=hex[bytes[i]&15]; }
+        return result;
+    }
+};
 uint64_t ParseNumber(const std::string& s) {
     uint64_t n=0; auto r=std::from_chars(s.data(),s.data()+s.size(),n);
     if(s.empty() || r.ec!=std::errc() || r.ptr!=s.data()+s.size())
@@ -43,6 +77,8 @@ extern "C" int zb_lhm_import_manifest(zb_lhm_context* ctx,const char* target,con
         Error(error,size,"context, target, manifest, result and at least 1 MiB budget required"); return ZB_LHM_INVALID;
     }
     try { return worker().run([&](threadinfo& ti)->int {
+        if(!ContextUsable(ctx)) { Error(error,size,"LHM session failed; restart to recover"); return ZB_LHM_ERROR; }
+        if(ctx->ns.shared_readonly()) { Error(error,size,"shared-template namespace is read-only"); return ZB_LHM_READONLY; }
         uint64_t line_number=0;
         try {
             const size_t max_record=std::min<uint64_t>(budget/128,64*1024);
@@ -50,8 +86,11 @@ extern "C" int zb_lhm_import_manifest(zb_lhm_context* ctx,const char* target,con
             auto mount=MasstreeLHM::PathKey::parse_absolute_path(target);
             if(mount.normalized_path!=target || mount.components.empty() || target[0]!='/')
                 throw std::runtime_error("target must be a canonical non-root path");
-            std::ifstream input(manifest,std::ios::binary);
-            if(!input) throw std::runtime_error("cannot open manifest");
+            std::ifstream source(manifest,std::ios::binary);
+            if(!source) throw std::runtime_error("cannot open manifest");
+            std::unique_ptr<ManifestDigestBuffer> digest;
+            if(!ctx->batch_manifest_sha256.empty()) digest=std::make_unique<ManifestDigestBuffer>(source.rdbuf());
+            std::istream input(digest ? static_cast<std::streambuf*>(digest.get()) : source.rdbuf());
             // Up to 32 columns, each copied only a bounded number of times.
             std::string line;
             ++line_number;
@@ -93,14 +132,16 @@ extern "C" int zb_lhm_import_manifest(zb_lhm_context* ctx,const char* target,con
                 auto name=final.components.back(); attr.name_length=name.size(); std::memcpy(attr.file_name,name.data(),name.size());
                 if(!zb::mds::lhm_codec::Valid(attr)) throw std::runtime_error("invalid inode attributes");
                 uint64_t token=0,id=0;
+                if(ctx->runtime) ctx->dirty=true;
                 if(!ctx->ns.reserve_create(full,dir,token,id,ti)) throw std::runtime_error("create failed (duplicate target, missing parent or storage failure): "+full);
                 attr.inode_id=id; MasstreeLHM::inode_disk inode{};
                 bool ok=false;
                 try { ok=zb::mds::lhm_codec::Encode(attr,inode) && ctx->ns.commit_create(token,inode,ti); }
                 catch(...) { ctx->ns.cancel_create(token); throw; }
-                if(!ok) { ctx->ns.cancel_create(token); throw std::runtime_error("write/publish failed: "+full); }
+                if(!ok) { ctx->ns.cancel_create(token); FailRuntime(ctx); throw std::runtime_error("write/publish failed: "+full); }
                 if(!result->processed_records) result->root_inode_id=id;
                 ++result->processed_records; if(dir) ++result->directories; else ++result->files;
+                if(digest) MasstreeLHM::BatchFault("import_record");
                 // This is one long worker job. Advance RCU between completed
                 // records so deferred Masstree frees do not accumulate until EOF.
                 if((result->processed_records & 63)==0) {
@@ -108,7 +149,9 @@ extern "C" int zb_lhm_import_manifest(zb_lhm_context* ctx,const char* target,con
                 }
             }
             if(!result->processed_records) throw std::runtime_error("manifest has no root");
-            if(!ctx->ns.sync_persistence()) throw std::runtime_error("import data sync failed");
+            if(digest && digest->finish()!=ctx->batch_manifest_sha256)
+                throw std::runtime_error("manifest SHA256 differs from the batch identity");
+            if(!ctx->ns.sync_persistence()) { FailRuntime(ctx); throw std::runtime_error("import data sync failed"); }
             return ZB_LHM_OK;
         } catch(const std::exception& e) { result->error_line=line_number; Error(error,size,e.what()); return ZB_LHM_ERROR; }
     }); } catch(const std::exception& e) { Error(error,size,e.what()); return ZB_LHM_ERROR; }

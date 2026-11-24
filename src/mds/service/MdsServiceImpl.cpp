@@ -3079,7 +3079,7 @@ void MdsServiceImpl::CommitArchiveTask(google::protobuf::RpcController* cntl_bas
 
 bool MdsServiceImpl::EnsureRoot(std::string* error) {
     zb::rpc::InodeAttr root;
-    if (!unified_namespace_ && GetInode(kRootInodeId, &root, error)) {
+    if (GetInode(kRootInodeId, &root, error)) {
         return true;
     }
     if (error && !error->empty()) {

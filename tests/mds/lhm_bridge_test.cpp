@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
         };
         const uint64_t block = inode.inode_id >> 16;
         const uint64_t slot = (inode.inode_id & 0xffffULL);
-        check(stored_size((2*block-1)*16384 + 256 + slot*256 + 16) == 12345,
+        check(stored_size(block*16384 + 256 + slot*256 + 16) == 12345,
               "file ID does not match physical inode position");
         const uint64_t head = dir.inode_id & ~(uint64_t{1} << 63);
         disk.close(); disk.open(file+".heads", std::ios::binary);

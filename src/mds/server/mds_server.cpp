@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -30,6 +31,14 @@
 DEFINE_string(config, "", "Path to MDS config file");
 DEFINE_int32(port, 9000, "Port for MDS brpc server");
 DEFINE_int32(idle_timeout_sec, -1, "Idle timeout for connections");
+
+#ifdef ZB_HAS_LHM
+namespace {
+std::atomic<bool> lhm_checkpoint_requested{false};
+static_assert(std::atomic<bool>::is_always_lock_free, "signal flag must be lock-free");
+void RequestLhmCheckpoint(int) { lhm_checkpoint_requested.store(true,std::memory_order_relaxed); }
+}
+#endif
 
 int main(int argc, char* argv[]) {
     google::SetCommandLineOption("graceful_quit_on_sigterm", "true");
@@ -55,6 +64,13 @@ int main(int argc, char* argv[]) {
     }
 
     const bool unified = cfg.namespace_backend == "lhm";
+#ifdef ZB_HAS_LHM
+    if(unified) {
+        struct sigaction action{}; action.sa_handler=RequestLhmCheckpoint;
+        sigemptyset(&action.sa_mask);
+        if(sigaction(SIGUSR1,&action,nullptr)) { std::cerr<<"Cannot install LHM checkpoint signal"<<std::endl; return 1; }
+    }
+#endif
     std::unique_ptr<zb::mds::NamespaceStore> namespace_store;
     std::string backend_marker;
     const bool reopen_lhm=unified && cfg.lhm_store_mode=="reopen";
@@ -288,8 +304,35 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    std::thread checkpoint_thread;
+#ifdef ZB_HAS_LHM
+    if(unified) {
+        checkpoint_thread=std::thread([&] {
+            auto* lhm=static_cast<zb::mds::LhmNamespaceStore*>(namespace_store.get());
+            const auto interval=std::chrono::seconds(cfg.lhm_checkpoint_interval_seconds);
+            auto next=std::chrono::steady_clock::now()+interval;
+            bool retry=false;
+            while(!stop_sync.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if(stop_sync.load()) break;
+                const auto now=std::chrono::steady_clock::now();
+                const bool requested=lhm_checkpoint_requested.exchange(false,std::memory_order_relaxed);
+                if(!requested && !((retry || interval.count()) && now>=next)) continue;
+                std::string checkpoint_error; bool busy=false;
+                if(!lhm->Checkpoint(&checkpoint_error,&busy)) {
+                    if(busy) { retry=true; next=now+std::chrono::seconds(1); continue; }
+                    std::cerr<<"LHM checkpoint failed; stopping service for recovery: "<<checkpoint_error<<std::endl;
+                    brpc::AskToQuit(); break;
+                }
+                retry=false; next=std::chrono::steady_clock::now()+interval;
+                std::cerr<<"LHM checkpoint completed"<<std::endl;
+            }
+        });
+    }
+#endif
     server.RunUntilAskedToQuit();
     stop_sync.store(true);
+    if(checkpoint_thread.joinable()) checkpoint_thread.join();
     if (sync_thread.joinable()) {
         sync_thread.join();
     }

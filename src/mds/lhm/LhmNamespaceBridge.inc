@@ -1,8 +1,19 @@
 // Included by LhmBridge.cpp to share its private worker and native context.
 namespace {
-template<class F> int checked(zb_lhm_context* ctx, F f) {
+template<class F> int checked(zb_lhm_context* ctx, F f, bool mutation=false) {
     if (!ctx) return ZB_LHM_ERROR;
-    try { return worker().run(f); } catch (const std::invalid_argument&) { return ZB_LHM_INVALID; } catch (...) { return ZB_LHM_ERROR; }
+    try { return worker().run([&](threadinfo& ti) -> int {
+        if(!ContextUsable(ctx)) return ZB_LHM_ERROR;
+        if(mutation && ctx->ns.shared_readonly()) return ZB_LHM_READONLY;
+        try {
+            const int rc=f(ti);
+            if(ctx->runtime && mutation) {
+                if(rc==ZB_LHM_OK || rc==ZB_LHM_ERROR) ctx->dirty=true;
+            }
+            return ContextUsable(ctx)?rc:ZB_LHM_ERROR;
+        } catch(const std::invalid_argument&) { throw; }
+        catch(...) { if(mutation) FailRuntime(ctx); throw; }
+    }); } catch (const std::invalid_argument&) { return ZB_LHM_INVALID; } catch (...) { return ZB_LHM_ERROR; }
 }
 bool parse_service_path(const char* path, std::string& out) {
     if (!path || path[0] != '/') return false;
@@ -75,7 +86,7 @@ int zb_lhm_reserve_checked(zb_lhm_context* ctx, const char* path, uint8_t type,
         rc=parent_checked(ctx,normalized,ti);
         if (rc!=ZB_LHM_OK) return rc;
         return ctx->ns.reserve_create(normalized,type==2,*token,*id,ti) ? ZB_LHM_OK : ZB_LHM_ERROR;
-    });
+    },true);
 }
 int zb_lhm_commit_checked(zb_lhm_context* ctx,uint64_t token,const zb_lhm_full_inode* attr) {
     return checked(ctx,[=](threadinfo& ti) -> int {
@@ -91,7 +102,7 @@ int zb_lhm_commit_checked(zb_lhm_context* ctx,uint64_t token,const zb_lhm_full_i
         MasstreeLHM::inode_disk inode{};
         if (!zb::mds::lhm_codec::Encode(*attr,inode)) return ZB_LHM_INVALID;
         return ctx->ns.commit_create(token,inode,ti) ? ZB_LHM_OK : ZB_LHM_ERROR;
-    });
+    },true);
 }
 int zb_lhm_rename_checked(zb_lhm_context* ctx,const char* from,const char* to) {
     return checked(ctx,[=](threadinfo& ti) -> int {
@@ -117,7 +128,7 @@ int zb_lhm_rename_checked(zb_lhm_context* ctx,const char* from,const char* to) {
         // Restore application timestamps/version and update the full-attribute name.
         // Structural refs/generation from the native rename remain intact.
         return ctx->ns.replace_inode_attributes(attr.inode_id,encoded) ? ZB_LHM_OK : ZB_LHM_ERROR;
-    });
+    },true);
 }
 int zb_lhm_remove_checked(zb_lhm_context* ctx,const char* path,uint8_t type) {
     return checked(ctx,[=](threadinfo& ti) -> int {
@@ -133,7 +144,7 @@ int zb_lhm_remove_checked(zb_lhm_context* ctx,const char* path,uint8_t type) {
             if (!entries.empty()) return ZB_LHM_NOT_EMPTY;
         }
         return ctx->ns.remove_path(normalized,ti) ? ZB_LHM_OK : ZB_LHM_ERROR;
-    });
+    },true);
 }
 int zb_lhm_readdir_checked(zb_lhm_context* ctx,const char* path,const char* after,
                           uint32_t limit,zb_lhm_entry_callback callback,void* opaque,int* more) {
@@ -165,4 +176,12 @@ int zb_lhm_readdir_checked(zb_lhm_context* ctx,const char* path,const char* afte
         return ZB_LHM_OK;
     });
 }
+}
+
+extern "C" int zb_lhm_shared_index_stats(zb_lhm_context* ctx,uint64_t* templates,uint64_t* instances,uint64_t* routes) {
+    return checked(ctx,[&](threadinfo&) -> int {
+        if(!templates || !instances || !routes) return ZB_LHM_INVALID;
+        *templates=ctx->ns.shared_template_count(); *instances=ctx->ns.shared_instance_count();
+        *routes=ctx->ns.shared_route_count(); return ZB_LHM_OK;
+    });
 }

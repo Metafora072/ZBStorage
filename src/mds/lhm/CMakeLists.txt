@@ -8,6 +8,7 @@ add_library(zb_lhm_bridge SHARED LhmBridge.cpp
     ${ZB_LHM_SOURCE_DIR}/kvthread.cc
     ${ZB_LHM_SOURCE_DIR}/memdebug.cc
     ${ZB_LHM_SOURCE_DIR}/persistent_store.cc
+    ${ZB_LHM_SOURCE_DIR}/batch_undo.cc
     ${ZB_LHM_SOURCE_DIR}/str.cc
     ${ZB_LHM_SOURCE_DIR}/straccum.cc
     ${ZB_LHM_SOURCE_DIR}/string.cc
@@ -15,7 +16,8 @@ add_library(zb_lhm_bridge SHARED LhmBridge.cpp
 target_compile_features(zb_lhm_bridge PRIVATE cxx_std_17)
 target_compile_options(zb_lhm_bridge PRIVATE -include ${ZB_LHM_SOURCE_DIR}/config.h)
 target_include_directories(zb_lhm_bridge PRIVATE ${ZB_LHM_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(zb_lhm_bridge PRIVATE Threads::Threads)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+target_link_libraries(zb_lhm_bridge PRIVATE Threads::Threads OpenSSL::Crypto)
 # Localize even template/runtime symbols; only the plain C bridge is exported.
 target_link_options(zb_lhm_bridge PRIVATE
     "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports.map" "LINKER:-Bsymbolic" "LINKER:-z,defs")

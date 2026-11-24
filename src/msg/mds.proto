@@ -14,6 +14,7 @@ enum MdsStatusCode {
   MDS_NOT_EMPTY = 4;
   MDS_INTERNAL_ERROR = 5;
   MDS_STALE_EPOCH = 6;
+  MDS_UNAVAILABLE = 7;
 }
 
 message MdsStatus {
@@ -296,20 +297,24 @@ message PathPlacementPolicyRecord {
 
 message LookupRequest {
   string path = 1;
+  string database_id = 2; // Required in lhm_multi_readonly mode; empty for single-db MDS.
 }
 
 message LookupReply {
   MdsStatus status = 1;
   InodeAttr attr = 2;
+  string database_id = 3;
 }
 
 message GetattrRequest {
   uint64 inode_id = 1;
+  string database_id = 2; // inode_id is local to this database.
 }
 
 message GetattrReply {
   MdsStatus status = 1;
   InodeAttr attr = 2;
+  string database_id = 3;
 }
 
 message OpenRequest {
@@ -361,6 +366,7 @@ message ReaddirRequest {
   string path = 1;
   uint32 limit = 2;
   string start_after = 3;
+  string database_id = 4;
 }
 
 message ReaddirReply {
@@ -368,6 +374,25 @@ message ReaddirReply {
   repeated Dentry entries = 2;
   bool has_more = 3;
   string next_token = 4;
+  string database_id = 5;
+}
+
+message ListDatabasesRequest {}
+message DatabaseQueryStatus {
+  string database_id = 1;
+  bool available = 2;
+  string error = 3;
+  uint64 template_count = 4;
+  uint64 instance_count = 5;
+}
+message ListDatabasesReply {
+  MdsStatus status = 1;
+  repeated DatabaseQueryStatus databases = 2;
+  uint64 cached_templates = 3;
+  uint64 cached_directory_routes = 4;
+  uint64 template_references = 5;
+  uint64 template_loads = 6;
+  uint64 template_cache_hits = 7;
 }
 
 message RenameRequest {
@@ -827,6 +852,7 @@ message ImportNamespaceReply {
 }
 
 service MdsService {
+  rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesReply);
   rpc ImportNamespace(ImportNamespaceRequest) returns (ImportNamespaceReply);
   rpc AllocateAvailableImageId(AllocateAvailableImageIdRequest) returns (AllocateAvailableImageIdReply);
   rpc AllocateAvailableDiscId(AllocateAvailableDiscIdRequest) returns (AllocateAvailableDiscIdReply);

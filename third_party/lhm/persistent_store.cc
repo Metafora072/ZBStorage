@@ -237,12 +237,13 @@ void PersistentStore::SaveAllocation(SnapshotWriter& out) const {
     out.u64(sequence_); out.u64(next_inode_ticket_.load());
     out.u64(highest_initialized_inode_block_.load()); out.u64(next_head_);
 }
-void PersistentStore::LoadAllocation(SnapshotReader& in) {
+void PersistentStore::LoadAllocation(SnapshotReader& in, bool portable_readonly) {
     const auto layout=ReadSegmentLayout(in);
     if(layout.segment_bytes!=segment_bytes_) throw std::runtime_error("snapshot segment size differs from superblock");
-    ValidateSegmentFiles(path_,layout);
+    ValidateSegmentFiles(path_,layout,false,!portable_readonly);
     const auto actual=CurrentSegmentLayout();
-    if(!(layout==actual)) throw std::runtime_error("snapshot segment inventory differs from store");
+    if(portable_readonly ? !SameSegmentGeometry(layout,actual) : !(layout==actual))
+        throw std::runtime_error("snapshot segment inventory differs from store");
     auto blocks=in.u64(), dirs=in.u64(); auto seq=in.u64(), tickets=in.u64(), high=in.u64(), heads=in.u64();
     if (!blocks || !dirs || !seq || !tickets || !high || dirs>(kMaxLogicalBlock+1) ||
         high>kMaxLogicalBlock || tickets>uint64_t(kMaxLogicalBlock)*kInodesPerBlock ||

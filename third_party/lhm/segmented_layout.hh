@@ -43,6 +43,18 @@ inline bool operator==(const SegmentLayout& a, const SegmentLayout& b) {
     return a.segment_bytes == b.segment_bytes && a.logical_bytes == b.logical_bytes &&
            a.segments == b.segments;
 }
+// Portable read-only opens compare persisted addresses and lengths, not the
+// host's device numbers or the filesystem inodes assigned during a copy.
+// Keep operator== strict: undo and append use it to protect physical files.
+inline bool SameSegmentGeometry(const SegmentLayout& a, const SegmentLayout& b) {
+    if(a.segment_bytes!=b.segment_bytes || a.logical_bytes!=b.logical_bytes ||
+       a.segments.size()!=b.segments.size()) return false;
+    for(size_t i=0;i<a.segments.size();++i) {
+        const auto& x=a.segments[i]; const auto& y=b.segments[i];
+        if(x.kind!=y.kind || x.index!=y.index || x.bytes!=y.bytes) return false;
+    }
+    return true;
+}
 inline bool ValidSegmentBytes(uint64_t bytes) {
     return bytes >= (uint64_t{1} << 16) && bytes <= kMaxSegmentBytes &&
            (bytes & (bytes - 1)) == 0;
@@ -138,12 +150,15 @@ inline SegmentLayout ScanSegmentLayout(const std::string& store, uint64_t segmen
     ValidateSegmentLayout(layout);
     return layout;
 }
-inline void ValidateSegmentFiles(const std::string& store, const SegmentLayout& layout, bool allow_growth = false) {
+inline void ValidateSegmentFiles(const std::string& store, const SegmentLayout& layout,
+                                 bool allow_growth = false, bool require_identity = true) {
     ValidateSegmentLayout(layout);
+    std::set<std::pair<uint64_t,uint64_t>> actual_identities;
     for (const auto& expected : layout.segments) {
         const auto path = SegmentPath(store, unsigned(expected.kind), expected.index);
         const auto actual = StatSegment(path, unsigned(expected.kind), expected.index);
-        if (actual.dev != expected.dev || actual.ino != expected.ino || actual.bytes > layout.segment_bytes ||
+        if ((require_identity && (actual.dev != expected.dev || actual.ino != expected.ino)) ||
+            !actual_identities.emplace(actual.dev,actual.ino).second || actual.bytes > layout.segment_bytes ||
             (allow_growth ? actual.bytes < expected.bytes : actual.bytes != expected.bytes))
             throw std::runtime_error("segment/checkpoint identity or length mismatch: " + path);
     }

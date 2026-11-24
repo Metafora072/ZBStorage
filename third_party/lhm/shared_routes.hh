@@ -4,6 +4,9 @@
 #include "incremental_checkpoint.hh"
 #include <numeric>
 #include <sstream>
+#include <map>
+#include <memory>
+#include <mutex>
 namespace MasstreeLHM {
 constexpr uint64_t kSharedRouteMagic=0x315254534d484cULL;
 struct SharedRoutes {
@@ -74,6 +77,58 @@ struct SharedRoutes {
         }
         if(in.checksum()!=identity.checksum) throw std::runtime_error("shared route checksum differs from checkpoint");
         in.finish(); validate(info);
+    }
+};
+// Process-local immutable routes. Weak ownership releases memory when the last
+// namespace closes; each database keeps its own on-disk index and mappings.
+class SharedRouteCache {
+    std::mutex mutex_;
+    std::map<std::string,std::weak_ptr<const SharedRoutes>> entries_;
+    uint64_t loads_=0, hits_=0;
+    static void VerifyContents(const std::string& file,const IndexFile& identity) {
+        if(identity.bytes<8 || identity.bytes%8) throw std::runtime_error("invalid shared index length");
+        std::ifstream input(file,std::ios::binary);
+        std::array<char,65536> buffer{};
+        uint64_t remaining=identity.bytes-8,hash=14695981039346656037ULL;
+        while(remaining) {
+            const auto n=std::min<uint64_t>(remaining,buffer.size());
+            if(!input.read(buffer.data(),n)) throw std::runtime_error("truncated shared index");
+            for(size_t i=0;i<n;++i) hash=(hash^uint8_t(buffer[i]))*1099511628211ULL;
+            remaining-=n;
+        }
+        uint64_t trailer=0;
+        for(unsigned i=0;i<8;++i) {const int c=input.get();
+            if(c==EOF) throw std::runtime_error("truncated shared index checksum");
+            trailer|=uint64_t(uint8_t(c))<<(i*8);}
+        if(hash!=identity.checksum || trailer!=hash || input.get()!=EOF)
+            throw std::runtime_error("shared index checksum differs from cached template");
+    }
+public:
+    static SharedRouteCache& Instance() {static SharedRouteCache cache;return cache;}
+    std::shared_ptr<const SharedRoutes> Acquire(const std::string& file,const IndexFile& identity,
+                                               const SharedTemplateInfo& info) {
+        const auto key=std::string("shared-routes-v1:")+info.digest+":"+
+            std::to_string(identity.checksum)+":"+std::to_string(identity.bytes)+":"+
+            std::to_string(info.files)+":"+std::to_string(info.directories)+":"+
+            std::to_string(info.inode_pages)+":"+std::to_string(info.bucket_pages);
+        std::lock_guard<std::mutex> lock(mutex_);
+        for(auto i=entries_.begin();i!=entries_.end();) {
+            if(i->second.expired()) i=entries_.erase(i); else ++i;
+        }
+        const auto found=entries_.find(key);
+        if(found!=entries_.end()) if(auto shared=found->second.lock()) {
+            // A good copy in another database cannot hide corruption here.
+            VerifyContents(file,identity); ++hits_; return shared;
+        }
+        auto shared=std::make_shared<SharedRoutes>(); shared->load(file,identity,info);
+        entries_[key]=shared; ++loads_; return shared;
+    }
+    void Stats(uint64_t& templates,uint64_t& routes,uint64_t& references,uint64_t& loads,uint64_t& hits) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        templates=routes=references=0;loads=loads_;hits=hits_;
+        for(const auto& entry:entries_) if(auto p=entry.second.lock()) {
+            ++templates;routes+=p->routes.size();references+=p.use_count()-1;
+        }
     }
 };
 }

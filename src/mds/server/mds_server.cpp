@@ -3,6 +3,7 @@
 #include <rocksdb/iterator.h>
 #ifdef ZB_HAS_LHM
 #include "../lhm/LhmNamespaceStore.h"
+#include "../lhm/MultiLhmQueryService.h"
 #endif
 
 #include <atomic>
@@ -55,6 +56,23 @@ int main(int argc, char* argv[]) {
     if (!error.empty()) {
         std::cerr << "Failed to load config: " << error << std::endl;
         return 1;
+    }
+
+    if(cfg.namespace_backend=="lhm_multi_readonly") {
+#ifdef ZB_HAS_LHM
+        zb::mds::MultiLhmQueryService service;
+        if(!service.LoadCatalog(cfg.lhm_databases_file,&error)) {std::cerr<<error<<std::endl;return 1;}
+        brpc::Server server;brpc::ServerOptions options;options.idle_timeout_sec=FLAGS_idle_timeout_sec;
+        if(server.AddService(&service,brpc::SERVER_DOESNT_OWN_SERVICE)!=0 || server.Start(FLAGS_port,&options)!=0) {
+            std::cerr<<"Cannot start multi-database query service"<<std::endl;return 1;
+        }
+        std::cerr<<"namespace_backend=lhm_multi_readonly"<<std::endl;
+        server.RunUntilAskedToQuit();server.Stop(0);server.Join();
+        if(!service.Close(&error)) {std::cerr<<error<<std::endl;return 1;}
+        return 0;
+#else
+        std::cerr<<"lhm_multi_readonly requires ZB_BUILD_LHM_BRIDGE=ON"<<std::endl;return 1;
+#endif
     }
 
     zb::mds::RocksMetaStore store;

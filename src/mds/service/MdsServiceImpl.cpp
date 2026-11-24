@@ -1094,6 +1094,12 @@ void MdsServiceImpl::Lookup(google::protobuf::RpcController* cntl_base,
         return;
     }
 
+    if(!request->database_id().empty()) {
+        FillStatus(response->mutable_status(),zb::rpc::MDS_INVALID_ARGUMENT,
+                   "database_id requires lhm_multi_readonly mode");
+        return;
+    }
+
     std::string error;
     zb::rpc::InodeAttr attr;
     uint64_t inode_id = 0;
@@ -1127,6 +1133,12 @@ void MdsServiceImpl::Getattr(google::protobuf::RpcController* cntl_base,
 
     if (request->inode_id() == 0) {
         FillStatus(response->mutable_status(), zb::rpc::MDS_INVALID_ARGUMENT, "inode_id is empty");
+        return;
+    }
+
+    if(!request->database_id().empty()) {
+        FillStatus(response->mutable_status(),zb::rpc::MDS_INVALID_ARGUMENT,
+                   "database_id requires lhm_multi_readonly mode");
         return;
     }
 
@@ -1500,6 +1512,12 @@ void MdsServiceImpl::Readdir(google::protobuf::RpcController* cntl_base,
 
     if (request->path().empty()) {
         FillStatus(response->mutable_status(), zb::rpc::MDS_INVALID_ARGUMENT, "path is empty");
+        return;
+    }
+
+    if(!request->database_id().empty()) {
+        FillStatus(response->mutable_status(),zb::rpc::MDS_INVALID_ARGUMENT,
+                   "database_id requires lhm_multi_readonly mode");
         return;
     }
 

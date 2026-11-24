@@ -125,15 +125,18 @@ inline IndexFile InspectIndex(const std::string& store,uint64_t token) {
             uint64_t(st.st_mtim.tv_sec),uint64_t(st.st_mtim.tv_nsec),
             uint64_t(st.st_ctim.tv_sec),uint64_t(st.st_ctim.tv_nsec)};
 }
-inline void ValidateIndexFiles(const std::string& store,const IndexCatalog& catalog) {
+// When require_identity is false the caller must load and verify each index's
+// contents against its checkpoint checksum before exposing the namespace.
+inline void ValidateIndexFiles(const std::string& store,const IndexCatalog& catalog,bool require_identity=true) {
     std::set<std::pair<uint64_t,uint64_t>> identities;
     std::set<uint64_t> tokens;
     for(const auto& f:catalog.files) {
         const auto actual=InspectIndex(store,f.token);
-        if(f.bytes<32 || f.bytes%8 || actual.dev!=f.dev || actual.ino!=f.ino ||
-           actual.bytes!=f.bytes || actual.mtime_sec!=f.mtime_sec || actual.mtime_ns!=f.mtime_ns ||
-           actual.ctime_sec!=f.ctime_sec || actual.ctime_ns!=f.ctime_ns ||
-           !identities.emplace(f.dev,f.ino).second || !tokens.insert(f.token).second)
+        const bool identity_changed=actual.dev!=f.dev || actual.ino!=f.ino ||
+            actual.mtime_sec!=f.mtime_sec || actual.mtime_ns!=f.mtime_ns ||
+            actual.ctime_sec!=f.ctime_sec || actual.ctime_ns!=f.ctime_ns;
+        if(f.bytes<32 || f.bytes%8 || actual.bytes!=f.bytes || (require_identity && identity_changed) ||
+           !identities.emplace(actual.dev,actual.ino).second || !tokens.insert(f.token).second)
             throw std::runtime_error("checkpoint index identity/length/time mismatch: "+IndexPath(store,f.token));
     }
 }

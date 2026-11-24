@@ -81,7 +81,7 @@ class PersistentStore {
 
     bool OpenOrCreate(const std::string& path, bool from_snapshot = false);
     void SaveAllocation(SnapshotWriter& out) const;
-    void LoadAllocation(SnapshotReader& in);
+    void LoadAllocation(SnapshotReader& in, bool portable_readonly = false);
     void Close();
     bool IsOpen() const;
     bool Sync();

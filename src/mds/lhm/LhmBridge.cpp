@@ -133,12 +133,19 @@ void StartRuntime(zb_lhm_context& ctx,threadinfo& ti,bool initial) {
         if(::rename(temp.c_str(),(ctx.path+".snapshot").c_str())) throw std::runtime_error("initial checkpoint publication failed");
         SyncFile(std::filesystem::path(ctx.path).parent_path().string(),true);
     }
-    ctx.runtime=true; ctx.ns.begin_batch_undo(true);
+    ctx.runtime=true;
+    // Shared namespaces reject every mutation. Do not bind a read-only session
+    // to local file identities by creating an unnecessary undo journal.
+    if(!ctx.ns.shared_readonly()) ctx.ns.begin_batch_undo(true);
     MasstreeLHM::BatchFault("service_started");
 }
 int RuntimeCheckpoint(zb_lhm_context& ctx,threadinfo& ti,bool closing) {
     if(!ctx.runtime || !ContextUsable(&ctx)) throw std::runtime_error("LHM session failed; restart to recover");
     if(ctx.ns.pending_create_count()) return ZB_LHM_BUSY;
+    if(ctx.ns.shared_readonly()) {
+        if(ctx.dirty) throw std::runtime_error("shared read-only namespace became dirty");
+        return ZB_LHM_OK;
+    }
     if(ctx.dirty) {
         ctx.ns.advance_checkpoint_sequence();
         const auto temp=ctx.path+".snapshot.tmp";

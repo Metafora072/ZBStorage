@@ -131,8 +131,11 @@ void reopen_snapshot(const std::string& file, const std::string& snapshot, threa
     if(in.u64()!=kSegmentedSnapshotMagic) throw std::runtime_error("invalid snapshot magic");
     const auto version=in.u64();
     if(!SupportedSnapshotVersion(version)) throw std::runtime_error("unsupported snapshot version: expected 4, 5 or 6");
+    // Shared service sessions are immutable. Offline append and all writable
+    // formats retain physical identity checks for their undo baselines.
+    const bool portable_readonly=version==kSharedSnapshotVersion && !append_only;
     if(!persistent_store_.OpenOrCreate(file,true)) throw std::runtime_error("cannot reopen store");
-    persistent_store_.LoadAllocation(in);
+    persistent_store_.LoadAllocation(in,portable_readonly);
     directory_blocks_.bind(persistent_store_);
     auto block=in.u64(), slot=in.u64();
     if(!block || block>kMaxLogicalBlock || slot>=kInodesPerBlock) throw std::runtime_error("invalid snapshot root reference");
@@ -149,7 +152,7 @@ void reopen_snapshot(const std::string& file, const std::string& snapshot, threa
         if(version==kSharedSnapshotVersion) {
             shared_catalog_=ReadSharedCatalog(in,snapshot_indexes_); shared_snapshot_=true;
         }
-        in.finish(); ValidateIndexFiles(file,snapshot_indexes_);
+        in.finish(); ValidateIndexFiles(file,snapshot_indexes_,!portable_readonly);
         if(shared_snapshot_) {
             validate_shared_instances();
             if(!append_only) {

@@ -80,6 +80,9 @@ zb_lhm_context* zb_lhm_open(const char* fresh_backing_file);
 void zb_lhm_close(zb_lhm_context* ctx);
 // Automatically recover a service journal, retain the checkpoint and protect writes.
 // Pending offline import journals still require the offline recovery entry point.
+// Clean v6 shared namespaces support relocated files for read-only queries and
+// create no service undo. Writable opens, offline append and pending recovery
+// still require the original physical file identities.
 zb_lhm_context* zb_lhm_reopen(const char* file, char* error, size_t error_size);
 // Consumes ctx even on failure; retains the checkpoint and rolls back or leaves
 // its journal for recovery. A failed close is never reported as a new commit.

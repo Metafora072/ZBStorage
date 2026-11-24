@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -39,6 +40,7 @@ def worker(r):
     bindings = {
         'zb_lhm_reopen': ([text,text,C.c_size_t],ptr),
         'zb_lhm_close_checked': ([ptr,text,C.c_size_t],C.c_int),
+        'zb_lhm_checkpoint': ([ptr,text,C.c_size_t],C.c_int),
         'zb_lhm_lookup_checked': ([ptr,text,C.POINTER(Inode)],C.c_int),
         'zb_lhm_read_checked': ([ptr,u64,C.POINTER(Inode)],C.c_int),
         'zb_lhm_shared_index_stats': ([ptr,C.POINTER(u64),C.POINTER(u64),C.POINTER(u64)],C.c_int),
@@ -72,6 +74,9 @@ def worker(r):
         assert lib.zb_lhm_reserve_checked(ctx,b'/outside',1,C.byref(token),C.byref(identifier))==7
         assert lib.zb_lhm_remove_checked(ctx,b'/one/a/f0000',1)==7
         assert lib.zb_lhm_rename_checked(ctx,b'/one/a',b'/renamed')==7
+    if r.get('checkpoint'):
+        assert lib.zb_lhm_checkpoint(ctx,error,len(error))==0,error.value
+        assert not Path(str(r['store'])+'.undo').exists()
     assert lib.zb_lhm_close_checked(ctx,error,len(error))==1,error.value
     return dict(opened=True,templates=t.value,instances=b.value,routes=d.value,values=values,listings=listings)
 
@@ -126,6 +131,58 @@ def main(args):
     assert call('query',store,paths=['/one/a/f0399'])['values']['/one/a/f0399']['size']==499
     for name in templates:(root/(name+'-hidden')).rename(Path(templates[name]['template']))
     checks.append('reopen independent of external template bundles')
+    # Copying changes inode/ctime; --migration-root additionally changes device.
+    # Immutable shared queries must not need checkpoint rebinding.
+    with tempfile.TemporaryDirectory(prefix='lhm-portable-',dir=args.migration_root) as destination:
+        moved_dir=Path(destination)/'shared'
+        shutil.copytree(store.parent,moved_dir)
+        moved=moved_dir/store.name
+        assert (moved.stat().st_dev,moved.stat().st_ino)!=(store.stat().st_dev,store.stat().st_ino)
+        if args.migration_root:
+            assert moved.stat().st_dev!=store.stat().st_dev, '--migration-root must be on a different filesystem'
+        def contents(directory):
+            return {p.name:hashlib.sha256(p.read_bytes()).hexdigest()
+                    for p in directory.glob('meta*') if p.is_file()}
+        original=contents(moved_dir)
+        actual=call('query',moved,paths=paths,listings=['/','/tail/a'],mutations=True,checkpoint=True)
+        assert actual['opened'] and actual['values']==q['values'],actual
+        assert contents(moved_dir)==original, 'read-only migration modified persistent files'
+        assert not Path(str(moved)+'.undo').exists()
+        assert imp(moved,'/extra')['rc']!=0
+        assert contents(moved_dir)==original
+        checks.append('relocated shared query: inode IDs/attributes preserved; no checkpoint rewrite or undo; relocated append rejected')
+        for mode in ('index-checksum','missing-segment','short-segment','extra-segment','aliased-segment'):
+            bad_dir=Path(destination)/mode;shutil.copytree(moved_dir,bad_dir);bad_store=bad_dir/store.name
+            if mode=='index-checksum':
+                p=next(bad_dir.glob('meta.index-*'))
+                with p.open('r+b') as stream:
+                    stream.seek(-1,2); byte=stream.read(1);stream.seek(-1,2);stream.write(bytes([byte[0]^1]))
+            elif mode=='missing-segment':Path(str(bad_store)+'.buckets').unlink()
+            elif mode=='short-segment':
+                p=Path(str(bad_store)+'.buckets')
+                with p.open('r+b') as stream:stream.truncate(p.stat().st_size-16384)
+            elif mode=='extra-segment':Path(str(bad_store)+'.part999999').write_bytes(bytes(16384))
+            else:
+                p=Path(str(bad_store)+'.heads');p.unlink();os.link(bad_store,p)
+            before_bad=contents(bad_dir)
+            assert not call('query',bad_store,paths=['/one/a/f0000'])['opened'],mode
+            assert contents(bad_dir)==before_bad,mode
+        checks.append('portable query rejects corrupt indexes, missing/truncated/extra/aliased segments without modifying data')
+        if not args.basic_only:
+            call('query',moved,fault='service_started',crash=True)
+            assert not Path(str(moved)+'.undo').exists()
+            assert call('query',moved,paths=['/one/a/f0000'])['values']['/one/a/f0000']==q['values']['/one/a/f0000']
+            assert contents(moved_dir)==original
+            checks.append('killed portable shared query reopens without undo or checkpoint changes')
+            pending=fresh('pending-migration');assert imp(pending,'/base')['rc']==0
+            imp(pending,'/new','tail',fault='batch_snapshot',crash=True)
+            copied_dir=Path(destination)/'pending';shutil.copytree(pending.parent,copied_dir);copied=copied_dir/pending.name
+            before_pending=contents(copied_dir)
+            assert not call('query',copied,paths=['/base/a/f0000'])['opened']
+            assert call('recover',copied)['rc']!=0
+            assert contents(copied_dir)==before_pending
+            assert call('recover',pending)['rc']==0
+            checks.append('relocated pending undo rejected without restoring/deleting files; original still recovers')
     if not args.basic_only:
         for phase in ['shared_index_written','shared_index_synced','shared_mapping_written','batch_snapshot','undo_commit','batch_published']:
             crashstore=fresh('crash-'+phase);assert imp(crashstore,'/base')['rc']==0
@@ -211,6 +268,6 @@ def main(args):
     (root/'verification.json').write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result,indent=2))
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--library',type=Path);p.add_argument('--basic-only',action='store_true');p.add_argument('--worker',action='store_true');args=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--library',type=Path);p.add_argument('--basic-only',action='store_true');p.add_argument('--worker',action='store_true');p.add_argument('--migration-root',type=Path,help='optional writable directory on a different filesystem supporting O_DIRECT');args=p.parse_args()
     if args.worker:print(json.dumps(worker(json.load(sys.stdin))))
     else:main(args)

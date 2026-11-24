@@ -58,7 +58,7 @@ class LhmNamespace {
     bool loaded_incremental_snapshot_ = false;
     bool shared_snapshot_ = false;
     SharedCatalog shared_catalog_;
-    std::vector<SharedRoutes> shared_routes_;
+    std::vector<std::shared_ptr<const SharedRoutes>> shared_routes_;
     std::map<std::string,size_t> shared_names_;
     uint64_t loaded_directory_hash_ = 0;
 #ifdef ZB_LHM_TESTING

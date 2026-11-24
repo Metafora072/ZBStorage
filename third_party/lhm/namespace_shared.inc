@@ -3,7 +3,7 @@ bool shared_readonly() const { return shared_snapshot_; }
 size_t shared_template_count() const { return shared_catalog_.templates.size(); }
 size_t shared_instance_count() const { return shared_catalog_.instances.size(); }
 uint64_t shared_route_count() const {
-    uint64_t n=0; for(const auto& t:shared_routes_) n+=t.routes.size(); return n;
+    uint64_t n=0; for(const auto& t:shared_routes_) if(t) n+=t->routes.size(); return n;
 }
 void validate_shared_instances() {
     shared_names_.clear(); std::vector<uint64_t> roots;
@@ -74,7 +74,7 @@ bool shared_entry_in_range(const SharedInstance& b,const DirectoryBlockStore::en
 bool shared_lookup(const ParsedPath& parsed,value_type& out) const {
     const auto it=shared_names_.find(parsed.components.front());
     if(it==shared_names_.end()) return false;
-    const auto& b=shared_catalog_.instances[it->second]; const auto& tree=shared_routes_[b.template_index];
+    const auto& b=shared_catalog_.instances[it->second]; const auto& tree=*shared_routes_[b.template_index];
     uint64_t ordinal=1;
     for(size_t i=1;i<parsed.components.size();++i) {
         const auto child=tree.child(ordinal,parsed.components[i]);
@@ -101,7 +101,7 @@ bool shared_readdir(const ParsedPath& parsed,std::vector<readdir_record>& result
         return true;
     }
     const auto it=shared_names_.find(parsed.components.front()); if(it==shared_names_.end()) return false;
-    const auto& b=shared_catalog_.instances[it->second]; const auto& tree=shared_routes_[b.template_index];
+    const auto& b=shared_catalog_.instances[it->second]; const auto& tree=*shared_routes_[b.template_index];
     uint64_t ordinal=1;
     for(size_t i=1;i<parsed.components.size();++i) {ordinal=tree.child(ordinal,parsed.components[i]); if(!ordinal) return false;}
     auto child=std::lower_bound(tree.children.begin(),tree.children.end(),ordinal,

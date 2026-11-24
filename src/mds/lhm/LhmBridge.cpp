@@ -222,6 +222,32 @@ zb_lhm_context* zb_lhm_reopen(const char* file,char* error,size_t size) {
         });
     } catch(const std::exception& e) { Error(error,size,e.what()); return nullptr; }
 }
+zb_lhm_context* zb_lhm_reopen_shared_readonly(const char* file,char* error,size_t size) {
+    Error(error,size,"");
+    if(!file || !*file) {Error(error,size,"missing store path");return nullptr;}
+    try {
+        const auto path=std::filesystem::absolute(file).lexically_normal().string();
+        return worker().run([&](threadinfo& ti)->zb_lhm_context* {
+            auto ctx=std::make_unique<zb_lhm_context>();
+            RuntimeRunnerLock(*ctx,path);LockStore(*ctx,path);
+            if(MasstreeLHM::BatchUndo::Exists(path))
+                throw std::runtime_error("database has pending undo; recover offline before query-only open");
+            MasstreeLHM::SnapshotReader header(path+".snapshot");
+            if(header.u64()!=MasstreeLHM::kSegmentedSnapshotMagic || header.u64()!=MasstreeLHM::kSharedSnapshotVersion)
+                throw std::runtime_error("multi-database queries require a v6 shared read-only store");
+            try {
+                ctx->ns.reopen_snapshot(path,path+".snapshot",ti);
+                StartRuntime(*ctx,ti,false);return ctx.release();
+            } catch(...) {ctx->ns.destroy(ti);throw;}
+        });
+    } catch(const std::exception& e) {Error(error,size,e.what());return nullptr;}
+}
+int zb_lhm_shared_cache_stats(zb_lhm_shared_cache_info* result) {
+    if(!result) return ZB_LHM_INVALID;
+    try {MasstreeLHM::SharedRouteCache::Instance().Stats(result->templates,result->routes,
+        result->references,result->loads,result->hits);return ZB_LHM_OK;}
+    catch(...) {return ZB_LHM_ERROR;}
+}
 int zb_lhm_close_checked(zb_lhm_context* ctx,char* error,size_t size) {
     Error(error,size,""); if(!ctx) return 1;
     try { return worker().run([&](threadinfo& ti) {

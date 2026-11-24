@@ -248,6 +248,8 @@ MdsConfig MdsConfig::LoadFromFile(const std::string& path, std::string* error) {
             cfg.namespace_backend = ToLower(value);
         } else if (key == "LHM_STORE_FILE") {
             cfg.lhm_store_file = value;
+        } else if (key == "LHM_DATABASES_FILE") {
+            cfg.lhm_databases_file = value;
         } else if (key == "LHM_STORE_MODE") {
             cfg.lhm_store_mode = value;
         } else if (key == "LHM_CHECKPOINT_INTERVAL_SECONDS") {
@@ -403,12 +405,25 @@ MdsConfig MdsConfig::LoadFromFile(const std::string& path, std::string* error) {
         }
     }
 
+    if(cfg.namespace_backend=="lhm_multi_readonly") {
+        if(cfg.lhm_databases_file.empty() || !cfg.lhm_store_file.empty() ||
+           !cfg.lhm_bulk_manifest.empty() || cfg.enable_optical_archive ||
+           !cfg.scheduler_address.empty() || cfg.lhm_checkpoint_interval_seconds) {
+            if(error) *error="lhm_multi_readonly requires LHM_DATABASES_FILE and excludes single-store, bulk import, archive, scheduler and checkpoint configuration";
+            return {};
+        }
+        return cfg; // No writable global control store or placement services.
+    }
+    if(!cfg.lhm_databases_file.empty()) {
+        if(error) *error="LHM_DATABASES_FILE requires NAMESPACE_BACKEND=lhm_multi_readonly";
+        return {};
+    }
     if (cfg.db_path.empty() && error) {
         *error = "MDS_DB_PATH is required";
         return {};
     }
     if (cfg.namespace_backend != "rocksdb" && cfg.namespace_backend != "lhm") {
-        if (error) *error = "NAMESPACE_BACKEND must be rocksdb or lhm";
+        if (error) *error = "NAMESPACE_BACKEND must be rocksdb, lhm or lhm_multi_readonly";
         return {};
     }
     if ((cfg.lhm_store_mode != "create" && cfg.lhm_store_mode != "reopen") ||

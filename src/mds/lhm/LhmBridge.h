@@ -84,6 +84,13 @@ void zb_lhm_close(zb_lhm_context* ctx);
 // create no service undo. Writable opens, offline append and pending recovery
 // still require the original physical file identities.
 zb_lhm_context* zb_lhm_reopen(const char* file, char* error, size_t error_size);
+// Query-only multi-database entry: accepts only clean v6 stores; never recovers
+// or opens a writable namespace. Each returned context retains its own locks.
+zb_lhm_context* zb_lhm_reopen_shared_readonly(const char* file,char* error,size_t error_size);
+typedef struct {
+    uint64_t templates, routes, references, loads, hits;
+} zb_lhm_shared_cache_info;
+int zb_lhm_shared_cache_stats(zb_lhm_shared_cache_info* result);
 // Consumes ctx even on failure; retains the checkpoint and rolls back or leaves
 // its journal for recovery. A failed close is never reported as a new commit.
 int zb_lhm_close_checked(zb_lhm_context*, char* error, size_t error_size);

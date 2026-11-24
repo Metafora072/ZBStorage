@@ -14,6 +14,8 @@
 
 DEFINE_string(server, "127.0.0.1:19000", "MDS endpoint");
 DEFINE_string(path, "", "One absolute namespace path");
+DEFINE_string(database_id, "", "Database ID for lhm_multi_readonly queries");
+DEFINE_bool(list_databases, false, "List multi-database availability and shared index cache counts");
 DEFINE_string(paths_file, "", "UTF-8 paths, one per line, queried in order");
 DEFINE_bool(interactive, false, "Read paths from stdin");
 DEFINE_string(output, "", "JSONL output; default stdout");
@@ -61,20 +63,32 @@ int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     try {
         if (!FLAGS_index_source.empty()) return Index();
-        if (int(!FLAGS_path.empty()) + int(!FLAGS_paths_file.empty()) + int(FLAGS_interactive) != 1)
-            throw std::runtime_error("choose exactly one: --path, --paths_file, --interactive");
+        if (int(!FLAGS_path.empty()) + int(!FLAGS_paths_file.empty()) + int(FLAGS_interactive) + int(FLAGS_list_databases) != 1)
+            throw std::runtime_error("choose exactly one: --path, --paths_file, --interactive, --list_databases");
         if (FLAGS_timeout_ms <= 0) throw std::runtime_error("timeout_ms must be positive");
         brpc::Channel channel; brpc::ChannelOptions options;
         options.protocol = "baidu_std"; options.connection_type = "single";
         options.timeout_ms = FLAGS_timeout_ms; options.max_retry = 0;
         if (channel.Init(FLAGS_server.c_str(), &options)) throw std::runtime_error("channel init failed");
         zb::rpc::MdsService_Stub stub(&channel);
+        if(FLAGS_list_databases) {
+            zb::rpc::ListDatabasesRequest request;zb::rpc::ListDatabasesReply reply;brpc::Controller ctl;
+            stub.ListDatabases(&ctl,&request,&reply,nullptr);
+            if(ctl.Failed()) throw std::runtime_error(ctl.ErrorText());
+            std::string body;google::protobuf::util::JsonPrintOptions print;
+            print.preserve_proto_field_names=true;print.always_print_primitive_fields=true;
+            if(!google::protobuf::util::MessageToJsonString(reply,&body,print).ok()) throw std::runtime_error("cannot serialize database list");
+            if(FLAGS_output.empty()) std::cout<<body<<'\n';
+            else {std::ofstream out(FLAGS_output);out<<body<<'\n';out.close();if(!out) throw std::runtime_error("cannot write database list");}
+            return reply.status().code()==zb::rpc::MDS_OK?0:2;
+        }
         // Establish transport with root lookup; no sampled file is pre-queried.
         zb::rpc::LookupRequest warm; warm.set_path("/");
+        warm.set_database_id(FLAGS_database_id);
         zb::rpc::LookupReply warm_reply; brpc::Controller warm_ctl;
         stub.Lookup(&warm_ctl, &warm, &warm_reply, nullptr);
-        if (warm_ctl.Failed() || warm_reply.status().code() != zb::rpc::MDS_OK)
-            throw std::runtime_error("root readiness/connection warmup failed: " + warm_ctl.ErrorText());
+        if (warm_ctl.Failed() || warm_reply.status().code() != zb::rpc::MDS_OK || warm_reply.database_id()!=FLAGS_database_id)
+            throw std::runtime_error("root readiness/connection warmup failed: " + warm_ctl.ErrorText()+" "+warm_reply.status().message());
         std::ofstream output; std::ostream* out = &std::cout;
         if (!FLAGS_output.empty()) {
             output.open(FLAGS_output); if (!output) throw std::runtime_error("cannot open output"); out = &output;
@@ -84,12 +98,13 @@ int main(int argc, char** argv) {
             if (path.empty() || path.front() != '/' || path.find('\0') != std::string::npos)
                 throw std::runtime_error("invalid absolute path");
             zb::rpc::LookupRequest req; req.set_path(path);
+            req.set_database_id(FLAGS_database_id);
             zb::rpc::LookupReply reply; brpc::Controller ctl;
             const auto start = std::chrono::steady_clock::now();
             stub.Lookup(&ctl, &req, &reply, nullptr);
             const auto end = std::chrono::steady_clock::now();
             const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-            const bool ok = !ctl.Failed() && reply.status().code() == zb::rpc::MDS_OK;
+            const bool ok = !ctl.Failed() && reply.status().code() == zb::rpc::MDS_OK && reply.database_id()==FLAGS_database_id;
             if (!ok) ++failures;
             std::string body; google::protobuf::util::JsonPrintOptions print;
             print.preserve_proto_field_names = true; print.always_print_primitive_fields = true;

@@ -158,8 +158,9 @@ void reopen_snapshot(const std::string& file, const std::string& snapshot, threa
             if(!append_only) {
                 shared_routes_.resize(shared_catalog_.templates.size());
                 for(size_t i=0;i<shared_routes_.size();++i)
-                    shared_routes_[i].load(IndexPath(file,snapshot_indexes_.files[i].token),
-                                          snapshot_indexes_.files[i],shared_catalog_.templates[i]);
+                    shared_routes_[i]=SharedRouteCache::Instance().Acquire(
+                        IndexPath(file,snapshot_indexes_.files[i].token),
+                        snapshot_indexes_.files[i],shared_catalog_.templates[i]);
             }
         } else if(!append_only) {
             for(const auto& f:snapshot_indexes_.files) {

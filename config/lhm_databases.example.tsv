@@ -1,0 +1,3 @@
+# database_id<TAB>existing control directory<TAB>existing namespace file
+disk-a	/mnt/disk-a/zb-metadata/db/control	/mnt/disk-a/zb-metadata/db/namespace.meta
+disk-b	/mnt/disk-b/zb-metadata/db/control	/mnt/disk-b/zb-metadata/db/namespace.meta

@@ -45,6 +45,7 @@ struct MdsConfig {
     std::string lhm_store_mode = "create";
     uint32_t lhm_checkpoint_interval_seconds = 0; // 0: explicit SIGUSR1 and normal close only.
     std::string lhm_bulk_manifest; // Optional type/path TSV, fresh LHM only.
+    std::string lhm_databases_file; // TSV: database_id, control directory, namespace file.
     std::string scheduler_address;
     uint32_t scheduler_refresh_ms{2000};
     std::string managed_node_id;
